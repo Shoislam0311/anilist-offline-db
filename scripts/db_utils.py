@@ -472,7 +472,7 @@ def upsert_tags(conn: sqlite3.Connection, anime_id: int, tags: list):
 
 def upsert_studios(conn: sqlite3.Connection, anime_id: int, studios_data: dict):
     for edge in studios_data.get("edges", []):
-        node = edge.get("node", {})
+        node = edge.get("node") or {}
         studio_id = node.get("id")
         studio_name = node.get("name")
         is_main = 1 if edge.get("isMain") else 0
@@ -556,7 +556,7 @@ def upsert_characters(conn: sqlite3.Connection, anime_id: int, characters_data: 
 def upsert_relations(conn: sqlite3.Connection, anime_id: int, relations_data: dict):
     conn.execute("DELETE FROM relations WHERE anime_id=?", (anime_id,))
     for edge in relations_data.get("edges", []):
-        node = edge.get("node", {})
+        node = edge.get("node") or {}
         related_id = node.get("id")
         rel_type = edge.get("relationType")
         if related_id and rel_type:
@@ -573,7 +573,9 @@ def upsert_recommendations(conn: sqlite3.Connection, anime_id: int, recommendati
     conn.execute("DELETE FROM recommendations WHERE anime_id=?", (anime_id,))
     for edge in recommendations_data.get("edges", []):
         node = edge.get("node", {})
-        rec = node.get("mediaRecommendation", {})
+        if not node:
+            continue
+        rec = node.get("mediaRecommendation") or {}
         rec_id = rec.get("id")
         rating = node.get("rating")
         user_rating = node.get("userRating")
