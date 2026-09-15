@@ -1,0 +1,207 @@
+name: Update AniList Database
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      fetch_mode:
+        description: 'Fetch mode (full or incremental)'
+        required: false
+        default: 'incremental'
+        type: choice
+        options:
+          - incremental
+          - full
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "anilist-update"
+  cancel-in-progress: true
+
+jobs:
+  fetch-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Determine fetch mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ github.event.inputs.fetch_mode }}" >> $GITHUB_OUTPUT
+          else
+            LAST_COMMIT_MSG=$(git log -1 --pretty=%B 2>/dev/null || echo "")
+            if echo "$LAST_COMMIT_MSG" | grep -q "full fetch"; then
+              echo "mode=incremental" >> $GITHUB_OUTPUT
+            else
+              echo "mode=incremental" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Run fetcher
+        env:
+          FETCH_MODE: ${{ steps.mode.outputs.mode }}
+        run: |
+          echo "Starting $FETCH_MODE fetch at $(date -u)"
+          python scripts/fetch_anilist.py
+          echo "Fetch completed at $(date -u)"
+
+      - name: Generate API data
+        run: python scripts/api_generator.py
+
+      - name: Show database stats
+        run: python -c "
+          import sys
+          sys.path.insert(0, 'scripts')
+          from db_utils import connect_db, get_database_stats
+          import json
+          conn = connect_db('data/anilist.db')
+          stats = get_database_stats(conn)
+          print(json.dumps(stats, indent=2))
+          conn.close()
+          "
+
+      - name: Copy API data to docs
+        run: |
+          mkdir -p docs/api
+          cp -r data/shards docs/api/ 2>/dev/null || true
+          cp data/search_index.json docs/api/ 2>/dev/null || true
+          cp data/metadata.json docs/api/ 2>/dev/null || true
+          cp data/sample.json docs/api/ 2>/dev/null || true
+
+      - name: Commit changes
+        run: |
+          git add data/ docs/
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+            ANIME_COUNT=$(python -c "
+              import sys
+              sys.path.insert(0, 'scripts')
+              from db_utils import connect_db
+              conn = connect_db('data/anilist.db')
+              count = conn.execute('SELECT COUNT(*) FROM anime').fetchone()[0]
+              conn.close()
+              print(count)
+            ")
+            git commit -m "update: ${{ steps.mode.outputs.mode }} fetch - $ANIME_COUNT anime - $TIMESTAMP"
+          fi
+
+      - name: Push changes
+        run: git push
+
+      - name: Get database stats for release
+        id: stats
+        run: |
+          ANIME_COUNT=$(python -c "
+            import sys
+            sys.path.insert(0, 'scripts')
+            from db_utils import connect_db
+            conn = connect_db('data/anilist.db')
+            count = conn.execute('SELECT COUNT(*) FROM anime').fetchone()[0]
+            conn.close()
+            print(count)
+          ")
+          echo "anime_count=$ANIME_COUNT" >> $GITHUB_OUTPUT
+          echo "date=$(date -u +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+      - name: Create compressed archives
+        run: |
+          cd data
+          tar -czf ../anilist-db-${{ steps.stats.outputs.date }}.tar.gz anilist.db anilist.json
+          cd ..
+          gzip -k -f data/anilist.db
+          gzip -k -f data/anilist.json
+          ls -lh *.gz data/*.gz 2>/dev/null
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "db-${{ steps.stats.outputs.date }}"
+          name: "AniList Database - ${{ steps.stats.outputs.date }}"
+          body: |
+            ## AniList Offline Database Update
+
+            **Date:** ${{ steps.stats.outputs.date }}
+            **Mode:** ${{ steps.mode.outputs.mode }}
+            **Total Anime:** ${{ steps.stats.outputs.anime_count }}
+
+            ### Files
+            - `anilist-db-${{ steps.stats.outputs.date }}.tar.gz` - Full database archive
+            - `anilist.db.gz` - Compressed SQLite database
+            - `anilist.json.gz` - Compressed JSON export
+
+            ### Usage
+            ```bash
+            # Download and extract
+            tar -xzf anilist-db-${{ steps.stats.outputs.date }}.tar.gz
+
+            # Query with SQLite
+            sqlite3 anilist.db "SELECT title_romaji, average_score FROM anime ORDER BY popularity DESC LIMIT 10;"
+            ```
+
+            ### API
+            Visit the GitHub Pages site for the full GraphQL API with zero rate limits.
+          files: |
+            anilist-db-${{ steps.stats.outputs.date }}.tar.gz
+            data/anilist.db.gz
+            data/anilist.json.gz
+          make_latest: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy-pages:
+    needs: fetch-and-build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

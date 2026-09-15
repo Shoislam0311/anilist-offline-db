@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Data files (large, tracked by workflow)
+data/*.db
+data/*.json
+data/*.db.gz
+data/*.json.gz
+data/shards/
+data/.checkpoint.json
+*.tar.gz
+
+# Keep changelog
+!data/changelog.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

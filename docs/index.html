@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AniList Offline API</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0b1622; color: #ced9e0; line-height: 1.6; }
+        .header { background: linear-gradient(135deg, #1a2634 0%, #253746 100%); padding: 2rem; border-bottom: 2px solid #3db4f2; }
+        .header h1 { color: #3db4f2; font-size: 1.8rem; }
+        .header p { color: #8ba0b0; margin-top: 0.5rem; }
+        .badge { display: inline-block; background: #2ecc71; color: #fff; padding: 0.2rem 0.6rem; border-radius: 12px; font-size: 0.75rem; margin-left: 0.5rem; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+        .endpoint-box { background: #151f2e; border: 1px solid #253746; border-radius: 8px; padding: 1.5rem; margin: 1rem 0; }
+        .endpoint-url { font-family: monospace; color: #3db4f2; font-size: 1.1rem; word-break: break-all; }
+        .method { background: #3db4f2; color: #0b1622; padding: 0.2rem 0.5rem; border-radius: 4px; font-weight: bold; font-size: 0.8rem; }
+        .tabs { display: flex; gap: 0; margin: 2rem 0 0; border-bottom: 2px solid #253746; }
+        .tab { padding: 0.8rem 1.5rem; cursor: pointer; color: #8ba0b0; border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all 0.2s; }
+        .tab:hover { color: #ced9e0; }
+        .tab.active { color: #3db4f2; border-bottom-color: #3db4f2; }
+        .tab-content { display: none; padding: 1.5rem 0; }
+        .tab-content.active { display: block; }
+        .code-block { background: #0b1622; border: 1px solid #253746; border-radius: 6px; padding: 1rem; overflow-x: auto; font-family: 'Fira Code', monospace; font-size: 0.85rem; line-height: 1.5; }
+        .code-block .keyword { color: #c678dd; }
+        .code-block .string { color: #98c379; }
+        .code-block .number { color: #d19a66; }
+        .code-block .type { color: #e5c07b; }
+        .code-block .field { color: #61afef; }
+        .code-block .comment { color: #5c6370; font-style: italic; }
+        .search-box { display: flex; gap: 0.5rem; margin: 1rem 0; }
+        .search-box input { flex: 1; padding: 0.8rem 1rem; background: #0b1622; border: 1px solid #253746; border-radius: 6px; color: #ced9e0; font-size: 1rem; outline: none; }
+        .search-box input:focus { border-color: #3db4f2; }
+        .search-box button { padding: 0.8rem 1.5rem; background: #3db4f2; color: #0b1622; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 1rem; }
+        .search-box button:hover { background: #2da0d9; }
+        .results { margin: 1rem 0; }
+        .result-item { display: flex; gap: 1rem; padding: 1rem; background: #151f2e; border: 1px solid #253746; border-radius: 6px; margin: 0.5rem 0; }
+        .result-item img { width: 60px; height: 85px; border-radius: 4px; object-fit: cover; }
+        .result-info h3 { color: #3db4f2; font-size: 1rem; margin-bottom: 0.3rem; }
+        .result-info p { color: #8ba0b0; font-size: 0.85rem; }
+        .result-meta { display: flex; gap: 1rem; margin-top: 0.3rem; font-size: 0.8rem; }
+        .result-meta span { color: #e5c07b; }
+        .playground { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; min-height: 400px; }
+        .playground textarea { width: 100%; height: 100%; min-height: 350px; background: #0b1622; border: 1px solid #253746; border-radius: 6px; padding: 1rem; color: #ced9e0; font-family: monospace; font-size: 0.85rem; resize: vertical; outline: none; }
+        .playground textarea:focus { border-color: #3db4f2; }
+        .playground .output { background: #0b1622; border: 1px solid #253746; border-radius: 6px; padding: 1rem; overflow: auto; max-height: 400px; font-family: monospace; font-size: 0.85rem; white-space: pre-wrap; }
+        .btn { padding: 0.6rem 1.2rem; background: #3db4f2; color: #0b1622; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; margin: 0.5rem 0.5rem 0.5rem 0; }
+        .btn:hover { background: #2da0d9; }
+        .btn-secondary { background: #253746; color: #ced9e0; }
+        .btn-secondary:hover { background: #2d4560; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin: 1rem 0; }
+        .stat-card { background: #151f2e; border: 1px solid #253746; border-radius: 8px; padding: 1rem; text-align: center; }
+        .stat-card .number { font-size: 2rem; color: #3db4f2; font-weight: bold; }
+        .stat-card .label { color: #8ba0b0; font-size: 0.85rem; margin-top: 0.3rem; }
+        .loading { text-align: center; padding: 2rem; color: #8ba0b0; }
+        .error { color: #e74c3c; padding: 1rem; background: #1a0f0f; border: 1px solid #e74c3c; border-radius: 6px; }
+        @media (max-width: 768px) {
+            .playground { grid-template-columns: 1fr; }
+            .container { padding: 1rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>AniList Offline API <span class="badge">No Rate Limits</span></h1>
+        <p>Full GraphQL API mirroring <code>graphql.anilist.co</code> - backed by offline SQLite database</p>
+    </div>
+
+    <div class="container">
+        <div class="endpoint-box">
+            <p><span class="method">POST</span> <span class="endpoint-url" id="apiEndpoint">Loading...</span></p>
+            <p style="margin-top: 0.5rem; color: #8ba0b0; font-size: 0.9rem;">
+                Same GraphQL schema as AniList. No authentication required. No rate limits.
+            </p>
+        </div>
+
+        <div class="stats-grid" id="statsGrid">
+            <div class="stat-card"><div class="number" id="statTotal">-</div><div class="label">Total Anime</div></div>
+            <div class="stat-card"><div class="number" id="statCharacters">-</div><div class="label">Characters</div></div>
+            <div class="stat-card"><div class="number" id="statStudios">-</div><div class="label">Studios</div></div>
+            <div class="stat-card"><div class="number" id="statGenres">-</div><div class="label">Genres</div></div>
+        </div>
+
+        <div class="tabs">
+            <div class="tab active" data-tab="playground">Query Playground</div>
+            <div class="tab" data-tab="search">Search</div>
+            <div class="tab" data-tab="browse">Browse</div>
+            <div class="tab" data-tab="docs">API Docs</div>
+        </div>
+
+        <div id="tab-playground" class="tab-content active">
+            <div class="playground">
+                <div>
+                    <h3 style="color: #3db4f2; margin-bottom: 0.5rem;">Query</h3>
+                    <textarea id="queryInput">{
+  Page(page: 1, perPage: 5) {
+    media(sort: POPULARITY_DESC, type: ANIME) {
+      id
+      title {
+        romaji
+        english
+      }
+      averageScore
+      popularity
+      coverImage {
+        large
+      }
+    }
+  }
+}</textarea>
+                    <button class="btn" onclick="executeQuery()">Execute</button>
+                    <button class="btn btn-secondary" onclick="loadSampleQuery('popular')">Popular</button>
+                    <button class="btn btn-secondary" onclick="loadSampleQuery('search')">Search</button>
+                    <button class="btn btn-secondary" onclick="loadSampleQuery('filter')">Filter</button>
+                    <button class="btn btn-secondary" onclick="loadSampleQuery('details')">Details</button>
+                </div>
+                <div>
+                    <h3 style="color: #3db4f2; margin-bottom: 0.5rem;">Response</h3>
+                    <div class="output" id="queryOutput">Click "Execute" to run the query...</div>
+                </div>
+            </div>
+        </div>
+
+        <div id="tab-search" class="tab-content">
+            <div class="search-box">
+                <input type="text" id="searchInput" placeholder="Search anime by title..." onkeypress="if(event.key==='Enter') searchAnime()">
+                <button onclick="searchAnime()">Search</button>
+            </div>
+            <div class="results" id="searchResults"></div>
+        </div>
+
+        <div id="tab-browse" class="tab-content">
+            <div style="display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem;">
+                <select id="browseGenre" onchange="browseAnime()"><option value="">All Genres</option></select>
+                <select id="browseStatus" onchange="browseAnime()">
+                    <option value="">All Status</option>
+                    <option value="FINISHED">Finished</option>
+                    <option value="RELEASING">Releasing</option>
+                    <option value="NOT_YET_RELEASED">Not Yet Released</option>
+                    <option value="CANCELLED">Cancelled</option>
+                </select>
+                <select id="browseFormat" onchange="browseAnime()">
+                    <option value="">All Formats</option>
+                    <option value="TV">TV</option>
+                    <option value="MOVIE">Movie</option>
+                    <option value="OVA">OVA</option>
+                    <option value="ONA">ONA</option>
+                    <option value="SPECIAL">Special</option>
+                </select>
+                <select id="browseSort" onchange="browseAnime()">
+                    <option value="POPULARITY_DESC">Popularity</option>
+                    <option value="SCORE_DESC">Score</option>
+                    <option value="UPDATED_AT_DESC">Recently Updated</option>
+                    <option value="START_DATE_DESC">Newest</option>
+                </select>
+            </div>
+            <div class="results" id="browseResults"><div class="loading">Loading...</div></div>
+        </div>
+
+        <div id="tab-docs" class="tab-content">
+            <h2 style="color: #3db4f2; margin-bottom: 1rem;">API Documentation</h2>
+            <p style="margin-bottom: 1rem;">This API mirrors the official AniList GraphQL API at <code>graphql.anilist.co</code>. Use the same queries, variables, and schema.</p>
+
+            <h3 style="color: #e5c07b; margin: 1rem 0 0.5rem;">Base URL</h3>
+            <div class="code-block"><span class="string" id="docBaseUrl">Loading...</span></div>
+
+            <h3 style="color: #e5c07b; margin: 1rem 0 0.5rem;">Available Types</h3>
+            <div class="code-block">
+<span class="type">Page</span> - Paginated results
+  .media(<span class="field">type</span>: <span class="type">MediaType</span>, <span class="field">sort</span>: [<span class="type">MediaSort</span>], <span class="field">page</span>: <span class="type">Int</span>, <span class="field">perPage</span>: <span class="type">Int</span>): [<span class="type">Media</span>]
+  .pageInfo: <span class="type">PageInfo</span>
+
+<span class="type">Media</span> - Anime entry
+  .id, .idMal, .title (<span class="type">MediaTitle</span>), .description, .coverImage (<span class="type">CoverImage</span>)
+  .bannerImage, .episodes, .duration, .status, .format, .season, .seasonYear
+  .averageScore, .meanScore, .popularity, .favourites, .trending
+  .genres: [<span class="type">String</span>], .tags: [<span class="type">MediaTag</span>]
+  .studios: <span class="type">StudioConnection</span>
+  .characters: <span class="type">CharacterConnection</span>
+  .relations: <span class="type">MediaConnection</span>
+  .recommendations: <span class="type">RecommendationConnection</span>
+  .nextAiringEpisode: <span class="type">AiringSchedule</span>
+  .startDate, .endDate: <span class="type">FuzzyDate</span>
+  .externalLinks: [<span class="type">MediaExternalLink</span>]
+  .streamingEpisodes: [<span class="type">MediaStreamingEpisode</span>]
+
+<span class="type">MediaSort</span>: ID, POPULARITY_DESC, SCORE_DESC, UPDATED_AT_DESC, START_DATE_DESC, FAVOURITES_DESC, TRENDING_DESC
+<span class="type">MediaType</span>: ANIME, MANGA
+<span class="type">MediaStatus</span>: FINISHED, RELEASING, NOT_YET_RELEASED, CANCELLED, HIATUS
+<span class="type">MediaFormat</span>: TV, MOVIE, OVA, ONA, SPECIAL, MUSIC, MANGA, NOVEL, ONE_SHOT, OEL, MANHWA, MANHUA
+            </div>
+
+            <h3 style="color: #e5c07b; margin: 1rem 0 0.5rem;">Example Queries</h3>
+            <div class="code-block">
+<span class="comment"># Get top anime by popularity</span>
+{
+  Page(page: <span class="number">1</span>, perPage: <span class="number">10</span>) {
+    media(sort: <span class="type">POPULARITY_DESC</span>, type: <span class="type">ANIME</span>) {
+      id
+      title { romaji english }
+      averageScore
+    }
+  }
+}
+
+<span class="comment"># Search by title</span>
+{
+  Page(page: <span class="number">1</span>, perPage: <span class="number">5</span>) {
+    media(search: <span class="string">"naruto"</span>, type: <span class="type">ANIME</span>) {
+      id
+      title { romaji }
+      episodes
+    }
+  }
+}
+
+<span class="comment"># Filter by genre and year</span>
+{
+  Page(page: <span class="number">1</span>, perPage: <span class="number">10</span>) {
+    media(genre: <span class="string">"Action"</span>, seasonYear: <span class="number">2024</span>, type: <span class="type">ANIME</span>) {
+      id
+      title { romaji }
+      format
+    }
+  }
+}
+            </div>
+        </div>
+    </div>
+
+    <script src="api.js"></script>
+</body>
+</html>
