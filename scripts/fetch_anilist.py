@@ -312,6 +312,10 @@ class AniListFetcher:
                     logger.info("No more media found. Fetch complete.")
                     break
 
+                if total_pages and page >= total_pages:
+                    logger.info(f"Reached last page ({total_pages}). Fetch complete.")
+                    break
+
                 for media in media_list:
                     self._process_anime(conn, media)
                     total_fetched += 1
@@ -470,6 +474,8 @@ class AniListFetcher:
 
     def post_fetch(self):
         logger.info("Post-fetch: rebuilding FTS index and exporting JSON...")
+        from db_utils import init_fts
+        init_fts(self.db_path)
         conn = connect_db(self.db_path)
 
         logger.info("Populating FTS index...")
