@@ -160,6 +160,17 @@ query ($page: Int, $perPage: Int, $updatedAt_greater: Int) {
 }
 """ % MEDIA_FIELDS
 
+STATUS_SEASON_FETCH_QUERY = """
+query ($page: Int, $perPage: Int, $status: MediaStatus, $season: MediaSeason, $seasonYear: Int) {
+  Page(page: $page, perPage: $perPage) {
+    media(type: ANIME, sort: ID, status: $status, season: $season, seasonYear: $seasonYear) {
+      %s
+    }
+    pageInfo { total hasNextPage currentPage lastPage }
+  }
+}
+""" % MEDIA_FIELDS
+
 
 class AniListFetcher:
     def __init__(self, data_dir: str):
@@ -319,54 +330,60 @@ class AniListFetcher:
 
         return count
 
-    def _fetch_by_status_with_seasons(self, conn, status: str, seen_ids: set) -> int:
-        page = 1
-        count = 0
-        while True:
-            data = self._request(STATUS_FETCH_QUERY, {
-                "page": page, "perPage": PER_PAGE, "status": status
-            })
-            if not data or "data" not in data:
-                time.sleep(3)
-                data = self._request(STATUS_FETCH_QUERY, {
-                    "page": page, "perPage": PER_PAGE, "status": status
-                })
-                if not data or "data" not in data:
-                    logger.error(f"Failed status={status} page {page} twice, skipping")
-                    break
-
-            media_list = data["data"]["Page"].get("media", [])
-            page_info = data["data"]["Page"].get("pageInfo", {})
-
-            if not media_list:
-                break
-
-            new_in_batch = 0
-            for media in media_list:
-                aid = media.get("id")
-                if aid and aid not in seen_ids:
-                    seen_ids.add(aid)
-                    self._process_anime(conn, media)
-                    count += 1
-                    new_in_batch += 1
-
-            if new_in_batch == 0 and page > 200:
-                break
-
-            if not page_info.get("hasNextPage"):
-                break
-            page += 1
-
-        return count
-
     def _fetch_missing_by_season_year(self, conn, seen_ids: set) -> int:
         total = 0
-        logger.info("Running status-based sweep for anime without season data...")
+        seasons = ["WINTER", "SPRING", "SUMMER", "FALL"]
+        current_year = datetime.now(timezone.utc).year
+        year_range = range(1917, current_year + 2)
+
+        logger.info("Status sweep: fetching by status+season+year combos...")
         for status in ["FINISHED", "RELEASING", "NOT_YET_RELEASED", "CANCELLED"]:
-            new_count = self._fetch_by_status_with_seasons(conn, status, seen_ids)
-            total += new_count
-            if new_count > 0:
-                logger.info(f"Status sweep ({status}): +{new_count} anime")
+            status_count = 0
+            for year in year_range:
+                for season in seasons:
+                    page = 1
+                    while True:
+                        data = self._request(STATUS_SEASON_FETCH_QUERY, {
+                            "page": page, "perPage": PER_PAGE, "status": status,
+                            "season": season, "seasonYear": year
+                        })
+                        if not data or "data" not in data:
+                            time.sleep(3)
+                            data = self._request(STATUS_SEASON_FETCH_QUERY, {
+                                "page": page, "perPage": PER_PAGE, "status": status,
+                                "season": season, "seasonYear": year
+                            })
+                            if not data or "data" not in data:
+                                break
+
+                        media_list = data["data"]["Page"].get("media", [])
+                        page_info = data["data"]["Page"].get("pageInfo", {})
+
+                        if not media_list:
+                            break
+
+                        new_in_batch = 0
+                        for media in media_list:
+                            aid = media.get("id")
+                            if aid and aid not in seen_ids:
+                                seen_ids.add(aid)
+                                self._process_anime(conn, media)
+                                status_count += 1
+                                total += 1
+                                new_in_batch += 1
+
+                        if new_in_batch == 0:
+                            break
+
+                        if not page_info.get("hasNextPage"):
+                            break
+                        page += 1
+
+                if year % 5 == 0:
+                    conn.commit()
+
+            if status_count > 0:
+                logger.info(f"Status sweep ({status}): +{status_count} anime")
             conn.commit()
 
         return total
@@ -409,6 +426,8 @@ class AniListFetcher:
 
                     if new_count > 0:
                         logger.info(f"{season} {year}: +{new_count} anime (total: {total_fetched})")
+                    else:
+                        logger.info(f"{season} {year}: 0 new anime (total: {total_fetched})")
 
                     if total_fetched % 200 == 0:
                         conn.commit()
@@ -421,7 +440,6 @@ class AniListFetcher:
                         })
 
             logger.info(f"Season+year pass complete. Total unique anime: {total_fetched}")
-            logger.info("Running status-based sweep for anime without season data...")
             new_count = self._fetch_missing_by_season_year(conn, seen_ids)
             total_fetched += new_count
             if new_count > 0:
