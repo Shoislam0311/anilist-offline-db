@@ -320,6 +320,10 @@ class AniListFetcher:
             for media in media_list:
                 aid = media.get("id")
                 if aid and aid not in seen_ids:
+                    media_season = (media.get("season") or "").upper()
+                    media_year = media.get("seasonYear")
+                    if media_season != season or media_year != year:
+                        continue
                     seen_ids.add(aid)
                     self._process_anime(conn, media)
                     count += 1
@@ -366,6 +370,10 @@ class AniListFetcher:
                         for media in media_list:
                             aid = media.get("id")
                             if aid and aid not in seen_ids:
+                                media_season = (media.get("season") or "").upper()
+                                media_year = media.get("seasonYear")
+                                if media_season != season or media_year != year:
+                                    continue
                                 seen_ids.add(aid)
                                 self._process_anime(conn, media)
                                 status_count += 1
