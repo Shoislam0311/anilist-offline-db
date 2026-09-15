@@ -128,7 +128,7 @@ query ($page: Int, $perPage: Int, $sort: [MediaSort]) {
 """ % MEDIA_FIELDS
 
 SEASON_FETCH_QUERY = """
-query ($page: Int, $perPage: Int, $season: Season, $seasonYear: Int) {
+query ($page: Int, $perPage: Int, $season: MediaSeason, $seasonYear: Int) {
   Page(page: $page, perPage: $perPage) {
     media(type: ANIME, sort: ID, season: $season, seasonYear: $seasonYear) {
       %s
