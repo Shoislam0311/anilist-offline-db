@@ -74,7 +74,8 @@ jobs:
         run: python scripts/api_generator.py
 
       - name: Show database stats
-        run: python -c "
+        run: |
+          python -c "
           import sys
           sys.path.insert(0, 'scripts')
           from db_utils import connect_db, get_database_stats
@@ -101,13 +102,13 @@ jobs:
           else
             TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
             ANIME_COUNT=$(python -c "
-              import sys
-              sys.path.insert(0, 'scripts')
-              from db_utils import connect_db
-              conn = connect_db('data/anilist.db')
-              count = conn.execute('SELECT COUNT(*) FROM anime').fetchone()[0]
-              conn.close()
-              print(count)
+            import sys
+            sys.path.insert(0, 'scripts')
+            from db_utils import connect_db
+            conn = connect_db('data/anilist.db')
+            count = conn.execute('SELECT COUNT(*) FROM anime').fetchone()[0]
+            conn.close()
+            print(count)
             ")
             git commit -m "update: ${{ steps.mode.outputs.mode }} fetch - $ANIME_COUNT anime - $TIMESTAMP"
           fi
@@ -119,13 +120,13 @@ jobs:
         id: stats
         run: |
           ANIME_COUNT=$(python -c "
-            import sys
-            sys.path.insert(0, 'scripts')
-            from db_utils import connect_db
-            conn = connect_db('data/anilist.db')
-            count = conn.execute('SELECT COUNT(*) FROM anime').fetchone()[0]
-            conn.close()
-            print(count)
+          import sys
+          sys.path.insert(0, 'scripts')
+          from db_utils import connect_db
+          conn = connect_db('data/anilist.db')
+          count = conn.execute('SELECT COUNT(*) FROM anime').fetchone()[0]
+          conn.close()
+          print(count)
           ")
           echo "anime_count=$ANIME_COUNT" >> $GITHUB_OUTPUT
           echo "date=$(date -u +'%Y-%m-%d')" >> $GITHUB_OUTPUT
