@@ -127,6 +127,28 @@ query ($page: Int, $perPage: Int, $sort: [MediaSort]) {
 }
 """ % MEDIA_FIELDS
 
+SEASON_FETCH_QUERY = """
+query ($page: Int, $perPage: Int, $season: Season, $seasonYear: Int) {
+  Page(page: $page, perPage: $perPage) {
+    media(type: ANIME, sort: ID, season: $season, seasonYear: $seasonYear) {
+      %s
+    }
+    pageInfo { total hasNextPage currentPage lastPage }
+  }
+}
+""" % MEDIA_FIELDS
+
+STATUS_FETCH_QUERY = """
+query ($page: Int, $perPage: Int, $status: MediaStatus) {
+  Page(page: $page, perPage: $perPage) {
+    media(type: ANIME, sort: ID, status: $status) {
+      %s
+    }
+    pageInfo { total hasNextPage currentPage lastPage }
+  }
+}
+""" % MEDIA_FIELDS
+
 INCREMENTAL_FETCH_QUERY = """
 query ($page: Int, $perPage: Int, $updatedAt_greater: Int) {
   Page(page: $page, perPage: $perPage) {
@@ -261,90 +283,149 @@ class AniListFetcher:
         upsert_external_links(conn, media["id"], media.get("externalLinks", []) or [])
         upsert_streaming_episodes(conn, media["id"], media.get("streamingEpisodes", []) or [])
 
+    def _fetch_season_year(self, conn, season: str, year: int, seen_ids: set) -> int:
+        page = 1
+        count = 0
+        while True:
+            data = self._request(SEASON_FETCH_QUERY, {
+                "page": page, "perPage": PER_PAGE, "season": season, "seasonYear": year
+            })
+            if not data or "data" not in data:
+                time.sleep(3)
+                data = self._request(SEASON_FETCH_QUERY, {
+                    "page": page, "perPage": PER_PAGE, "season": season, "seasonYear": year
+                })
+                if not data or "data" not in data:
+                    logger.error(f"Failed {season} {year} page {page} twice, skipping")
+                    break
+
+            media_list = data["data"]["Page"].get("media", [])
+            page_info = data["data"]["Page"].get("pageInfo", {})
+
+            if not media_list:
+                break
+
+            for media in media_list:
+                aid = media.get("id")
+                if aid and aid not in seen_ids:
+                    seen_ids.add(aid)
+                    self._process_anime(conn, media)
+                    count += 1
+
+            if not page_info.get("hasNextPage"):
+                break
+            page += 1
+
+        return count
+
+    def _fetch_by_status(self, conn, status: str, seen_ids: set) -> int:
+        page = 1
+        count = 0
+        while True:
+            data = self._request(STATUS_FETCH_QUERY, {
+                "page": page, "perPage": PER_PAGE, "status": status
+            })
+            if not data or "data" not in data:
+                time.sleep(3)
+                data = self._request(STATUS_FETCH_QUERY, {
+                    "page": page, "perPage": PER_PAGE, "status": status
+                })
+                if not data or "data" not in data:
+                    logger.error(f"Failed status={status} page {page} twice, skipping")
+                    break
+
+            media_list = data["data"]["Page"].get("media", [])
+            page_info = data["data"]["Page"].get("pageInfo", {})
+
+            if not media_list:
+                break
+
+            new_in_batch = 0
+            for media in media_list:
+                aid = media.get("id")
+                if aid and aid not in seen_ids:
+                    seen_ids.add(aid)
+                    self._process_anime(conn, media)
+                    count += 1
+                    new_in_batch += 1
+
+            if new_in_batch == 0 and page > 200:
+                break
+
+            if not page_info.get("hasNextPage"):
+                break
+            page += 1
+
+        return count
+
     def full_fetch(self):
-        logger.info("Starting full fetch of all anime from AniList...")
+        logger.info("Starting full fetch of ALL anime from AniList...")
+        logger.info("Strategy: season+year combos + status fallback for complete coverage")
         conn = init_db(self.db_path)
         set_metadata(conn, "fetch_type", "full")
         set_metadata(conn, "fetch_started_at", datetime.now(timezone.utc).isoformat())
 
-        old_anime_ids = set()
+        seen_ids = set()
         for row in conn.execute("SELECT id FROM anime"):
-            old_anime_ids.add(row[0])
+            seen_ids.add(row[0])
 
-        page = 1
-        total_fetched = 0
-        total_pages = None
         checkpoint = self._load_checkpoint()
-
         if checkpoint and checkpoint.get("fetch_type") == "full":
-            page = checkpoint.get("page", 1)
+            already_done = checkpoint.get("seasons_done", [])
+            seen_ids = set(checkpoint.get("seen_ids", []))
             total_fetched = checkpoint.get("total_fetched", 0)
-            logger.info(f"Resuming from checkpoint: page {page}, {total_fetched} anime fetched")
+            logger.info(f"Resuming: {len(already_done)} seasons done, {total_fetched} anime")
+        else:
+            already_done = []
+            total_fetched = len(seen_ids)
+
+        seasons = ["WINTER", "SPRING", "SUMMER", "FALL"]
+        current_year = datetime.now(timezone.utc).year
+        year_range = range(1917, current_year + 2)
 
         try:
-            while True:
-                logger.info(f"Fetching page {page}... ({total_fetched} anime so far)")
-                data = self._request(FULL_FETCH_QUERY, {"page": page, "perPage": PER_PAGE, "sort": "ID"})
+            for year in year_range:
+                for season in seasons:
+                    combo = f"{season}_{year}"
+                    if combo in already_done:
+                        continue
 
-                if not data or "data" not in data:
-                    logger.error(f"Failed to fetch page {page}. Retrying...")
-                    time.sleep(5)
-                    data = self._request(FULL_FETCH_QUERY, {"page": page, "perPage": PER_PAGE, "sort": "ID"})
-                    if not data or "data" not in data:
-                        logger.error(f"Failed again on page {page}. Saving checkpoint and exiting.")
+                    new_count = self._fetch_season_year(conn, season, year, seen_ids)
+                    total_fetched += new_count
+                    already_done.append(combo)
+
+                    if new_count > 0:
+                        logger.info(f"{season} {year}: +{new_count} anime (total: {total_fetched})")
+
+                    if total_fetched % 200 == 0:
+                        conn.commit()
                         self._save_checkpoint({
                             "fetch_type": "full",
-                            "page": page,
+                            "seasons_done": already_done,
+                            "seen_ids": list(seen_ids),
                             "total_fetched": total_fetched,
                             "timestamp": datetime.now(timezone.utc).isoformat()
                         })
-                        break
 
-                page_data = data["data"]["Page"]
-                media_list = page_data.get("media", [])
-                page_info = page_data.get("pageInfo", {})
-
-                if total_pages is None:
-                    total_pages = page_info.get("lastPage", 0)
-                    logger.info(f"Total pages: {total_pages}")
-
-                if not media_list:
-                    logger.info("No more media found. Fetch complete.")
-                    break
-
-                if total_pages and page >= total_pages:
-                    logger.info(f"Reached last page ({total_pages}). Fetch complete.")
-                    break
-
-                for media in media_list:
-                    self._process_anime(conn, media)
-                    total_fetched += 1
-
-                if total_fetched % 500 == 0:
-                    conn.commit()
-                    self._save_checkpoint({
-                        "fetch_type": "full",
-                        "page": page,
-                        "total_fetched": total_fetched,
-                        "timestamp": datetime.now(timezone.utc).isoformat()
-                    })
-                    logger.info(f"Saved checkpoint: {total_fetched} anime")
-
-                if not page_info.get("hasNextPage"):
-                    logger.info("No more pages. Fetch complete.")
-                    break
-
-                page += 1
+            logger.info(f"Season+year pass complete. Total unique anime: {total_fetched}")
+            logger.info("Running status-based sweep for anime without season data...")
+            for status in ["FINISHED", "RELEASING", "NOT_YET_RELEASED", "CANCELLED"]:
+                new_count = self._fetch_by_status(conn, status, seen_ids)
+                total_fetched += new_count
+                if new_count > 0:
+                    logger.info(f"Status sweep ({status}): +{new_count} anime (total: {total_fetched})")
+                conn.commit()
 
             conn.commit()
-            logger.info(f"Full fetch complete. Total anime: {total_fetched}")
+            logger.info(f"Full fetch complete. Total unique anime: {total_fetched}")
 
         except KeyboardInterrupt:
             logger.info("Interrupted. Saving checkpoint...")
             conn.commit()
             self._save_checkpoint({
                 "fetch_type": "full",
-                "page": page,
+                "seasons_done": already_done,
+                "seen_ids": list(seen_ids),
                 "total_fetched": total_fetched,
                 "timestamp": datetime.now(timezone.utc).isoformat()
             })
@@ -523,8 +604,12 @@ def main():
     elapsed = time.time() - start_time
     minutes = int(elapsed // 60)
     seconds = int(elapsed % 60)
-    logger.info(f"Total time: {minutes}m {seconds}s")
+    logger.info(f"=" * 60)
+    logger.info(f"Completed in {minutes}m {seconds}s")
     logger.info(f"Total API requests: {fetcher.request_count}")
+    if fetcher.request_count > 0:
+        logger.info(f"Avg: {elapsed/fetcher.request_count:.1f}s per request")
+    logger.info(f"=" * 60)
 
 
 if __name__ == "__main__":
