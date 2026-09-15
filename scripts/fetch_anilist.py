@@ -35,10 +35,10 @@ logger = logging.getLogger(__name__)
 
 ANILIST_API = "https://graphql.anilist.co"
 PER_PAGE = 50
-RATE_LIMIT_DELAY = 2.1
+RATE_LIMIT_DELAY = 2.5
 MAX_RETRIES = 5
 BACKOFF_BASE = 2
-REQUESTS_PER_MINUTE = 28
+REQUESTS_PER_MINUTE = 25
 BATCH_WINDOW = 60
 request_timestamps = []
 
@@ -303,6 +303,7 @@ class AniListFetcher:
             page_info = data["data"]["Page"].get("pageInfo", {})
 
             if not media_list:
+                logger.debug(f"{season} {year}: no anime found (page {page})")
                 break
 
             for media in media_list:
@@ -318,7 +319,7 @@ class AniListFetcher:
 
         return count
 
-    def _fetch_by_status(self, conn, status: str, seen_ids: set) -> int:
+    def _fetch_by_status_with_seasons(self, conn, status: str, seen_ids: set) -> int:
         page = 1
         count = 0
         while True:
@@ -357,6 +358,18 @@ class AniListFetcher:
             page += 1
 
         return count
+
+    def _fetch_missing_by_season_year(self, conn, seen_ids: set) -> int:
+        total = 0
+        logger.info("Running status-based sweep for anime without season data...")
+        for status in ["FINISHED", "RELEASING", "NOT_YET_RELEASED", "CANCELLED"]:
+            new_count = self._fetch_by_status_with_seasons(conn, status, seen_ids)
+            total += new_count
+            if new_count > 0:
+                logger.info(f"Status sweep ({status}): +{new_count} anime")
+            conn.commit()
+
+        return total
 
     def full_fetch(self):
         logger.info("Starting full fetch of ALL anime from AniList...")
@@ -409,12 +422,10 @@ class AniListFetcher:
 
             logger.info(f"Season+year pass complete. Total unique anime: {total_fetched}")
             logger.info("Running status-based sweep for anime without season data...")
-            for status in ["FINISHED", "RELEASING", "NOT_YET_RELEASED", "CANCELLED"]:
-                new_count = self._fetch_by_status(conn, status, seen_ids)
-                total_fetched += new_count
-                if new_count > 0:
-                    logger.info(f"Status sweep ({status}): +{new_count} anime (total: {total_fetched})")
-                conn.commit()
+            new_count = self._fetch_missing_by_season_year(conn, seen_ids)
+            total_fetched += new_count
+            if new_count > 0:
+                logger.info(f"Status sweep complete: +{new_count} anime (total: {total_fetched})")
 
             conn.commit()
             logger.info(f"Full fetch complete. Total unique anime: {total_fetched}")

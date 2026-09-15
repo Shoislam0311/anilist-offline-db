@@ -74,17 +74,7 @@ jobs:
         run: python scripts/api_generator.py
 
       - name: Show database stats
-        run: |
-          python -c "
-          import sys
-          sys.path.insert(0, 'scripts')
-          from db_utils import connect_db, get_database_stats
-          import json
-          conn = connect_db('data/anilist.db')
-          stats = get_database_stats(conn)
-          print(json.dumps(stats, indent=2))
-          conn.close()
-          "
+        run: python -c "import sys; sys.path.insert(0, 'scripts'); from db_utils import connect_db, get_database_stats; import json; conn = connect_db('data/anilist.db'); stats = get_database_stats(conn); print(json.dumps(stats, indent=2)); conn.close()"
 
       - name: Copy API data to docs
         run: |
@@ -101,15 +91,7 @@ jobs:
             echo "No changes to commit"
           else
             TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
-            ANIME_COUNT=$(python -c "
-            import sys
-            sys.path.insert(0, 'scripts')
-            from db_utils import connect_db
-            conn = connect_db('data/anilist.db')
-            count = conn.execute('SELECT COUNT(*) FROM anime').fetchone()[0]
-            conn.close()
-            print(count)
-            ")
+            ANIME_COUNT=$(python -c "import sys; sys.path.insert(0, 'scripts'); from db_utils import connect_db; conn = connect_db('data/anilist.db'); count = conn.execute('SELECT COUNT(*) FROM anime').fetchone()[0]; conn.close(); print(count)")
             git commit -m "update: ${{ steps.mode.outputs.mode }} fetch - $ANIME_COUNT anime - $TIMESTAMP"
           fi
 
@@ -119,15 +101,7 @@ jobs:
       - name: Get database stats for release
         id: stats
         run: |
-          ANIME_COUNT=$(python -c "
-          import sys
-          sys.path.insert(0, 'scripts')
-          from db_utils import connect_db
-          conn = connect_db('data/anilist.db')
-          count = conn.execute('SELECT COUNT(*) FROM anime').fetchone()[0]
-          conn.close()
-          print(count)
-          ")
+          ANIME_COUNT=$(python -c "import sys; sys.path.insert(0, 'scripts'); from db_utils import connect_db; conn = connect_db('data/anilist.db'); count = conn.execute('SELECT COUNT(*) FROM anime').fetchone()[0]; conn.close(); print(count)")
           echo "anime_count=$ANIME_COUNT" >> $GITHUB_OUTPUT
           echo "date=$(date -u +'%Y-%m-%d')" >> $GITHUB_OUTPUT
 
