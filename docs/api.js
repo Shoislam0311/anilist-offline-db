@@ -84,7 +84,18 @@ async function loadAllAnime() {
 
 async function loadAnimeById(id) {
     if (!metadata) return null;
-    const shardIdx = Math.floor(id / metadata.shardSize);
+    let shardIdx = 0;
+    if (metadata.shardStartIds) {
+        const starts = metadata.shardStartIds;
+        let lo = 0, hi = starts.length - 1;
+        while (lo < hi) {
+            const mid = (lo + hi + 1) >> 1;
+            if (starts[mid] <= id) lo = mid; else hi = mid - 1;
+        }
+        shardIdx = lo;
+    } else {
+        shardIdx = Math.floor(id / metadata.shardSize);
+    }
     const shard = await loadShard(shardIdx);
     return shard.find(a => a.id === id) || null;
 }

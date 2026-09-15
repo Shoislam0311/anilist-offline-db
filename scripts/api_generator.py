@@ -189,10 +189,19 @@ def generate_metadata(conn, output_dir: str):
     )]
     stats["years"] = years
 
-    max_id = conn.execute("SELECT MAX(id) FROM anime").fetchone()[0] or 0
     shard_size = 200
-    stats["totalShards"] = (max_id + shard_size - 1) // shard_size
+    stats["totalShards"] = (stats["totalAnime"] + shard_size - 1) // shard_size
     stats["shardSize"] = shard_size
+
+    shard_start_ids = []
+    for shard_idx in range(stats["totalShards"]):
+        offset = shard_idx * shard_size
+        first_id = conn.execute(
+            "SELECT id FROM anime ORDER BY id LIMIT 1 OFFSET ?",
+            (offset,)
+        ).fetchone()
+        shard_start_ids.append(first_id[0] if first_id else 0)
+    stats["shardStartIds"] = shard_start_ids
 
     from datetime import datetime, timezone
     stats["generatedAt"] = datetime.now(timezone.utc).isoformat()
