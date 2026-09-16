@@ -338,10 +338,16 @@ class AniListFetcher:
         total = 0
         seasons = ["WINTER", "SPRING", "SUMMER", "FALL"]
         current_year = datetime.now(timezone.utc).year
-        year_range = range(1917, current_year + 2)
+
+        status_ranges = {
+            "FINISHED": range(1940, current_year + 1),
+            "RELEASING": range(max(2020, current_year - 6), current_year + 1),
+            "NOT_YET_RELEASED": range(current_year, current_year + 3),
+            "CANCELLED": range(1990, current_year + 1),
+        }
 
         logger.info("Status sweep: fetching by status+season+year combos...")
-        for status in ["FINISHED", "RELEASING", "NOT_YET_RELEASED", "CANCELLED"]:
+        for status, year_range in status_ranges.items():
             status_count = 0
             for year in year_range:
                 for season in seasons:
@@ -419,7 +425,7 @@ class AniListFetcher:
 
         seasons = ["WINTER", "SPRING", "SUMMER", "FALL"]
         current_year = datetime.now(timezone.utc).year
-        year_range = range(1917, current_year + 2)
+        year_range = range(1940, current_year + 2)
 
         try:
             for year in year_range:
@@ -615,6 +621,130 @@ class AniListFetcher:
         self._clear_checkpoint()
         logger.info("Post-fetch complete.")
 
+    def airing_fetch(self):
+        logger.info("Daily airing update: refreshing RELEASING anime schedules and scores...")
+        conn = init_db(self.db_path)
+        set_metadata(conn, "fetch_type", "airing")
+        set_metadata(conn, "fetch_started_at", datetime.now(timezone.utc).isoformat())
+
+        total_updated = 0
+        page = 1
+
+        try:
+            while True:
+                logger.info(f"Fetching RELEASING anime page {page}...")
+                data = self._request(STATUS_FETCH_QUERY, {
+                    "page": page, "perPage": PER_PAGE, "status": "RELEASING"
+                })
+
+                if not data or "data" not in data:
+                    time.sleep(3)
+                    data = self._request(STATUS_FETCH_QUERY, {
+                        "page": page, "perPage": PER_PAGE, "status": "RELEASING"
+                    })
+                    if not data or "data" not in data:
+                        logger.error(f"Failed to fetch RELEASING page {page}, stopping")
+                        break
+
+                media_list = data["data"]["Page"].get("media", [])
+                page_info = data["data"]["Page"].get("pageInfo", {})
+
+                if not media_list:
+                    break
+
+                for media in media_list:
+                    self._process_anime(conn, media)
+                    total_updated += 1
+
+                if total_updated % 200 == 0:
+                    conn.commit()
+
+                if not page_info.get("hasNextPage"):
+                    break
+                page += 1
+
+            conn.commit()
+            logger.info(f"Daily airing update complete. Updated: {total_updated} RELEASING anime")
+
+        except KeyboardInterrupt:
+            logger.info("Interrupted. Saving progress...")
+            conn.commit()
+        finally:
+            conn.close()
+
+        return total_updated
+
+    def upcoming_fetch(self):
+        logger.info("Weekly upcoming sweep: fetching NOT_YET_RELEASED anime...")
+        conn = init_db(self.db_path)
+        set_metadata(conn, "fetch_type", "upcoming")
+        set_metadata(conn, "fetch_started_at", datetime.now(timezone.utc).isoformat())
+
+        seen_ids = set()
+        for row in conn.execute("SELECT id FROM anime"):
+            seen_ids.add(row[0])
+
+        current_year = datetime.now(timezone.utc).year
+        seasons = ["WINTER", "SPRING", "SUMMER", "FALL"]
+        total_new = 0
+
+        try:
+            for status in ["NOT_YET_RELEASED", "RELEASING"]:
+                for year in range(current_year - 1, current_year + 3):
+                    for season in seasons:
+                        page = 1
+                        while True:
+                            data = self._request(STATUS_SEASON_FETCH_QUERY, {
+                                "page": page, "perPage": PER_PAGE, "status": status,
+                                "season": season, "seasonYear": year
+                            })
+                            if not data or "data" not in data:
+                                time.sleep(3)
+                                data = self._request(STATUS_SEASON_FETCH_QUERY, {
+                                    "page": page, "perPage": PER_PAGE, "status": status,
+                                    "season": season, "seasonYear": year
+                                })
+                                if not data or "data" not in data:
+                                    break
+
+                            media_list = data["data"]["Page"].get("media", [])
+                            page_info = data["data"]["Page"].get("pageInfo", {})
+
+                            if not media_list:
+                                break
+
+                            new_in_batch = 0
+                            for media in media_list:
+                                aid = media.get("id")
+                                if aid and aid not in seen_ids:
+                                    media_season = (media.get("season") or "").upper()
+                                    media_year = media.get("seasonYear")
+                                    if media_season != season or media_year != year:
+                                        continue
+                                    seen_ids.add(aid)
+                                    self._process_anime(conn, media)
+                                    total_new += 1
+                                    new_in_batch += 1
+
+                            if new_in_batch == 0:
+                                break
+
+                            if not page_info.get("hasNextPage"):
+                                break
+                            page += 1
+
+                        conn.commit()
+
+            logger.info(f"Weekly upcoming sweep complete. New anime: {total_new}")
+
+        except KeyboardInterrupt:
+            logger.info("Interrupted. Saving progress...")
+            conn.commit()
+        finally:
+            conn.close()
+
+        return total_new
+
 
 def main():
     data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
@@ -633,6 +763,10 @@ def main():
 
     if mode == "full":
         fetcher.full_fetch()
+    elif mode == "airing":
+        fetcher.airing_fetch()
+    elif mode == "upcoming":
+        fetcher.upcoming_fetch()
     else:
         fetcher.incremental_fetch()
 

@@ -2,17 +2,21 @@ name: Update AniList Database
 
 on:
   schedule:
-    - cron: '0 4 * * *'
+    - cron: '0 4 * * *'    # Daily at 04:00 UTC
+    - cron: '0 4 * * 0'    # Weekly on Sunday at 04:00 UTC
+    - cron: '0 4 1 * *'    # Monthly on 1st at 04:00 UTC
   workflow_dispatch:
     inputs:
       fetch_mode:
-        description: 'Fetch mode (full or incremental)'
+        description: 'Fetch mode'
         required: false
-        default: 'incremental'
+        default: 'airing'
         type: choice
         options:
-          - incremental
+          - airing
+          - upcoming
           - full
+          - incremental
 
 permissions:
   contents: write
@@ -54,11 +58,16 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "mode=${{ github.event.inputs.fetch_mode }}" >> $GITHUB_OUTPUT
           else
-            LAST_COMMIT_MSG=$(git log -1 --pretty=%B 2>/dev/null || echo "")
-            if echo "$LAST_COMMIT_MSG" | grep -q "full fetch"; then
-              echo "mode=incremental" >> $GITHUB_OUTPUT
+            HOUR=$(date -u +%-H)
+            DOW=$(date -u +%-u)
+            DOM=$(date -u +%-d)
+
+            if [ "$DOM" = "1" ]; then
+              echo "mode=full" >> $GITHUB_OUTPUT
+            elif [ "$DOW" = "7" ]; then
+              echo "mode=upcoming" >> $GITHUB_OUTPUT
             else
-              echo "mode=incremental" >> $GITHUB_OUTPUT
+              echo "mode=airing" >> $GITHUB_OUTPUT
             fi
           fi
 
@@ -100,12 +109,14 @@ jobs:
 
       - name: Get database stats for release
         id: stats
+        if: steps.mode.outputs.mode == 'full'
         run: |
           ANIME_COUNT=$(python -c "import sys; sys.path.insert(0, 'scripts'); from db_utils import connect_db; conn = connect_db('data/anilist.db'); count = conn.execute('SELECT COUNT(*) FROM anime').fetchone()[0]; conn.close(); print(count)")
           echo "anime_count=$ANIME_COUNT" >> $GITHUB_OUTPUT
           echo "date=$(date -u +'%Y-%m-%d')" >> $GITHUB_OUTPUT
 
       - name: Create compressed archives
+        if: steps.mode.outputs.mode == 'full'
         run: |
           cd data
           tar -czf ../anilist-db-${{ steps.stats.outputs.date }}.tar.gz anilist.db anilist.json
@@ -115,6 +126,7 @@ jobs:
           ls -lh *.gz data/*.gz 2>/dev/null
 
       - name: Create GitHub Release
+        if: steps.mode.outputs.mode == 'full'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "db-${{ steps.stats.outputs.date }}"
