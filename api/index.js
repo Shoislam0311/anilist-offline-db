@@ -113,18 +113,40 @@ async function getShardStartIds() {
   const meta = await getMetadata();
   if (meta.shardStartIds?.length) return meta.shardStartIds;
   if (builtShardStartIds) return builtShardStartIds;
+  // Parallel cold-start probe: fetch shards 0-15 in parallel to find the
+  // boundary, then fetch remaining shards in batches of 10 in parallel.
+  // Drops cold-start from ~100s sequential to ~5-10s total.
   builtShardStartIds = [];
+  const BATCH = 10;
   let i = 0;
-  for (;;) {
-    try {
-      const shard = await getShard(i);
-      if (!shard.length) break;
-      builtShardStartIds.push(shard[0].id);
-      i++;
-      if (i > 2000) break;
-    } catch {
-      break;
+  // Phase 1: probe first 16 shards (covers ~3200 anime, enough to find boundary)
+  const phase1 = await Promise.allSettled(
+    Array.from({ length: 16 }, (_, k) => getShard(k).then((s) => ({ k, s })))
+  );
+  for (const r of phase1) {
+    if (r.status === 'fulfilled' && r.value.s.length) {
+      builtShardStartIds[r.value.k] = r.value.s[0].id;
+      i = Math.max(i, r.value.k + 1);
     }
+  }
+  if (!builtShardStartIds.length) return builtShardStartIds;
+  // Phase 2: continue in parallel batches until a gap
+  for (let start = i; start < 2000; start += BATCH) {
+    const batch = await Promise.allSettled(
+      Array.from({ length: BATCH }, (_, k) => {
+        const idx = start + k;
+        return getShard(idx).then((s) => ({ idx, s }));
+      })
+    );
+    let hitGap = false;
+    for (const r of batch) {
+      if (r.status === 'fulfilled' && r.value.s.length) {
+        builtShardStartIds[r.value.idx] = r.value.s[0].id;
+      } else {
+        hitGap = true;
+      }
+    }
+    if (hitGap) break;
   }
   return builtShardStartIds;
 }
