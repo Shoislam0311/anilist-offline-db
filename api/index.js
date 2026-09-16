@@ -83,6 +83,7 @@ function transformAnime(anime) {
 let metaEntry = null;
 let indexEntry = null;
 const shardCache = new Map();
+let builtShardStartIds = null;
 
 async function fetchJSON(url) {
   const r = await fetch(url);
@@ -108,6 +109,21 @@ async function getSearchIndex() {
   return indexEntry.data;
 }
 
+async function getShardStartIds() {
+  const meta = await getMetadata();
+  if (meta.shardStartIds?.length) return meta.shardStartIds;
+  if (builtShardStartIds) return builtShardStartIds;
+  const index = await getSearchIndex();
+  const sorted = [...index].sort((a, b) => a.id - b.id);
+  const totalShards = meta.totalShards || Math.ceil(sorted.length / 200);
+  const size = Math.ceil(sorted.length / totalShards);
+  builtShardStartIds = [];
+  for (let i = 0; i < sorted.length; i += size) {
+    builtShardStartIds.push(sorted[i].id);
+  }
+  return builtShardStartIds;
+}
+
 async function getShard(idx) {
   let entry = shardCache.get(idx);
   if (!fresh(entry)) {
@@ -124,21 +140,23 @@ async function getShard(idx) {
 }
 
 async function getAnimeById(id) {
-  const meta = await getMetadata();
-  const shardStartIds = meta.shardStartIds || [];
+  const shardStartIds = await getShardStartIds();
   let lo = 0, hi = shardStartIds.length - 1, idx = 0;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
     if (shardStartIds[mid] <= id) { idx = mid; lo = mid + 1; } else hi = mid - 1;
   }
-  const shard = await getShard(idx);
-  const found = shard.find((a) => a.id === id);
-  return found ? transformAnime(found) : null;
+  for (const tryIdx of [idx, idx - 1, idx + 1]) {
+    if (tryIdx < 0 || tryIdx >= shardStartIds.length) continue;
+    const shard = await getShard(tryIdx);
+    const found = shard.find((a) => a.id === id);
+    if (found) return transformAnime(found);
+  }
+  return null;
 }
 
 async function getAnimeBatch(ids) {
-  const meta = await getMetadata();
-  const shardStartIds = meta.shardStartIds || [];
+  const shardStartIds = await getShardStartIds();
   const byShard = new Map();
   for (const id of ids) {
     let lo = 0, hi = shardStartIds.length - 1, idx = 0;
@@ -146,15 +164,20 @@ async function getAnimeBatch(ids) {
       const mid = (lo + hi) >> 1;
       if (shardStartIds[mid] <= id) { idx = mid; lo = mid + 1; } else hi = mid - 1;
     }
-    if (!byShard.has(idx)) byShard.set(idx, []);
-    byShard.get(idx).push(id);
+    for (const tryIdx of [idx, idx - 1, idx + 1]) {
+      if (tryIdx < 0 || tryIdx >= shardStartIds.length) continue;
+      if (!byShard.has(tryIdx)) byShard.set(tryIdx, []);
+      if (!byShard.get(tryIdx).includes(id)) byShard.get(tryIdx).push(id);
+    }
   }
+  const found = new Map();
   const results = [];
   for (const [shardIdx, shardIds] of byShard) {
     const shard = await getShard(shardIdx);
     for (const id of shardIds) {
-      const found = shard.find((a) => a.id === id);
-      if (found) results.push(transformAnime(found));
+      if (found.has(id)) continue;
+      const item = shard.find((a) => a.id === id);
+      if (item) { found.set(id, true); results.push(transformAnime(item)); }
     }
   }
   return results;
