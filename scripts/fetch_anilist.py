@@ -416,11 +416,13 @@ class AniListFetcher:
         checkpoint = self._load_checkpoint()
         if checkpoint and checkpoint.get("fetch_type") == "full":
             already_done = checkpoint.get("seasons_done", [])
+            skip_combos = set(checkpoint.get("skip_combos", []))
             seen_ids = set(checkpoint.get("seen_ids", []))
             total_fetched = checkpoint.get("total_fetched", 0)
-            logger.info(f"Resuming: {len(already_done)} seasons done, {total_fetched} anime")
+            logger.info(f"Resuming: {len(already_done)} seasons done, {total_fetched} anime, {len(skip_combos)} skipped")
         else:
             already_done = []
+            skip_combos = set()
             total_fetched = len(seen_ids)
 
         seasons = ["WINTER", "SPRING", "SUMMER", "FALL"]
@@ -431,7 +433,7 @@ class AniListFetcher:
             for year in year_range:
                 for season in seasons:
                     combo = f"{season}_{year}"
-                    if combo in already_done:
+                    if combo in already_done or combo in skip_combos:
                         continue
 
                     new_count = self._fetch_season_year(conn, season, year, seen_ids)
@@ -441,13 +443,15 @@ class AniListFetcher:
                     if new_count > 0:
                         logger.info(f"{season} {year}: +{new_count} anime (total: {total_fetched})")
                     else:
-                        logger.info(f"{season} {year}: 0 new anime (total: {total_fetched})")
+                        skip_combos.add(combo)
+                        logger.info(f"{season} {year}: 0 new anime, skipping future (total: {total_fetched})")
 
                     if total_fetched % 200 == 0:
                         conn.commit()
                         self._save_checkpoint({
                             "fetch_type": "full",
                             "seasons_done": already_done,
+                            "skip_combos": list(skip_combos),
                             "seen_ids": list(seen_ids),
                             "total_fetched": total_fetched,
                             "timestamp": datetime.now(timezone.utc).isoformat()
@@ -468,6 +472,7 @@ class AniListFetcher:
             self._save_checkpoint({
                 "fetch_type": "full",
                 "seasons_done": already_done,
+                "skip_combos": list(skip_combos),
                 "seen_ids": list(seen_ids),
                 "total_fetched": total_fetched,
                 "timestamp": datetime.now(timezone.utc).isoformat()
