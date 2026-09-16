@@ -3,7 +3,7 @@
  * Drop-in mirror of https://graphql.anilist.co
  */
 
-const { parse, Kind } = require('graphql');
+import { parse, Kind } from 'graphql';
 
 const DATA_BASE = 'https://shoislam0311.github.io/anilist-offline-db/api';
 const CACHE_TTL_MS = 10 * 60 * 1000;
@@ -566,6 +566,6 @@ async function handleRequest(request) {
   }
 }
 
-module.exports = async function handler(request) {
+export default async function handler(request) {
   return handleRequest(request);
-};
+}

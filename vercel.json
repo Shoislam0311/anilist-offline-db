@@ -1,8 +1,8 @@
 {
   "rewrites": [
     { "source": "/graphql", "destination": "/" },
-    { "source": "/api/graphql", "destination": "/" },
-    { "source": "/api", "destination": "/" }
+    { "source": "/api", "destination": "/" },
+    { "source": "/api/graphql", "destination": "/" }
   ],
   "headers": [
     {
