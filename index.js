@@ -94,9 +94,15 @@ let indexEntry = null;
 const shardCache = new Map();
 
 async function fetchJSON(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`upstream ${r.status} for ${url}`);
-  return r.json();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+  try {
+    const r = await fetch(url, { signal: controller.signal });
+    if (!r.ok) throw new Error(`upstream ${r.status} for ${url}`);
+    return await r.json();
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function fresh(entry) {
@@ -520,6 +526,9 @@ async function execute(query, variables = {}, operationName = null) {
 /* -------------------------------- handler --------------------------------- */
 
 export default async function handler(request) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 55000); // 55 second timeout (less than maxDuration)
+  
   try {
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: CORS });
@@ -548,6 +557,11 @@ export default async function handler(request) {
     }
     return json({ errors: [{ message: 'Method not allowed' }] }, 405);
   } catch (err) {
+    if (err.name === 'AbortError') {
+      return json({ errors: [{ message: 'Request timeout' }] }, 504);
+    }
     return json({ errors: [{ message: err.message || 'Internal server error' }] }, 500);
+  } finally {
+    clearTimeout(timeout);
   }
 }
