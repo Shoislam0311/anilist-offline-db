@@ -1,22 +1,11 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
-    "index.js": {
-      "maxDuration": 60
+    "test-handler.js": {
+      "maxDuration": 10
     }
   },
   "rewrites": [
-    { "source": "/graphql", "destination": "/" },
-    { "source": "/api/graphql", "destination": "/" }
-  ],
-  "headers": [
-    {
-      "source": "/(.*)",
-      "headers": [
-        { "key": "Access-Control-Allow-Origin", "value": "*" },
-        { "key": "Access-Control-Allow-Methods", "value": "GET, POST, OPTIONS" },
-        { "key": "Access-Control-Allow-Headers", "value": "Content-Type" }
-      ]
-    }
+    { "source": "/test", "destination": "/test-handler.js" }
   ]
 }
