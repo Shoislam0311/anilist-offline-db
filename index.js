@@ -3,7 +3,7 @@
  * Drop-in mirror of https://graphql.anilist.co
  */
 
-import { parse, Kind } from 'graphql';
+const { parse, Kind } = require('graphql');
 
 const DATA_BASE = 'https://shoislam0311.github.io/anilist-offline-db/api';
 const CACHE_TTL_MS = 10 * 60 * 1000;
@@ -525,7 +525,7 @@ async function execute(query, variables = {}, operationName = null) {
 
 /* -------------------------------- handler --------------------------------- */
 
-export default async function handler(request) {
+async function handler(request) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 55000); // 55 second timeout (less than maxDuration)
   
@@ -565,3 +565,5 @@ export default async function handler(request) {
     clearTimeout(timeout);
   }
 }
+
+module.exports = handler;
