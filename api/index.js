@@ -113,14 +113,18 @@ async function getShardStartIds() {
   const meta = await getMetadata();
   if (meta.shardStartIds?.length) return meta.shardStartIds;
   if (builtShardStartIds) return builtShardStartIds;
-  const index = await getSearchIndex();
-  const sorted = [...index].sort((a, b) => a.id - b.id);
-  const totalShards = meta.totalShards || Math.ceil(sorted.length / 200);
-  const size = Math.ceil(sorted.length / totalShards);
-  builtShardStartIds = [];
-  for (let i = 0; i < sorted.length; i += size) {
-    builtShardStartIds.push(sorted[i].id);
+  const totalShards = meta.totalShards || 73;
+  builtShardStartIds = new Array(totalShards);
+  const probes = [];
+  for (let i = 0; i < totalShards; i++) {
+    probes.push(
+      getShard(i).then((shard) => {
+        if (shard.length > 0) builtShardStartIds[i] = shard[0].id;
+        else builtShardStartIds[i] = Infinity;
+      }).catch(() => { builtShardStartIds[i] = Infinity; })
+    );
   }
+  await Promise.all(probes);
   return builtShardStartIds;
 }
 
@@ -141,13 +145,15 @@ async function getShard(idx) {
 
 async function getAnimeById(id) {
   const shardStartIds = await getShardStartIds();
+  const totalShards = (await getMetadata()).totalShards || 73;
   let lo = 0, hi = shardStartIds.length - 1, idx = 0;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
     if (shardStartIds[mid] <= id) { idx = mid; lo = mid + 1; } else hi = mid - 1;
   }
+  idx = Math.min(idx, totalShards - 1);
   for (const tryIdx of [idx, idx - 1, idx + 1]) {
-    if (tryIdx < 0 || tryIdx >= shardStartIds.length) continue;
+    if (tryIdx < 0 || tryIdx >= totalShards) continue;
     const shard = await getShard(tryIdx);
     const found = shard.find((a) => a.id === id);
     if (found) return transformAnime(found);
@@ -157,6 +163,7 @@ async function getAnimeById(id) {
 
 async function getAnimeBatch(ids) {
   const shardStartIds = await getShardStartIds();
+  const totalShards = (await getMetadata()).totalShards || 73;
   const byShard = new Map();
   for (const id of ids) {
     let lo = 0, hi = shardStartIds.length - 1, idx = 0;
@@ -164,8 +171,9 @@ async function getAnimeBatch(ids) {
       const mid = (lo + hi) >> 1;
       if (shardStartIds[mid] <= id) { idx = mid; lo = mid + 1; } else hi = mid - 1;
     }
+    idx = Math.min(idx, totalShards - 1);
     for (const tryIdx of [idx, idx - 1, idx + 1]) {
-      if (tryIdx < 0 || tryIdx >= shardStartIds.length) continue;
+      if (tryIdx < 0 || tryIdx >= totalShards) continue;
       if (!byShard.has(tryIdx)) byShard.set(tryIdx, []);
       if (!byShard.get(tryIdx).includes(id)) byShard.get(tryIdx).push(id);
     }
