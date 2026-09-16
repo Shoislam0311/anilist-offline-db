@@ -444,7 +444,12 @@ export default async function handler(request) {
     return new Response(null, { status: 204, headers: CORS });
   }
   if (request.method === 'GET') {
-    const url = new URL(request.url);
+    let rawUrl = request.url;
+    if (!rawUrl.startsWith('http')) {
+      const host = request.headers.get('host') || 'localhost';
+      rawUrl = `https://${host}${rawUrl}`;
+    }
+    const url = new URL(rawUrl);
     const query = url.searchParams.get('query');
     if (!query) return json(INFO, 200);
     let variables = {};
