@@ -1,6 +1,33 @@
 # AniList Offline Database
 
-A complete offline database of AniList's anime catalog, built from their public GraphQL API. Includes a **full GraphQL API** on GitHub Pages with **zero rate limits**.
+A complete offline database of AniList's anime catalog, built from their public GraphQL API. Includes a **server-side GraphQL API** on Vercel plus a **client-side GraphQL playground** on GitHub Pages — both with **zero rate limits**.
+
+## Live Endpoints
+
+| Endpoint | URL |
+|----------|-----|
+| **GraphQL API (Vercel)** | `https://anilist-offline-db-phi.vercel.app/` |
+| **Web UI + Playground (Pages)** | `https://shoislam0311.github.io/anilist-offline-db/` |
+| **Raw JSON data** | `https://shoislam0311.github.io/anilist-offline-db/api/` |
+| **Repository** | `https://github.com/Shoislam0311/anilist-offline-db` |
+
+### Use the Vercel GraphQL API
+
+Drop-in replacement for `graphql.anilist.co` — same queries work, just change the URL. CORS is open (`*`), so any app or site can call it directly.
+
+```bash
+curl -X POST https://anilist-offline-db-phi.vercel.app/ \
+  -H "Content-Type: application/json" \
+  -d '{"query": "{ Page(page:1, perPage:5) { media(sort:POPULARITY_DESC) { id title { romaji english } averageScore } } }"}'
+```
+
+Query with variables:
+
+```bash
+curl -X POST https://anilist-offline-db-phi.vercel.app/ \
+  -H "Content-Type: application/json" \
+  -d '{"query": "query($search:String){Page(page:1,perPage:5){media(search:$search){id title{romaji}}}}", "variables": {"search": "Naruto"}}'
+```
 
 ## Features
 
@@ -20,9 +47,9 @@ A complete offline database of AniList's anime catalog, built from their public 
 
 ## Quick Start
 
-### Use the GraphQL API
+### Use the GraphQL API (GitHub Pages playground)
 
-Visit your GitHub Pages URL: `https://<username>.github.io/<repo>/`
+Visit the web UI: `https://shoislam0311.github.io/anilist-offline-db/`
 
 ```graphql
 {
@@ -42,7 +69,7 @@ Visit your GitHub Pages URL: `https://<username>.github.io/<repo>/`
 
 ### Download the Database
 
-Download from [Releases](https://github.com/<username>/<repo>/releases) or build locally.
+Download from [Releases](https://github.com/Shoislam0311/anilist-offline-db/releases) or build locally.
 
 ```bash
 # SQLite
@@ -81,8 +108,8 @@ python3 scripts/cli.py export --output top_anime.json --limit 100
 ### 1. Create the Repository
 
 ```bash
-git clone https://github.com/<username>/<repo>.git
-cd <repo>
+git clone https://github.com/Shoislam0311/anilist-offline-db.git
+cd anilist-offline-db
 pip install -r requirements.txt
 ```
 
@@ -171,7 +198,13 @@ For the full catalog (~22K anime):
 - ~15 minutes at 28 req/min
 - With overhead: **20-30 minutes**
 
-## GitHub Pages API
+## APIs
+
+### Vercel GraphQL API (server-side)
+
+`POST https://anilist-offline-db-phi.vercel.app/` with `{ "query", "variables", "operationName" }` — same contract as `graphql.anilist.co`. Also supports `GET` with `?query=` + `?variables=`. Supports `Page` + `Media` roots, filters (`search`, `genre`, `format`, `status`, `season`, `seasonYear`, `id`), all sorts, variables, aliases, fragments, and `operationName`. Open CORS.
+
+### GitHub Pages API (client-side)
 
 The static site loads JSON data shards and resolves GraphQL queries client-side:
 
@@ -236,7 +269,11 @@ export                   Export filtered data to JSON
 
 ```
 anilist-offline-db/
-├── .github/workflows/update-db.yml    # Daily GitHub Action
+├── .github/workflows/update-db.yml    # Daily/weekly/monthly GitHub Action
+├── api/
+│   └── index.js                        # Vercel serverless GraphQL handler
+├── vercel.json                         # Vercel rewrites + CORS headers
+├── package.json                        # Node deps (graphql parser)
 ├── scripts/
 │   ├── fetch_anilist.py                # Main API scraper
 │   ├── db_utils.py                     # SQLite + FTS5 utilities
