@@ -293,7 +293,7 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
       else if (arg.value.kind === Kind.BOOLEAN) args[arg.name.value] = arg.value.value === 'true' || arg.value.value === true;
       else if (arg.value.kind === Kind.STRING) args[arg.name.value] = arg.value.value;
       else if (arg.value.kind === Kind.ENUM) args[arg.name.value] = arg.value.value;
-      else if (arg.value.kind === Kind.LIST) args[arg.name.value] = arg.value.value.map((v) => v.value ?? v);
+      else if (arg.value.kind === Kind.LIST) args[arg.name.value] = (arg.value.values || []).map((v) => v.value ?? v);
       else if (arg.value.kind === Kind.OBJECT) {
         const obj = {};
         for (const f of arg.value.fields) {
@@ -320,7 +320,7 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
           else if (arg.value.kind === Kind.BOOLEAN) mediaArgs[arg.name.value] = arg.value.value === 'true' || arg.value.value === true;
           else if (arg.value.kind === Kind.STRING) mediaArgs[arg.name.value] = arg.value.value;
           else if (arg.value.kind === Kind.ENUM) mediaArgs[arg.name.value] = arg.value.value;
-          else if (arg.value.kind === Kind.LIST) mediaArgs[arg.name.value] = arg.value.value.map((v) => v.value ?? v);
+          else if (arg.value.kind === Kind.LIST) mediaArgs[arg.name.value] = (arg.value.values || []).map((v) => v.value ?? v);
           else if (arg.value.kind === Kind.OBJECT) {
             const obj = {};
             for (const f of arg.value.fields) {
