@@ -113,18 +113,19 @@ async function getShardStartIds() {
   const meta = await getMetadata();
   if (meta.shardStartIds?.length) return meta.shardStartIds;
   if (builtShardStartIds) return builtShardStartIds;
-  const totalShards = meta.totalShards || 73;
-  builtShardStartIds = new Array(totalShards);
-  const probes = [];
-  for (let i = 0; i < totalShards; i++) {
-    probes.push(
-      getShard(i).then((shard) => {
-        if (shard.length > 0) builtShardStartIds[i] = shard[0].id;
-        else builtShardStartIds[i] = Infinity;
-      }).catch(() => { builtShardStartIds[i] = Infinity; })
-    );
+  builtShardStartIds = [];
+  let i = 0;
+  for (;;) {
+    try {
+      const shard = await getShard(i);
+      if (!shard.length) break;
+      builtShardStartIds.push(shard[0].id);
+      i++;
+      if (i > 2000) break;
+    } catch {
+      break;
+    }
   }
-  await Promise.all(probes);
   return builtShardStartIds;
 }
 
@@ -145,8 +146,8 @@ async function getShard(idx) {
 
 async function getAnimeById(id) {
   const shardStartIds = await getShardStartIds();
-  const totalShards = (await getMetadata()).totalShards || 73;
-  let lo = 0, hi = shardStartIds.length - 1, idx = 0;
+  const totalShards = shardStartIds.length;
+  let lo = 0, hi = totalShards - 1, idx = 0;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
     if (shardStartIds[mid] <= id) { idx = mid; lo = mid + 1; } else hi = mid - 1;
@@ -163,10 +164,10 @@ async function getAnimeById(id) {
 
 async function getAnimeBatch(ids) {
   const shardStartIds = await getShardStartIds();
-  const totalShards = (await getMetadata()).totalShards || 73;
+  const totalShards = shardStartIds.length;
   const byShard = new Map();
   for (const id of ids) {
-    let lo = 0, hi = shardStartIds.length - 1, idx = 0;
+    let lo = 0, hi = totalShards - 1, idx = 0;
     while (lo <= hi) {
       const mid = (lo + hi) >> 1;
       if (shardStartIds[mid] <= id) { idx = mid; lo = mid + 1; } else hi = mid - 1;
