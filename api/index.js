@@ -310,46 +310,71 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
     if (fieldNode.name.value === 'Page') {
       const meta = await getMetadata();
       const index = await getSearchIndex();
-      const page = args.page || 1;
-      const perPage = Math.min(args.perPage || 50, 50);
+      const mediaFieldNode = fieldNode.selectionSet?.selections?.find((s) => s.kind === Kind.FIELD && s.name.value === 'media');
+      const mediaArgs = {};
+      if (mediaFieldNode?.arguments) {
+        for (const arg of mediaFieldNode.arguments) {
+          if (arg.value.kind === Kind.INT) mediaArgs[arg.name.value] = parseInt(arg.value.value, 10);
+          else if (arg.value.kind === Kind.FLOAT) mediaArgs[arg.name.value] = parseFloat(arg.value.value);
+          else if (arg.value.kind === Kind.BOOLEAN) mediaArgs[arg.name.value] = arg.value.value === 'true' || arg.value.value === true;
+          else if (arg.value.kind === Kind.STRING) mediaArgs[arg.name.value] = arg.value.value;
+          else if (arg.value.kind === Kind.ENUM) mediaArgs[arg.name.value] = arg.value.value;
+          else if (arg.value.kind === Kind.LIST) mediaArgs[arg.name.value] = arg.value.value.map((v) => v.value ?? v);
+          else if (arg.value.kind === Kind.OBJECT) {
+            const obj = {};
+            for (const f of arg.value.fields) {
+              if (f.value.kind === Kind.INT) obj[f.name.value] = parseInt(f.value.value, 10);
+              else if (f.value.kind === Kind.STRING) obj[f.name.value] = f.value.value;
+              else obj[f.name.value] = f.value.value;
+            }
+            mediaArgs[arg.name.value] = obj;
+          }
+          else if (arg.value.kind === Kind.VARIABLE) mediaArgs[arg.name.value] = variables?.[arg.value.name.value] ?? undefined;
+        }
+      }
+      const fargs = { ...mediaArgs, ...args };
+      const page = fargs.page || args.page || 1;
+      const perPage = Math.min(fargs.perPage || args.perPage || 50, 50);
+      for (const k of Object.keys(mediaArgs)) { if (mediaArgs[k] !== undefined) args[k] = mediaArgs[k]; }
+      const sargs = args;
 
       let candidateIds = null;
-      const hasFilter = args.search || args.genre || args.genre_in || args.format || args.format_in ||
-        args.status || args.status_in || args.season || args.seasonYear ||
-        args.id || args.id_in || args.startDate_greater || args.startDate_lesser ||
-        args.popularity_greater || args.averageScore_greater || args.averageScore_lesser;
+      const hasFilter = sargs.search || sargs.genre || sargs.genre_in || sargs.format || sargs.format_in ||
+        sargs.status || sargs.status_in || sargs.season || sargs.seasonYear ||
+        sargs.id || sargs.id_in || sargs.startDate_greater || sargs.startDate_lesser ||
+        sargs.popularity_greater || sargs.averageScore_greater || sargs.averageScore_lesser;
 
       if (hasFilter) {
         candidateIds = index
           .filter((e) => {
-            if (args.search) {
-              const q = args.search.toLowerCase();
+            if (sargs.search) {
+              const q = sargs.search.toLowerCase();
               if (!(e.romaji || '').toLowerCase().includes(q) &&
                 !(e.english || '').toLowerCase().includes(q) &&
                 !(e.native || '').toLowerCase().includes(q)) return false;
             }
-            if (args.genre && !e.genres?.includes(args.genre)) return false;
-            if (args.genre_in && !args.genre_in.some((g) => e.genres?.includes(g))) return false;
-            if (args.format && e.format !== args.format) return false;
-            if (args.format_in && !args.format_in.includes(e.format)) return false;
-            if (args.status && e.status !== args.status) return false;
-            if (args.status_in && !args.status_in.includes(e.status)) return false;
-            if (args.season && e.season !== args.season) return false;
-            if (args.seasonYear && e.year !== args.seasonYear) return false;
-            if (args.id && e.id !== args.id) return false;
-            if (args.id_in && !args.id_in.includes(e.id)) return false;
+            if (sargs.genre && !e.genres?.includes(sargs.genre)) return false;
+            if (sargs.genre_in && !sargs.genre_in.some((g) => e.genres?.includes(g))) return false;
+            if (sargs.format && e.format !== sargs.format) return false;
+            if (sargs.format_in && !sargs.format_in.includes(sargs.format)) return false;
+            if (sargs.status && e.status !== sargs.status) return false;
+            if (sargs.status_in && !sargs.status_in.includes(sargs.status)) return false;
+            if (sargs.season && e.season !== sargs.season) return false;
+            if (sargs.seasonYear && e.year !== sargs.seasonYear) return false;
+            if (sargs.id && e.id !== sargs.id) return false;
+            if (sargs.id_in && !sargs.id_in.includes(e.id)) return false;
             return true;
           })
           .map((e) => e.id);
       }
 
-      if (candidateIds && (args.sort || args.popularity_greater || args.averageScore_greater || args.averageScore_lesser)) {
+      if (candidateIds && (sargs.sort || sargs.popularity_greater || sargs.averageScore_greater || sargs.averageScore_lesser)) {
         const full = await getAnimeBatch(candidateIds);
         let filtered = full;
-        if (args.popularity_greater) filtered = filtered.filter((a) => (a.popularity || 0) > args.popularity_greater);
-        if (args.averageScore_greater) filtered = filtered.filter((a) => (a.averageScore || 0) > args.averageScore_greater);
-        if (args.averageScore_lesser) filtered = filtered.filter((a) => (a.averageScore || 0) < args.averageScore_lesser);
-        const sorts = args.sort ? (Array.isArray(args.sort) ? args.sort : [args.sort]) : ['POPULARITY_DESC'];
+        if (sargs.popularity_greater) filtered = filtered.filter((a) => (a.popularity || 0) > sargs.popularity_greater);
+        if (sargs.averageScore_greater) filtered = filtered.filter((a) => (a.averageScore || 0) > sargs.averageScore_greater);
+        if (sargs.averageScore_lesser) filtered = filtered.filter((a) => (a.averageScore || 0) < sargs.averageScore_lesser);
+        const sorts = sargs.sort ? (Array.isArray(sargs.sort) ? sargs.sort : [sargs.sort]) : ['POPULARITY_DESC'];
         for (const s of sorts) {
           const desc = s.endsWith('_DESC');
           const field = s.replace(/_DESC$/, '').replace(/_ASC$/, '').toLowerCase();
@@ -375,7 +400,7 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
         return out;
       }
 
-      if (candidateIds && !args.sort && !args.popularity_greater && !args.averageScore_greater && !args.averageScore_lesser) {
+      if (candidateIds && !sargs.sort && !sargs.popularity_greater && !sargs.averageScore_greater && !sargs.averageScore_lesser) {
         const total = candidateIds.length;
         const start = (page - 1) * perPage;
         const pagedIds = candidateIds.slice(start, start + perPage);
@@ -400,10 +425,10 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
       const animeIds = paged.map((e) => e.id);
       const animeList = await getAnimeBatch(animeIds);
       const mediaNode = fieldNode.selectionSet?.selections?.find((s) => s.name.value === 'media');
-      const sorts = args.sort ? (Array.isArray(args.sort) ? args.sort : [args.sort]) : null;
+      const sorts = sargs.sort ? (Array.isArray(sargs.sort) ? sargs.sort : [sargs.sort]) : null;
       let mediaResolved;
       if (sorts) {
-        mediaResolved = filterMedia(animeList, args, mediaNode, fragments);
+        mediaResolved = filterMedia(animeList, sargs, mediaNode, fragments);
       } else {
         mediaResolved = animeList.map((item) => pick(item, collectSelections(mediaNode, fragments), fragments));
       }
