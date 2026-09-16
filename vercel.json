@@ -1,0 +1,12 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/*.js": {
+      "maxDuration": 60
+    }
+  },
+  "rewrites": [
+    { "source": "/graphql", "destination": "/api/graphql" },
+    { "source": "/", "destination": "/api/graphql" }
+  ]
+}

@@ -20,6 +20,15 @@ def generate_anime_shards(conn, output_dir: str, shard_size: int = 200):
     shard_dir = os.path.join(output_dir, "shards")
     os.makedirs(shard_dir, exist_ok=True)
 
+    # Remove stale shards from previous (larger) runs so the directory
+    # never serves ghost entries. See: shrinking DB between runs.
+    import glob as _glob
+    for old in _glob.glob(os.path.join(shard_dir, "shard_*.json*")):
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+
     total = conn.execute("SELECT COUNT(*) FROM anime").fetchone()[0]
     total_shards = (total + shard_size - 1) // shard_size
 
