@@ -26,7 +26,13 @@ const INFO = {
 };
 
 function json(data, status = 200) {
-  return Response.json(data, { status, headers: CORS });
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      ...CORS,
+    },
+  });
 }
 
 /* ------------------------------- data layer ------------------------------ */
@@ -514,30 +520,34 @@ async function execute(query, variables = {}, operationName = null) {
 /* -------------------------------- handler --------------------------------- */
 
 export default async function handler(request) {
-  if (request.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: CORS });
-  }
-  if (request.method === 'GET') {
-    const url = new URL(request.url);
-    const query = url.searchParams.get('query');
-    if (!query) return json(INFO, 200);
-    let variables = {};
-    try {
-      variables = JSON.parse(url.searchParams.get('variables') || '{}');
-    } catch {
-      return json({ errors: [{ message: 'Invalid variables JSON' }] }, 400);
+  try {
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS });
     }
-    return json(await execute(query, variables, url.searchParams.get('operationName')), 200);
-  }
-  if (request.method === 'POST') {
-    let body;
-    try {
-      body = await request.json();
-    } catch {
-      return json({ errors: [{ message: 'Invalid JSON body' }] }, 400);
+    if (request.method === 'GET') {
+      const url = new URL(request.url);
+      const query = url.searchParams.get('query');
+      if (!query) return json(INFO, 200);
+      let variables = {};
+      try {
+        variables = JSON.parse(url.searchParams.get('variables') || '{}');
+      } catch {
+        return json({ errors: [{ message: 'Invalid variables JSON' }] }, 400);
+      }
+      return json(await execute(query, variables, url.searchParams.get('operationName')), 200);
     }
-    if (!body || !body.query) return json({ errors: [{ message: 'No query provided' }] }, 400);
-    return json(await execute(body.query, body.variables || {}, body.operationName || null), 200);
+    if (request.method === 'POST') {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ errors: [{ message: 'Invalid JSON body' }] }, 400);
+      }
+      if (!body || !body.query) return json({ errors: [{ message: 'No query provided' }] }, 400);
+      return json(await execute(body.query, body.variables || {}, body.operationName || null), 200);
+    }
+    return json({ errors: [{ message: 'Method not allowed' }] }, 405);
+  } catch (err) {
+    return json({ errors: [{ message: err.message || 'Internal server error' }] }, 500);
   }
-  return json({ errors: [{ message: 'Method not allowed' }] }, 405);
 }
