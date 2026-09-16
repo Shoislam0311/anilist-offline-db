@@ -525,9 +525,9 @@ async function execute(query, variables = {}, operationName = null) {
 
 /* -------------------------------- handler --------------------------------- */
 
-async function handler(request) {
+async function handleRequest(request) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 55000); // 55 second timeout (less than maxDuration)
+  const timeout = setTimeout(() => controller.abort(), 55000);
   
   try {
     if (request.method === 'OPTIONS') {
@@ -566,4 +566,6 @@ async function handler(request) {
   }
 }
 
-module.exports = handler;
+module.exports = async function handler(request) {
+  return handleRequest(request);
+};
