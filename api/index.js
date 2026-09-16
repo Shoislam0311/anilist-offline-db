@@ -282,7 +282,7 @@ function buildPageInfo(total, page, perPage) {
 
 /* ----------------------------- query executor ----------------------------- */
 
-async function resolveNode(typeName, fieldNode, fragments) {
+async function resolveNode(typeName, fieldNode, fragments, variables) {
   const sels = collectSelections(fieldNode, fragments);
   const args = {};
   if (fieldNode.arguments) {
@@ -302,7 +302,7 @@ async function resolveNode(typeName, fieldNode, fragments) {
         }
         args[arg.name.value] = obj;
       }
-      else if (arg.value.kind === Kind.VARIABLE) args[arg.name.value] = undefined;
+      else if (arg.value.kind === Kind.VARIABLE) args[arg.name.value] = variables?.[arg.value.name.value] ?? undefined;
     }
   }
 
@@ -458,7 +458,7 @@ async function execute(query, variables = {}, operationName = null) {
   for (const field of op.selectionSet.selections) {
     if (field.kind !== Kind.FIELD) continue;
     try {
-      const result = await resolveNode('RootQuery', field, fragments);
+      const result = await resolveNode('RootQuery', field, fragments, variables);
       const key = field.alias?.value || field.name.value;
       data[key] = result;
     } catch (err) {
