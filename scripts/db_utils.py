@@ -751,25 +751,41 @@ def export_json(conn: sqlite3.Connection, output_path: str):
 
         anime_dict["relations"] = []
         for r in conn.execute("""
-            SELECT r.relation_type, a.id, a.title_romaji, a.cover_large
+            SELECT r.relation_type, a.id, a.title_romaji, a.title_english, a.title_native,
+                   a.cover_large, a.banner_image, a.format, a.status, a.episodes,
+                   a.average_score, a.mean_score, a.popularity, a.source, a.is_adult
             FROM relations r
             LEFT JOIN anime a ON r.related_anime_id = a.id
             WHERE r.anime_id=?
         """, (anime_dict["id"],)):
             anime_dict["relations"].append({
-                "relationType": r[0], "id": r[1], "title": r[2], "coverImage": r[3]
+                "relationType": r[0], "id": r[1],
+                "title": {"romaji": r[2], "english": r[3], "native": r[4]},
+                "coverImage": {"large": r[5], "color": None},
+                "bannerImage": r[6], "format": r[7], "status": r[8],
+                "episodes": r[9], "averageScore": r[10], "meanScore": r[11],
+                "popularity": r[12], "source": r[13], "isAdult": bool(r[14]) if r[14] else False,
+                "type": "ANIME",
             })
 
         anime_dict["recommendations"] = []
         for rec in conn.execute("""
-            SELECT r.recommended_anime_id, a.title_romaji, a.cover_large, r.rating
+            SELECT r.recommended_anime_id, a.title_romaji, a.title_english, a.title_native,
+                   a.cover_large, a.banner_image, a.format, a.status, a.episodes,
+                   a.average_score, a.mean_score, a.popularity, r.rating
             FROM recommendations r
             LEFT JOIN anime a ON r.recommended_anime_id = a.id
             WHERE r.anime_id=?
             ORDER BY r.rating DESC
         """, (anime_dict["id"],)):
             anime_dict["recommendations"].append({
-                "id": rec[0], "title": rec[1], "coverImage": rec[2], "rating": rec[3]
+                "id": rec[0],
+                "title": {"romaji": rec[1], "english": rec[2], "native": rec[3]},
+                "coverImage": {"large": rec[4], "color": None},
+                "bannerImage": rec[5], "format": rec[6], "status": rec[7],
+                "episodes": rec[8], "averageScore": rec[9], "meanScore": rec[10],
+                "popularity": rec[11], "rating": rec[12],
+                "type": "ANIME",
             })
 
         anime_list.append(anime_dict)
