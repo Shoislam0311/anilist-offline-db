@@ -467,7 +467,12 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
 }
 
 async function execute(query, variables = {}, operationName = null) {
-  const doc = parse(query);
+  let doc;
+  try {
+    doc = parse(query);
+  } catch (e) {
+    return { errors: [{ message: `Syntax Error: ${e.message}` }] };
+  }
   const fragments = {};
   for (const def of doc.definitions) {
     if (def.kind === Kind.FRAGMENT_DEFINITION) fragments[def.name.value] = def;
@@ -533,7 +538,11 @@ export default async function handler(req, res) {
     try { body = await readBody(req); }
     catch { return nodeJson(res, { errors: [{ message: 'Invalid JSON body' }] }, 400); }
     if (!body || !body.query) return nodeJson(res, { errors: [{ message: 'No query provided' }] }, 400);
-    return nodeJson(res, await execute(body.query, body.variables || {}, body.operationName || null), 200);
+    try {
+      return nodeJson(res, await execute(body.query, body.variables || {}, body.operationName || null), 200);
+    } catch (e) {
+      return nodeJson(res, { errors: [{ message: e.message || 'Internal error' }] }, 500);
+    }
   }
   return nodeJson(res, { errors: [{ message: 'Method not allowed' }] }, 405);
 }
