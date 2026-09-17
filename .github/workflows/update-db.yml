@@ -12,11 +12,11 @@ name: Update AniList Database
 
 on:
   schedule:
-    - cron: '0 4 * * *'    # Daily at 04:00 UTC -> airing refresh (or full on Sundays)
+    - cron: '0 4 * * *'    # Daily 04:00 UTC -> daily refresh (incremental on Sundays)
   workflow_dispatch:
     inputs:
       fetch_mode:
-        description: 'Fetch mode (weekly full + daily airing+counters is automatic)'
+        description: 'Fetch mode (weekly incremental + daily airing+counters is automatic)'
         required: false
         default: 'daily'
         type: choice
@@ -62,7 +62,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Determine fetch mode (weekly full + daily airing+counters)
+      - name: Determine fetch mode (weekly incremental + daily airing+counters)
         id: mode
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -70,7 +70,10 @@ jobs:
           else
             DOW=$(date -u +%-u)
             if [ "$DOW" = "7" ]; then
-              echo "mode=full" >> $GITHUB_OUTPUT
+              # True refresh: only entries changed on AniList (full payloads).
+              # `full` is bootstrap/repair only (manual dispatch) — on a warm DB
+              # its sweeps re-walk ~1700 empty pages for zero gain.
+              echo "mode=incremental" >> $GITHUB_OUTPUT
             else
               echo "mode=daily" >> $GITHUB_OUTPUT
             fi

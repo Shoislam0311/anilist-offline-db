@@ -592,7 +592,33 @@ class AniListFetcher:
         seasons = ["WINTER", "SPRING", "SUMMER", "FALL"]
         current_year = datetime.now(timezone.utc).year
         year_range = range(1940, current_year + 2)
+        started_empty = len(seen_ids) == 0
 
+        # Persistent skip-list lives in the DB (checkpoint files are wiped by
+        # post_fetch, so a file-only list re-walks 350 empty combos every run).
+        # Only historical years are persisted — recent years keep gaining entries.
+        def _combo_year(combo: str) -> int:
+            try:
+                return int(combo.rsplit("_", 1)[1])
+            except Exception:
+                return 0
+        persisted = get_metadata(conn, "skip_combos")
+        if persisted:
+            try:
+                skip_combos |= set(json.loads(persisted))
+            except Exception:
+                pass
+        skip_combos = {c for c in skip_combos if _combo_year(c) < current_year - 1}
+        if skip_combos:
+            logger.info(f"Skipping {len(skip_combos)} historically-empty combos (zero requests)")
+
+        def _persist_skips():
+            try:
+                set_metadata(conn, "skip_combos", json.dumps(sorted(skip_combos)))
+            except Exception:
+                pass
+
+        season_new = 0
         try:
             for year in year_range:
                 for season in seasons:
@@ -602,16 +628,19 @@ class AniListFetcher:
 
                     new_count = self._fetch_season_year(conn, season, year, seen_ids)
                     total_fetched += new_count
+                    season_new += new_count
                     already_done.append(combo)
 
                     if new_count > 0:
                         logger.info(f"{season} {year}: +{new_count} anime (total: {total_fetched})")
                     else:
-                        skip_combos.add(combo)
-                        logger.info(f"{season} {year}: 0 new anime, skipping future (total: {total_fetched})")
+                        if year < current_year - 1:
+                            skip_combos.add(combo)
+                        logger.debug(f"{season} {year}: 0 new anime")
 
                     if total_fetched % 200 == 0:
                         conn.commit()
+                        _persist_skips()
                         self._save_checkpoint({
                             "fetch_type": "full",
                             "seasons_done": already_done,
@@ -622,17 +651,26 @@ class AniListFetcher:
                         })
 
             logger.info(f"Season+year pass complete. Total unique anime: {total_fetched}")
-            new_count = self._fetch_missing_by_season_year(conn, seen_ids)
-            total_fetched += new_count
-            if new_count > 0:
-                logger.info(f"Status sweep complete: +{new_count} anime (total: {total_fetched})")
+            _persist_skips()
+            conn.commit()
 
-            # ID sweep catches entries with null season/year that both passes miss.
-            # This is what guarantees "same as AniList at any cost" for relations/recommendations targets.
-            id_new = self._fetch_by_id_sweep(conn, seen_ids)
-            total_fetched += id_new
-            if id_new > 0:
-                logger.info(f"ID sweep complete: +{id_new} anime (total: {total_fetched})")
+            # Sweeps only discover entries missing from season data. On a warm
+            # DB where the season pass added nothing, they re-walk ~1700 empty
+            # pages for zero gain — skip them.
+            if season_new > 0 or started_empty:
+                new_count = self._fetch_missing_by_season_year(conn, seen_ids)
+                total_fetched += new_count
+                if new_count > 0:
+                    logger.info(f"Status sweep complete: +{new_count} anime (total: {total_fetched})")
+
+                # ID sweep catches entries with null season/year that both passes miss.
+                # This is what guarantees "same as AniList at any cost" for relations/recommendations targets.
+                id_new = self._fetch_by_id_sweep(conn, seen_ids)
+                total_fetched += id_new
+                if id_new > 0:
+                    logger.info(f"ID sweep complete: +{id_new} anime (total: {total_fetched})")
+            else:
+                logger.info("Warm DB, season pass added nothing — skipping status + ID sweeps (zero gain)")
 
             conn.commit()
             logger.info(f"Full fetch complete. Total unique anime: {total_fetched}")
