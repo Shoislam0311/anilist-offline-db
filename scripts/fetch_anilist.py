@@ -197,12 +197,14 @@ query ($page: Int, $perPage: Int, $sort: [MediaSort]) {
 """ % MEDIA_FIELDS
 
 # Lightweight daily counters refresh: 6 numeric fields only (~1KB/anime vs
-# ~300KB full payload). ~290 requests cover the whole catalog in ~15 min.
-# Keeps trending/popularity/scores fresh without a full re-scrape.
+# ~300KB full payload). Uses explicit id_in chunks (50/request, always page 1)
+# because AniList caps offset pagination at 5000 entries deep ("Page depth
+# exceeds maximum") — page 101+ with perPage 50 hard-400s. Chunking local IDs
+# sidesteps the wall entirely and misses nothing (incl. null-season entries).
 COUNTERS_QUERY = """
-query ($page: Int, $perPage: Int) {
-  Page(page: $page, perPage: $perPage) {
-    media(type: ANIME, sort: ID) {
+query ($ids: [Int]) {
+  Page(page: 1, perPage: 50) {
+    media(type: ANIME, id_in: $ids) {
       id popularity trending favourites averageScore meanScore updatedAt
     }
     pageInfo { total hasNextPage currentPage lastPage }
@@ -923,9 +925,9 @@ class AniListFetcher:
     def counters_refresh(self):
         """Daily trending/popularity/scores refresh across the WHOLE catalog.
 
-        Uses the lightweight COUNTERS_QUERY (6 numeric fields, ~1KB/anime)
-        instead of full payloads (~300KB). ~290 requests ≈ 15 min for 14.5k
-        anime. Patches both indexed columns and stored raw_json so served
+        Chunked by local IDs (50/request, always page 1): offset pagination
+        hard-400s past 5000 entries deep, so page-walking can never cover all
+        14.6k. Patches both indexed columns and stored raw_json so served
         responses stay same-to-same on live counters."""
         from db_utils import update_counters
         logger.info("Daily counters refresh: trending/popularity/scores for ALL anime...")
@@ -933,23 +935,25 @@ class AniListFetcher:
         set_metadata(conn, "fetch_type", "counters")
         set_metadata(conn, "fetch_started_at", datetime.now(timezone.utc).isoformat())
 
+        all_ids = [r[0] for r in conn.execute("SELECT id FROM anime ORDER BY id")]
+        logger.info(f"Refreshing counters for {len(all_ids)} anime in 50-ID chunks...")
+
         total_updated = 0
-        page = 1
+        failures = 0
         try:
-            while True:
-                data = self._request(COUNTERS_QUERY, {"page": page, "perPage": PER_PAGE})
+            for i in range(0, len(all_ids), 50):
+                chunk = all_ids[i:i + 50]
+                data = self._request(COUNTERS_QUERY, {"ids": chunk})
                 if not data or "data" not in data:
                     time.sleep(3)
-                    data = self._request(COUNTERS_QUERY, {"page": page, "perPage": PER_PAGE})
+                    data = self._request(COUNTERS_QUERY, {"ids": chunk})
                     if not data or "data" not in data:
-                        logger.error(f"Counters page {page} failed twice, stopping")
-                        break
+                        failures += 1
+                        logger.error(f"Counters chunk {i // 50 + 1} failed twice, skipping "
+                                     f"({len(chunk)} ids go stale until next run)")
+                        continue
 
-                media_list = data["data"]["Page"].get("media", [])
-                page_info = data["data"]["Page"].get("pageInfo", {})
-                if not media_list:
-                    break
-
+                media_list = data["data"]["Page"].get("media", []) or []
                 for media in media_list:
                     if media.get("id") is None:
                         continue
@@ -960,19 +964,17 @@ class AniListFetcher:
                     except Exception as e:
                         logger.warning(f"Counters update failed for {media.get('id')}: {e}")
 
-                if total_updated % 1000 == 0:
+                if (i // 50 + 1) % 20 == 0:
                     conn.commit()
-                    logger.info(f"Counters: {total_updated} anime refreshed (page {page})")
-
-                if not page_info.get("hasNextPage"):
-                    break
-                page += 1
+                    logger.info(f"Counters: {total_updated} anime refreshed "
+                                f"({i + len(chunk)}/{len(all_ids)})")
 
             conn.commit()
             set_metadata(conn, "last_counters_refresh_at",
                          datetime.now(timezone.utc).isoformat())
             conn.commit()
-            logger.info(f"Counters refresh complete. Updated: {total_updated} anime")
+            logger.info(f"Counters refresh complete. Updated: {total_updated} anime, "
+                        f"failed chunks: {failures}")
 
         except KeyboardInterrupt:
             logger.info("Interrupted. Saving progress...")

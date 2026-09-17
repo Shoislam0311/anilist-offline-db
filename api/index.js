@@ -698,7 +698,96 @@ async function resolvePage(fieldNode, fragments, variables, pageArgs) {
   return pageOut(fieldNode, fragments, paged, total, page, perPage);
 }
 
+function splitYMD(s) {
+  const m = String(s || '').match(/^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$/);
+  if (!m) return { year: null, month: null, day: null };
+  return { year: parseInt(m[1], 10), month: m[2] ? parseInt(m[2], 10) : null, day: m[3] ? parseInt(m[3], 10) : null };
+}
+function jarr(s, fb = []) {
+  try { const v = JSON.parse(s || ''); return Array.isArray(v) ? v : fb; } catch { return fb; }
+}
+// Indexed entity lookups (single-row SQL, ~50ms). Null = fall back to shards.
+async function tursoCharacter(args) {
+  const c = tursoClient();
+  if (!c) return null;
+  let rs;
+  if (args.id) rs = await c.execute({ sql: `SELECT * FROM characters WHERE id = ?`, args: [args.id] });
+  else if (args.search) rs = await c.execute({ sql: `SELECT * FROM characters WHERE lower(name_full) LIKE ? ESCAPE '\\' ORDER BY favourites DESC NULLS LAST LIMIT 1`, args: [`%${escLike(args.search)}%`] });
+  else return null;
+  const r = rs.rows[0];
+  if (!r) return null;
+  return {
+    __typename: 'Character', id: r.id,
+    name: { __typename: 'CharacterName', first: r.name_first, middle: r.name_middle, last: r.name_last, full: r.name_full, native: r.name_native, alternative: jarr(r.name_alternative), alternativeSpoiler: jarr(r.name_alternative_spoiler), userPreferred: r.name_user_preferred || r.name_full },
+    image: { __typename: 'CharacterImage', large: r.image_large, medium: r.image_medium },
+    description: r.description, gender: r.gender, dateOfBirth: { __typename: 'FuzzyDate', ...splitYMD(r.date_of_birth) },
+    age: r.age, bloodType: r.blood_type, favourites: r.favourites, siteUrl: r.site_url,
+    isFavourite: false, isFavouriteBlocked: !!r.is_favourite_blocked,
+  };
+}
+async function tursoStaff(args) {
+  const c = tursoClient();
+  if (!c) return null;
+  let rs;
+  if (args.id) rs = await c.execute({ sql: `SELECT * FROM staff WHERE id = ?`, args: [args.id] });
+  else if (args.search) rs = await c.execute({ sql: `SELECT * FROM staff WHERE lower(name_full) LIKE ? ESCAPE '\\' ORDER BY favourites DESC NULLS LAST LIMIT 1`, args: [`%${escLike(args.search)}%`] });
+  else return null;
+  const r = rs.rows[0];
+  if (!r) return null;
+  return {
+    __typename: 'Staff', id: r.id, language: r.language,
+    name: { __typename: 'StaffName', first: r.name_first, middle: r.name_middle, last: r.name_last, full: r.name_full, native: r.name_native, alternative: jarr(r.name_alternative), userPreferred: r.name_user_preferred || r.name_full },
+    image: { __typename: 'StaffImage', large: r.image_large, medium: r.image_medium },
+    description: r.description, primaryOccupations: jarr(r.primary_occupations), gender: r.gender,
+    dateOfBirth: { __typename: 'FuzzyDate', ...splitYMD(r.date_of_birth) },
+    dateOfDeath: { __typename: 'FuzzyDate', ...splitYMD(r.date_of_death) },
+    age: r.age, yearsActive: jarr(r.years_active), homeTown: r.home_town, bloodType: r.blood_type,
+    favourites: r.favourites, siteUrl: r.site_url,
+    isFavourite: false, isFavouriteBlocked: !!r.is_favourite_blocked,
+  };
+}
+async function tursoStudio(args) {
+  const c = tursoClient();
+  if (!c) return null;
+  let rs;
+  if (args.id) rs = await c.execute({ sql: `SELECT * FROM studios WHERE id = ?`, args: [args.id] });
+  else if (args.search) rs = await c.execute({ sql: `SELECT * FROM studios WHERE lower(name) LIKE ? ESCAPE '\\' ORDER BY favourites DESC NULLS LAST LIMIT 1`, args: [`%${escLike(args.search)}%`] });
+  else return null;
+  const r = rs.rows[0];
+  if (!r) return null;
+  return { __typename: 'Studio', id: r.id, name: r.name, isAnimationStudio: !!r.is_animation_studio, siteUrl: r.site_url, favourites: r.favourites, isFavourite: false };
+}
+async function tursoHasRows(table) {
+  try {
+    const c = tursoClient();
+    if (!c) return false;
+    const rs = await c.execute({ sql: `SELECT COUNT(*) AS n FROM ${table}`, args: [] });
+    return Number(rs.rows[0]?.n || 0) > 0;
+  } catch { return false; }
+}
+async function tursoAiring(args) {
+  const c = tursoClient();
+  if (!c) return null;
+  let rs;
+  if (args.id) rs = await c.execute({ sql: `SELECT * FROM airing_schedule WHERE id = ?`, args: [args.id] });
+  else if (args.mediaId) rs = await c.execute({ sql: `SELECT * FROM airing_schedule WHERE anime_id = ? ORDER BY episode LIMIT 1`, args: [args.mediaId] });
+  else return null;
+  const r = rs.rows[0];
+  if (!r) return null;
+  const now = Math.floor(Date.now() / 1000);
+  return { __typename: 'AiringSchedule', id: r.id, episode: r.episode, airingAt: r.airing_at, timeUntilAiring: Math.max(0, (r.airing_at || 0) - now), mediaId: r.media_id || r.anime_id };
+}
+async function tursoTags() {
+  const c = tursoClient();
+  if (!c) return null;
+  const rs = await c.execute({ sql: `SELECT id, name, description, category, rank, is_general_spoiler, is_media_spoiler, is_adult FROM tags ORDER BY name`, args: [] });
+  return rs.rows.map((r) => ({
+    __typename: 'MediaTag', id: r.id, name: r.name, description: r.description, category: r.category, rank: r.rank,
+    isGeneralSpoiler: !!r.is_general_spoiler, isMediaSpoiler: !!r.is_media_spoiler, isAdult: !!r.is_adult,
+  }));
+}
 async function scanNested(kind, args) {
+  // Shard-scan fallback for entity roots (used only when Turso is unreachable).
   // Character/Staff/Studio/AiringSchedule standalone lookup by scanning cached shards.
   // Anime-only offline: sufficient and exact (same objects as Media nested).
   const shardStartIds = await getShardStartIds();
@@ -783,8 +872,23 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
       case 'Character':
       case 'Staff':
       case 'Studio': {
-        const kind = fieldNode.name.value === 'Character' ? 'characters'
-          : fieldNode.name.value === 'Staff' ? 'staff' : 'studios';
+        const fname = fieldNode.name.value;
+        const table = fname === 'Character' ? 'characters' : fname === 'Staff' ? 'staff' : 'studios';
+        try {
+          const t = table === 'characters' ? await tursoCharacter(args)
+            : table === 'staff' ? await tursoStaff(args) : await tursoStudio(args);
+          if (t) return pick(t, sels, fragments);
+          // Turso miss: 404 only when the remote table actually holds data;
+          // otherwise (not bootstrapped yet) fall through to shard scan.
+          if ((args.id || args.search) && await tursoHasRows(table)) {
+            throw Object.assign(new Error(`${fname} not found`), { status: 404 });
+          }
+        } catch (e) {
+          if (e?.status === 404) throw e;
+          // fall through to shard scan below
+        }
+        const kind = table === 'characters' ? 'characters'
+          : table === 'staff' ? 'staff' : 'studios';
         const list = await scanNested(kind, args);
         if (args.id) {
           const one = list.find((x) => x.id === args.id);
@@ -794,6 +898,10 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
         return pick(list[0] || null, sels, fragments);
       }
       case 'AiringSchedule': {
+        try {
+          const t = await tursoAiring(args);
+          if (t) return pick(t, sels, fragments);
+        } catch { /* shard fallback below */ }
         if (args.id || args.mediaId) {
           const shardStartIds = await getShardStartIds();
           for (let i = 0; i < Math.min(shardStartIds.length, 8); i++) {
@@ -813,9 +921,21 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
         }
         throw Object.assign(new Error('AiringSchedule not found'), { status: 404 });
       }
-      case 'GenreCollection':
+      case 'GenreCollection': {
+        // Zero-read path: bundled at deploy time. Falls back to fetched metadata.
+        try {
+          if (bundledMeta?.genres?.length) return bundledMeta.genres;
+        } catch { /* fetched fallback below */ }
         return (await getMetadata().catch(() => null))?.genres || [];
+      }
       case 'MediaTagCollection': {
+        try {
+          const t = await tursoTags();
+          if (t?.length) {
+            if (!sels.length) return t;
+            return t.map((x) => pick(x, sels, fragments));
+          }
+        } catch { /* shard fallback below */ }
         const shard = await getShard(0).catch(() => []);
         const tags = new Map();
         for (const a of shard.slice(0, 50)) {
@@ -871,8 +991,14 @@ function readBody(req) {
     req.on('error', reject);
   });
 }
-function nodeJson(res, data, status = 200) {
-  res.writeHead(status, { 'Content-Type': 'application/json', ...CORS });
+function nodeJson(res, data, status = 200, cacheSeconds = 0) {
+  const headers = { 'Content-Type': 'application/json', ...CORS };
+  // Edge-cache GET responses (identical rail/search queries served from edge,
+  // zero compute and zero Turso reads). POSTs stay uncached (same as AniList).
+  if (cacheSeconds > 0) {
+    headers['Cache-Control'] = `public, s-maxage=${cacheSeconds}, stale-while-revalidate=86400`;
+  }
+  res.writeHead(status, headers);
   res.end(JSON.stringify(data));
 }
 export default async function handler(req, res) {
@@ -887,7 +1013,7 @@ export default async function handler(req, res) {
     let variables = {};
     try { variables = JSON.parse(parsed.searchParams.get('variables') || '{}'); }
     catch { return nodeJson(res, { errors: [{ message: 'Invalid variables JSON', status: 400 }] }, 400); }
-    return nodeJson(res, await execute(query, variables, parsed.searchParams.get('operationName')), 200);
+    return nodeJson(res, await execute(query, variables, parsed.searchParams.get('operationName')), 200, 300);
   }
   if (req.method === 'POST') {
     let body;
