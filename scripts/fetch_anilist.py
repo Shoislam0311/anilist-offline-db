@@ -196,6 +196,20 @@ query ($page: Int, $perPage: Int, $sort: [MediaSort]) {
 }
 """ % MEDIA_FIELDS
 
+# Lightweight daily counters refresh: 6 numeric fields only (~1KB/anime vs
+# ~300KB full payload). ~290 requests cover the whole catalog in ~15 min.
+# Keeps trending/popularity/scores fresh without a full re-scrape.
+COUNTERS_QUERY = """
+query ($page: Int, $perPage: Int) {
+  Page(page: $page, perPage: $perPage) {
+    media(type: ANIME, sort: ID) {
+      id popularity trending favourites averageScore meanScore updatedAt
+    }
+    pageInfo { total hasNextPage currentPage lastPage }
+  }
+}
+"""
+
 SEASON_FETCH_QUERY = """
 query ($page: Int, $perPage: Int, $season: MediaSeason, $seasonYear: Int) {
   Page(page: $page, perPage: $perPage) {
@@ -836,6 +850,67 @@ class AniListFetcher:
 
         return total_updated
 
+    def counters_refresh(self):
+        """Daily trending/popularity/scores refresh across the WHOLE catalog.
+
+        Uses the lightweight COUNTERS_QUERY (6 numeric fields, ~1KB/anime)
+        instead of full payloads (~300KB). ~290 requests ≈ 15 min for 14.5k
+        anime. Patches both indexed columns and stored raw_json so served
+        responses stay same-to-same on live counters."""
+        from db_utils import update_counters
+        logger.info("Daily counters refresh: trending/popularity/scores for ALL anime...")
+        conn = init_db(self.db_path)
+        set_metadata(conn, "fetch_type", "counters")
+        set_metadata(conn, "fetch_started_at", datetime.now(timezone.utc).isoformat())
+
+        total_updated = 0
+        page = 1
+        try:
+            while True:
+                data = self._request(COUNTERS_QUERY, {"page": page, "perPage": PER_PAGE})
+                if not data or "data" not in data:
+                    time.sleep(3)
+                    data = self._request(COUNTERS_QUERY, {"page": page, "perPage": PER_PAGE})
+                    if not data or "data" not in data:
+                        logger.error(f"Counters page {page} failed twice, stopping")
+                        break
+
+                media_list = data["data"]["Page"].get("media", [])
+                page_info = data["data"]["Page"].get("pageInfo", {})
+                if not media_list:
+                    break
+
+                for media in media_list:
+                    if media.get("id") is None:
+                        continue
+                    try:
+                        update_counters(conn, media["id"], media)
+                        total_updated += 1
+                    except Exception as e:
+                        logger.warning(f"Counters update failed for {media.get('id')}: {e}")
+
+                if total_updated % 1000 == 0:
+                    conn.commit()
+                    logger.info(f"Counters: {total_updated} anime refreshed (page {page})")
+
+                if not page_info.get("hasNextPage"):
+                    break
+                page += 1
+
+            conn.commit()
+            set_metadata(conn, "last_counters_refresh_at",
+                         datetime.now(timezone.utc).isoformat())
+            conn.commit()
+            logger.info(f"Counters refresh complete. Updated: {total_updated} anime")
+
+        except KeyboardInterrupt:
+            logger.info("Interrupted. Saving progress...")
+            conn.commit()
+        finally:
+            conn.close()
+
+        return total_updated
+
     def upcoming_fetch(self):
         logger.info("Weekly upcoming sweep: fetching NOT_YET_RELEASED anime...")
         conn = init_db(self.db_path)
@@ -925,8 +1000,15 @@ def main():
 
     if mode == "full":
         fetcher.full_fetch()
+    elif mode == "daily":
+        # Daily schedule: airing titles fully refreshed + live counters
+        # (trending/popularity/scores) merged across the whole catalog.
+        fetcher.airing_fetch()
+        fetcher.counters_refresh()
     elif mode == "airing":
         fetcher.airing_fetch()
+    elif mode == "counters":
+        fetcher.counters_refresh()
     elif mode == "upcoming":
         fetcher.upcoming_fetch()
     else:

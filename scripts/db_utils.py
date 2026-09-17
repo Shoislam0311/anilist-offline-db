@@ -1104,6 +1104,33 @@ def build_exact_media(conn: sqlite3.Connection, anime_id: int) -> Optional[dict]
     }
 
 
+def update_counters(conn: sqlite3.Connection, anime_id: int, fields: dict):
+    """Daily lightweight refresh of live counters. Updates indexed columns AND
+    patches the same keys inside stored raw_json so served responses stay exact."""
+    import json as _json
+    conn.execute("""
+        UPDATE anime SET popularity=?, trending=?, favourites=?,
+            average_score=?, mean_score=?, updated_at=?
+        WHERE id=?
+    """, (
+        fields.get("popularity"), fields.get("trending"), fields.get("favourites"),
+        fields.get("averageScore"), fields.get("meanScore"), fields.get("updatedAt"),
+        anime_id,
+    ))
+    row = conn.execute("SELECT raw_json FROM anime WHERE id=?", (anime_id,)).fetchone()
+    if row and row[0]:
+        try:
+            raw = _json.loads(row[0])
+            for k in ("popularity", "trending", "favourites",
+                      "averageScore", "meanScore", "updatedAt"):
+                if fields.get(k) is not None:
+                    raw[k] = fields[k]
+            conn.execute("UPDATE anime SET raw_json=? WHERE id=?",
+                         (_json.dumps(raw, ensure_ascii=False), anime_id))
+        except Exception:
+            pass
+
+
 def set_metadata(conn: sqlite3.Connection, key: str, value: str):
     now = datetime.now(timezone.utc).isoformat()
     conn.execute("""

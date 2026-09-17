@@ -6,7 +6,9 @@ name: Update AniList Database
 # - Git tracks only small files: metadata, search_index, sample, manifest, site.
 # - The SQLite DB persists between ephemeral runners via actions/cache.
 # - Full and scheduled runs use SEPARATE concurrency groups so the daily
-#   airing refresh can never cancel a multi-hour full re-scrape.
+#   refresh can never cancel a multi-hour full re-scrape.
+# - Daily `daily` mode = airing titles fully refreshed + lightweight
+#   trending/popularity/scores merged across the whole catalog.
 
 on:
   schedule:
@@ -14,12 +16,14 @@ on:
   workflow_dispatch:
     inputs:
       fetch_mode:
-        description: 'Fetch mode (weekly full + daily airing is automatic)'
+        description: 'Fetch mode (weekly full + daily airing+counters is automatic)'
         required: false
-        default: 'airing'
+        default: 'daily'
         type: choice
         options:
+          - daily
           - airing
+          - counters
           - upcoming
           - full
           - incremental
@@ -58,7 +62,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Determine fetch mode (weekly full + daily airing)
+      - name: Determine fetch mode (weekly full + daily airing+counters)
         id: mode
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -68,7 +72,7 @@ jobs:
             if [ "$DOW" = "7" ]; then
               echo "mode=full" >> $GITHUB_OUTPUT
             else
-              echo "mode=airing" >> $GITHUB_OUTPUT
+              echo "mode=daily" >> $GITHUB_OUTPUT
             fi
           fi
 
@@ -167,6 +171,8 @@ jobs:
           # Point any AniList client at the Vercel endpoint or Pages mirror
           { Page(page: 1, perPage: 10) { media(sort: POPULARITY_DESC, type: ANIME) { id title { romaji } } } }
           \`\`\`" --latest || echo "Release may already exist, continuing"
+          # Drop the stale old-shape tarball from earlier runs if present (exact DB ships as db/json gz)
+          gh release delete-asset "${{ steps.rel.outputs.tag }}" "anilist-db-${{ steps.rel.outputs.date }}.tar.gz" -y 2>/dev/null || true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -212,7 +218,9 @@ jobs:
           git rm --cached -r --ignore-unmatch docs/api/shards data/anilist.db data/anilist.json data/anilist.db.gz data/anilist.json.gz || true
           git add docs/api/metadata.json docs/api/search_index.json docs/api/search_index.json.gz \
             docs/api/sample.json docs/api/shard_manifest.json docs/index.html docs/api.js \
-            data/changelog.md .github/workflows/update-db.yml
+            .github/workflows/update-db.yml
+          # changelog.md only exists after incremental runs — never fail the add on it
+          test -f data/changelog.md && git add data/changelog.md || true
           echo "Refusing to push any staged file over 90MB (fail fast, not after a 2-min push):"
           git diff --cached --name-only -z | xargs -0 -I{} sh -c 'test -f "{}" && stat -c "%s {}" "{}"' | \
             awk '$1 > 90000000 {print "TOO BIG:", $0; bad=1} END {if (bad) exit 1}'
