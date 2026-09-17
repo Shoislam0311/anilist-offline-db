@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AniList Offline API</title>
+    <title>AniList Offline — Browse Anime with Zero Rate Limits</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0b1622; color: #ced9e0; line-height: 1.6; }
@@ -15,8 +15,8 @@
         .endpoint-box { background: #151f2e; border: 1px solid #253746; border-radius: 8px; padding: 1.5rem; margin: 1rem 0; }
         .endpoint-url { font-family: monospace; color: #3db4f2; font-size: 1.1rem; word-break: break-all; }
         .method { background: #3db4f2; color: #0b1622; padding: 0.2rem 0.5rem; border-radius: 4px; font-weight: bold; font-size: 0.8rem; }
-        .tabs { display: flex; gap: 0; margin: 2rem 0 0; border-bottom: 2px solid #253746; }
-        .tab { padding: 0.8rem 1.5rem; cursor: pointer; color: #8ba0b0; border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all 0.2s; }
+        .tabs { display: flex; gap: 0; margin: 2rem 0 0; border-bottom: 2px solid #253746; overflow-x: auto; }
+        .tab { padding: 0.8rem 1.5rem; cursor: pointer; color: #8ba0b0; border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all 0.2s; white-space: nowrap; }
         .tab:hover { color: #ced9e0; }
         .tab.active { color: #3db4f2; border-bottom-color: #3db4f2; }
         .tab-content { display: none; padding: 1.5rem 0; }
@@ -28,18 +28,73 @@
         .code-block .type { color: #e5c07b; }
         .code-block .field { color: #61afef; }
         .code-block .comment { color: #5c6370; font-style: italic; }
+        .search-wrap { position: relative; }
         .search-box { display: flex; gap: 0.5rem; margin: 1rem 0; }
         .search-box input { flex: 1; padding: 0.8rem 1rem; background: #0b1622; border: 1px solid #253746; border-radius: 6px; color: #ced9e0; font-size: 1rem; outline: none; }
         .search-box input:focus { border-color: #3db4f2; }
         .search-box button { padding: 0.8rem 1.5rem; background: #3db4f2; color: #0b1622; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 1rem; }
         .search-box button:hover { background: #2da0d9; }
+        .search-drop { position: absolute; top: 100%; left: 0; right: 0; background: #151f2e; border: 1px solid #3db4f2; border-radius: 6px; z-index: 50; max-height: 380px; overflow-y: auto; display: none; }
+        .search-drop.open { display: block; }
+        .drop-item { display: flex; gap: 0.8rem; padding: 0.6rem 0.8rem; cursor: pointer; align-items: center; }
+        .drop-item img { width: 40px; height: 56px; border-radius: 4px; object-fit: cover; }
+        .drop-item .t { color: #ced9e0; font-size: 0.9rem; }
+        .drop-item .s { color: #8ba0b0; font-size: 0.75rem; }
+        .drop-item.sel, .drop-item:hover { background: #1f2d3d; }
+        .drop-item mark { background: none; color: #e5c07b; font-weight: bold; }
+        .filters { display: flex; gap: 0.8rem; flex-wrap: wrap; margin-bottom: 1rem; align-items: center; }
+        select { padding: 0.6rem; background: #0b1622; border: 1px solid #253746; border-radius: 6px; color: #ced9e0; }
+        .check { color: #8ba0b0; font-size: 0.85rem; display: flex; gap: 0.4rem; align-items: center; }
         .results { margin: 1rem 0; }
-        .result-item { display: flex; gap: 1rem; padding: 1rem; background: #151f2e; border: 1px solid #253746; border-radius: 6px; margin: 0.5rem 0; }
+        .result-item { display: flex; gap: 1rem; padding: 1rem; background: #151f2e; border: 1px solid #253746; border-radius: 6px; margin: 0.5rem 0; cursor: pointer; }
+        .result-item:hover { border-color: #3db4f2; }
         .result-item img { width: 60px; height: 85px; border-radius: 4px; object-fit: cover; }
         .result-info h3 { color: #3db4f2; font-size: 1rem; margin-bottom: 0.3rem; }
         .result-info p { color: #8ba0b0; font-size: 0.85rem; }
-        .result-meta { display: flex; gap: 1rem; margin-top: 0.3rem; font-size: 0.8rem; }
+        .result-meta { display: flex; gap: 1rem; margin-top: 0.3rem; font-size: 0.8rem; flex-wrap: wrap; }
         .result-meta span { color: #e5c07b; }
+        .rail-title { color: #e5c07b; font-size: 1.2rem; margin: 1.5rem 0 0.8rem; }
+        .rail { display: flex; gap: 0.9rem; overflow-x: auto; padding-bottom: 0.8rem; scroll-snap-type: x mandatory; }
+        .card { flex: 0 0 150px; background: #151f2e; border: 1px solid #253746; border-radius: 8px; overflow: hidden; cursor: pointer; scroll-snap-align: start; transition: transform 0.15s, border-color 0.15s; }
+        .card:hover { transform: translateY(-3px); border-color: #3db4f2; }
+        .card img { width: 100%; height: 210px; object-fit: cover; display: block; }
+        .card .score { position: absolute; background: rgba(11,22,34,0.85); color: #2ecc71; font-weight: bold; font-size: 0.75rem; padding: 0.15rem 0.45rem; border-radius: 0 0 6px 0; }
+        .card .body { padding: 0.5rem 0.6rem; }
+        .card .body h4 { color: #ced9e0; font-size: 0.8rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .card .body p { color: #8ba0b0; font-size: 0.72rem; }
+        .card .imgwrap { position: relative; }
+        .grid-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0.9rem; margin-top: 1rem; }
+        .grid-cards .card { flex: none; }
+        .sched-day { margin: 1.2rem 0; }
+        .sched-day h3 { color: #3db4f2; margin-bottom: 0.6rem; }
+        .sched-row { display: flex; gap: 0.8rem; align-items: center; padding: 0.5rem; background: #151f2e; border: 1px solid #253746; border-radius: 6px; margin-bottom: 0.4rem; cursor: pointer; }
+        .sched-row:hover { border-color: #3db4f2; }
+        .sched-row img { width: 36px; height: 50px; border-radius: 4px; object-fit: cover; }
+        .sched-row .time { color: #e5c07b; font-size: 0.8rem; min-width: 120px; }
+        .sched-row .ep { color: #8ba0b0; font-size: 0.8rem; margin-left: auto; white-space: nowrap; }
+        .modal-back { position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100; display: none; overflow-y: auto; }
+        .modal-back.open { display: block; }
+        .modal { max-width: 900px; margin: 3rem auto; background: #0b1622; border: 1px solid #3db4f2; border-radius: 10px; overflow: hidden; }
+        .modal .banner { height: 180px; background-size: cover; background-position: center; }
+        .modal .mbody { padding: 1.5rem; }
+        .modal .mhead { display: flex; gap: 1.2rem; margin-top: -90px; }
+        .modal .mhead img.cover { width: 150px; height: 210px; border-radius: 8px; object-fit: cover; border: 2px solid #253746; }
+        .modal h2 { color: #fff; }
+        .modal .alt { color: #8ba0b0; }
+        .chips { display: flex; gap: 0.4rem; flex-wrap: wrap; margin: 0.6rem 0; }
+        .chip { background: #253746; color: #ced9e0; font-size: 0.75rem; padding: 0.2rem 0.6rem; border-radius: 12px; }
+        .chip.score { background: #1a3a24; color: #2ecc71; font-weight: bold; }
+        .mgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 0.5rem; margin: 1rem 0; font-size: 0.85rem; }
+        .mgrid b { color: #8ba0b0; display: block; font-size: 0.72rem; text-transform: uppercase; }
+        .desc { color: #a9b7c2; font-size: 0.9rem; margin: 0.8rem 0; max-height: 160px; overflow-y: auto; }
+        .strip { display: flex; gap: 0.7rem; overflow-x: auto; padding: 0.4rem 0 0.8rem; }
+        .strip .mini { flex: 0 0 110px; cursor: pointer; text-align: center; }
+        .strip .mini img { width: 110px; height: 150px; object-fit: cover; border-radius: 6px; }
+        .strip .mini.char img { height: 130px; }
+        .strip .mini p { font-size: 0.72rem; color: #ced9e0; margin-top: 0.25rem; }
+        .strip .mini span { font-size: 0.68rem; color: #8ba0b0; }
+        .mclose { float: right; background: #253746; color: #fff; border: none; border-radius: 6px; padding: 0.4rem 0.8rem; cursor: pointer; font-size: 1rem; }
+        .mclose:hover { background: #e74c3c; }
         .playground { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; min-height: 400px; }
         .playground textarea { width: 100%; height: 100%; min-height: 350px; background: #0b1622; border: 1px solid #253746; border-radius: 6px; padding: 1rem; color: #ced9e0; font-family: monospace; font-size: 0.85rem; resize: vertical; outline: none; }
         .playground textarea:focus { border-color: #3db4f2; }
@@ -57,13 +112,14 @@
         @media (max-width: 768px) {
             .playground { grid-template-columns: 1fr; }
             .container { padding: 1rem; }
+            .modal .mhead img.cover { width: 110px; height: 155px; }
         }
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>AniList Offline API <span class="badge">No Rate Limits</span></h1>
-        <p>Full GraphQL API mirroring <code>graphql.anilist.co</code> - backed by offline SQLite database</p>
+        <h1>AniList Offline <span class="badge">No Rate Limits</span></h1>
+        <p>Browse 14,000+ anime with the same data as <code>graphql.anilist.co</code> — search, schedule, details &amp; recommendations, fully offline-capable.</p>
     </div>
 
     <div class="container">
@@ -82,13 +138,91 @@
         </div>
 
         <div class="tabs">
-            <div class="tab active" data-tab="playground">Query Playground</div>
+            <div class="tab active" data-tab="discover">Discover</div>
             <div class="tab" data-tab="search">Search</div>
+            <div class="tab" data-tab="schedule">Schedule</div>
             <div class="tab" data-tab="browse">Browse</div>
+            <div class="tab" data-tab="playground">Playground</div>
             <div class="tab" data-tab="docs">API Docs</div>
         </div>
 
-        <div id="tab-playground" class="tab-content active">
+        <div id="tab-discover" class="tab-content active">
+            <div id="discoverRails"><div class="loading">Loading rails...</div></div>
+        </div>
+
+        <div id="tab-search" class="tab-content">
+            <div class="search-wrap">
+                <div class="search-box">
+                    <input type="text" id="searchInput" placeholder="Search anime… try 'attack titan', 'OP', 'Kimi no Na wa'…" autocomplete="off">
+                    <button onclick="searchAnime()">Search</button>
+                </div>
+                <div class="search-drop" id="searchDrop"></div>
+            </div>
+            <div class="filters">
+                <select id="searchGenre"><option value="">Any genre</option></select>
+                <select id="searchStatus">
+                    <option value="">Any status</option>
+                    <option value="FINISHED">Finished</option>
+                    <option value="RELEASING">Releasing</option>
+                    <option value="NOT_YET_RELEASED">Not Yet Released</option>
+                    <option value="CANCELLED">Cancelled</option>
+                </select>
+                <select id="searchFormat">
+                    <option value="">Any format</option>
+                    <option value="TV">TV</option>
+                    <option value="MOVIE">Movie</option>
+                    <option value="OVA">OVA</option>
+                    <option value="ONA">ONA</option>
+                    <option value="SPECIAL">Special</option>
+                    <option value="MUSIC">Music</option>
+                </select>
+                <select id="searchSort">
+                    <option value="RELEVANCE">Best match</option>
+                    <option value="POPULARITY_DESC">Popularity</option>
+                    <option value="SCORE_DESC">Score</option>
+                    <option value="TRENDING_DESC">Trending</option>
+                    <option value="START_DATE_DESC">Newest</option>
+                </select>
+                <label class="check"><input type="checkbox" id="searchAdult"> include 18+</label>
+            </div>
+            <div id="searchRecent"></div>
+            <div class="results" id="searchResults"></div>
+        </div>
+
+        <div id="tab-schedule" class="tab-content">
+            <p style="color: #8ba0b0; font-size: 0.9rem;">Every episode airing in the next 7 days, from the offline schedule data.</p>
+            <div id="scheduleBody"><div class="loading">Loading schedule...</div></div>
+        </div>
+
+        <div id="tab-browse" class="tab-content">
+            <div style="display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem;">
+                <select id="browseGenre" onchange="browseAnime()"><option value="">All Genres</option></select>
+                <select id="browseStatus" onchange="browseAnime()">
+                    <option value="">All Status</option>
+                    <option value="FINISHED">Finished</option>
+                    <option value="RELEASING">Releasing</option>
+                    <option value="NOT_YET_RELEASED">Not Yet Released</option>
+                    <option value="CANCELLED">Cancelled</option>
+                </select>
+                <select id="browseFormat" onchange="browseAnime()">
+                    <option value="">All Formats</option>
+                    <option value="TV">TV</option>
+                    <option value="MOVIE">Movie</option>
+                    <option value="OVA">OVA</option>
+                    <option value="ONA">ONA</option>
+                    <option value="SPECIAL">Special</option>
+                </select>
+                <select id="browseSort" onchange="browseAnime()">
+                    <option value="POPULARITY_DESC">Popularity</option>
+                    <option value="SCORE_DESC">Score</option>
+                    <option value="UPDATED_AT_DESC">Recently Updated</option>
+                    <option value="START_DATE_DESC">Newest</option>
+                </select>
+            </div>
+            <div class="results" id="browseResults"><div class="loading">Loading...</div></div>
+        </div>
+
+        <div id="tab-playground" class="tab-content">
             <div class="playground">
                 <div>
                     <h3 style="color: #3db4f2; margin-bottom: 0.5rem;">Query</h3>
@@ -119,42 +253,6 @@
                     <div class="output" id="queryOutput">Click "Execute" to run the query...</div>
                 </div>
             </div>
-        </div>
-
-        <div id="tab-search" class="tab-content">
-            <div class="search-box">
-                <input type="text" id="searchInput" placeholder="Search anime by title..." onkeypress="if(event.key==='Enter') searchAnime()">
-                <button onclick="searchAnime()">Search</button>
-            </div>
-            <div class="results" id="searchResults"></div>
-        </div>
-
-        <div id="tab-browse" class="tab-content">
-            <div style="display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem;">
-                <select id="browseGenre" onchange="browseAnime()"><option value="">All Genres</option></select>
-                <select id="browseStatus" onchange="browseAnime()">
-                    <option value="">All Status</option>
-                    <option value="FINISHED">Finished</option>
-                    <option value="RELEASING">Releasing</option>
-                    <option value="NOT_YET_RELEASED">Not Yet Released</option>
-                    <option value="CANCELLED">Cancelled</option>
-                </select>
-                <select id="browseFormat" onchange="browseAnime()">
-                    <option value="">All Formats</option>
-                    <option value="TV">TV</option>
-                    <option value="MOVIE">Movie</option>
-                    <option value="OVA">OVA</option>
-                    <option value="ONA">ONA</option>
-                    <option value="SPECIAL">Special</option>
-                </select>
-                <select id="browseSort" onchange="browseAnime()">
-                    <option value="POPULARITY_DESC">Popularity</option>
-                    <option value="SCORE_DESC">Score</option>
-                    <option value="UPDATED_AT_DESC">Recently Updated</option>
-                    <option value="START_DATE_DESC">Newest</option>
-                </select>
-            </div>
-            <div class="results" id="browseResults"><div class="loading">Loading...</div></div>
         </div>
 
         <div id="tab-docs" class="tab-content">
@@ -226,6 +324,10 @@
 }
             </div>
         </div>
+    </div>
+
+    <div class="modal-back" id="modalBack">
+        <div class="modal" id="modalBox"></div>
     </div>
 
     <script src="api.js"></script>

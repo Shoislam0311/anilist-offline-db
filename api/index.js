@@ -274,6 +274,32 @@ function pick(obj, sels, fragments) {
 /* ------------------------- AniList filter + sort -------------------------- */
 function str(v) { return typeof v === 'string' ? v.toLowerCase() : v; }
 
+function normStr(s) { return String(s || '').toLowerCase().trim(); }
+// Tokenize latin queries into words; CJK strings stay whole (no spaces).
+function searchTokens(q) {
+  return normStr(q).split(/[\s_.,;:!?()[\]{}'"\/\\|-]+/).map((t) => t.trim()).filter((t) => t.length > 0);
+}
+// Relevance score for an index row vs query. -1 = no match (AniList-like:
+// every word must hit somewhere across romaji/english/native/synonyms).
+function searchScore(e, q) {
+  const query = normStr(q);
+  if (!query) return -1;
+  const variants = [e.romaji, e.english, e.native, ...(e.synonyms || [])].filter(Boolean).map(normStr);
+  if (!variants.length) return -1;
+  if (variants.some((v) => v === query)) return 100;
+  const tokens = searchTokens(query).filter((t) => t.length > 1);
+  const hay = variants.join('\n');
+  if (!tokens.length) return hay.includes(query) ? 20 : -1;
+  if (!tokens.every((t) => hay.includes(t))) return -1;
+  let score = 10;
+  const wordHit = variants.some((v) => v.split(/[^a-z0-9\u00c0-\u024f\u1e00-\u1eff\u3040-\u30ff\u4e00-\u9fff]+/u)
+    .some((w) => tokens.some((t) => w.startsWith(t))));
+  if (wordHit) score += 30;
+  if (variants.some((v) => v.startsWith(query))) score += 20;
+  if (variants.some((v) => v.includes(query))) score += 10;
+  return score;
+}
+
 function matchMedia(e, full, a) {
   // e = search-index row, full = exact Media (may be null when index-only filtering)
   const g = (k) => (full ? full[k] : undefined);
@@ -284,11 +310,7 @@ function matchMedia(e, full, a) {
   if (a.id_not_in && a.id_not_in.includes(e.id)) return false;
   if (a.idMal !== undefined && e.idMal !== a.idMal) return false;
   if (a.idMal_in && !a.idMal_in.includes(e.idMal)) return false;
-  if (a.search) {
-    const q = String(a.search).toLowerCase();
-    const hay = [e.romaji, e.english, e.native, ...(e.synonyms || [])].filter(Boolean).map((s) => String(s).toLowerCase());
-    if (!hay.some((h) => h.includes(q))) return false;
-  }
+  if (a.search && searchScore(e, a.search) < 0) return false;
   if (a.genre && !(e.genres || []).includes(a.genre)) return false;
   if (a.genre_in && !a.genre_in.some((x) => (e.genres || []).includes(x))) return false;
   if (a.genre_not_in && a.genre_not_in.some((x) => (e.genres || []).includes(x))) return false;
@@ -536,14 +558,12 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
         }
         if (args.search) {
           const index = await getSearchIndex();
-          const q = String(args.search).toLowerCase();
-          const hit = index.find((e) =>
-            (e.romaji || '').toLowerCase().includes(q) ||
-            (e.english || '').toLowerCase().includes(q) ||
-            (e.native || '').toLowerCase().includes(q) ||
-            (e.synonyms || []).some((s) => String(s).toLowerCase().includes(q)));
-          if (!hit) throw Object.assign(new Error('Media not found'), { status: 404 });
-          const anime = await getAnimeById(hit.id);
+          const ranked = index
+            .map((e) => ({ e, s: searchScore(e, args.search) }))
+            .filter((x) => x.s >= 0)
+            .sort((a, b) => (b.s - a.s) || ((b.e.popularity || 0) - (a.e.popularity || 0)));
+          if (!ranked.length) throw Object.assign(new Error('Media not found'), { status: 404 });
+          const anime = await getAnimeById(ranked[0].e.id);
           return pick(anime, sels, fragments);
         }
         throw Object.assign(new Error('Media query requires id, idMal or search'), { status: 400 });

@@ -79,18 +79,44 @@ async function init() {
         document.getElementById('statGenres').textContent = metadata.genres?.length || 0;
 
         const genreSelect = document.getElementById('browseGenre');
+        const searchGenre = document.getElementById('searchGenre');
         if (metadata.genres) {
             metadata.genres.forEach(g => {
                 const opt = document.createElement('option');
                 opt.value = g;
                 opt.textContent = g;
                 genreSelect.appendChild(opt);
+                const opt2 = document.createElement('option');
+                opt2.value = g;
+                opt2.textContent = g;
+                searchGenre.appendChild(opt2);
             });
         }
+        renderRecents();
+        renderDiscover();
         browseAnime();
+        wireSearchBox();
     } catch (e) {
         console.error('Failed to init:', e);
     }
+}
+
+function wireSearchBox() {
+  const input = document.getElementById('searchInput');
+  if (!input || input.dataset.wired) return;
+  input.dataset.wired = '1';
+  input.addEventListener('input', onSearchInput);
+  input.addEventListener('keydown', dropKey);
+  input.addEventListener('blur', () => setTimeout(hideDrop, 150));
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDetail(); });
+  document.getElementById('modalBack')?.addEventListener('click', (e) => {
+    if (e.target.id === 'modalBack') closeDetail();
+  });
+  for (const id of ['searchGenre', 'searchStatus', 'searchFormat', 'searchSort', 'searchAdult']) {
+    document.getElementById(id)?.addEventListener('change', () => {
+      if (document.getElementById('searchInput').value.trim()) searchAnime();
+    });
+  }
 }
 
 async function loadSearchIndex() {
@@ -308,6 +334,39 @@ function pickExact(obj, selections) {
 }
 
 /* ---------------- exact filter + sort (mirrors Vercel) -------------------- */
+function normStr(s) { return String(s || '').toLowerCase().trim(); }
+function searchTokens(q) {
+  return normStr(q).split(/[\s_.,;:!?()[\]{}'"\/\\|-]+/).map((t) => t.trim()).filter((t) => t.length > 0);
+}
+// Same semantics as the Vercel engine: every word must hit somewhere;
+// score ranks exact > word-start > substring, ties by popularity.
+function searchScore(e, q) {
+  const query = normStr(q);
+  if (!query) return -1;
+  const variants = [e.romaji, e.english, e.native, ...(e.synonyms || [])].filter(Boolean).map(normStr);
+  if (!variants.length) return -1;
+  if (variants.some((v) => v === query)) return 100;
+  const tokens = searchTokens(query).filter((t) => t.length > 1);
+  const hay = variants.join('\n');
+  if (!tokens.length) return hay.includes(query) ? 20 : -1;
+  if (!tokens.every((t) => hay.includes(t))) return -1;
+  let score = 10;
+  const wordHit = variants.some((v) => v.split(/[^a-z0-9\u00c0-\u024f\u1e00-\u1eff\u3040-\u30ff\u4e00-\u9fff]+/u)
+    .some((w) => tokens.some((t) => w.startsWith(t))));
+  if (wordHit) score += 30;
+  if (variants.some((v) => v.startsWith(query))) score += 20;
+  if (variants.some((v) => v.includes(query))) score += 10;
+  return score;
+}
+function rankSearch(index, q, limit) {
+  return index
+    .map((e) => ({ e, s: searchScore(e, q) }))
+    .filter((x) => x.s >= 0)
+    .sort((a, b) => (b.s - a.s) || ((b.e.popularity || 0) - (a.e.popularity || 0)))
+    .slice(0, limit || 20)
+    .map((x) => x.e);
+}
+
 function matchExact(e, full, a) {
   if (a.type && a.type !== 'ANIME') return false;
   if (a.id !== undefined && e.id !== a.id) return false;
@@ -315,11 +374,7 @@ function matchExact(e, full, a) {
   if (a.id_not !== undefined && e.id === a.id_not) return false;
   if (a.id_not_in && a.id_not_in.includes(e.id)) return false;
   if (a.idMal !== undefined && e.idMal !== a.idMal) return false;
-  if (a.search) {
-    const q = String(a.search).toLowerCase();
-    const hay = [e.romaji, e.english, e.native, ...(e.synonyms || [])].filter(Boolean).map((x) => String(x).toLowerCase());
-    if (!hay.some((h) => h.includes(q))) return false;
-  }
+  if (a.search && searchScore(e, a.search) < 0) return false;
   if (a.genre && !(e.genres || []).includes(a.genre)) return false;
   if (a.genre_in && !a.genre_in.some((x) => (e.genres || []).includes(x))) return false;
   if (a.genre_not_in && a.genre_not_in.some((x) => (e.genres || []).includes(x))) return false;
@@ -389,9 +444,8 @@ async function executeGraphQL(query, variables = {}) {
       if (args.id) anime = await loadAnimeById(args.id);
       else if (args.search) {
         const index = await loadSearchIndex();
-        const q = String(args.search).toLowerCase();
-        const hit = index.find((e) => [e.romaji, e.english, e.native].filter(Boolean).some((t) => String(t).toLowerCase().includes(q)));
-        if (hit) anime = await loadAnimeById(hit.id);
+        const hits = rankSearch(index, args.search, 1);
+        if (hits.length) anime = await loadAnimeById(hits[0].id);
       }
       if (!anime) return { data: null, errors: [{ message: 'Media not found', status: 404 }] };
       return { data: { Media: pickExact(anime, root.children) } };
@@ -433,39 +487,174 @@ async function executeGraphQL(query, variables = {}) {
     };
 }
 
+function esc(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function stripHtml(s) { return String(s || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim(); }
+function fmtCountdown(airingAt) {
+  const diff = airingAt * 1000 - Date.now();
+  if (diff <= 0) return 'Aired';
+  const m = Math.floor(diff / 60000);
+  const d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), mm = m % 60;
+  if (d > 0) return `in ${d}d ${h}h`;
+  if (h > 0) return `in ${h}h ${mm}m`;
+  return `in ${mm}m`;
+}
+function weekdayOf(airingAt) {
+  return new Date(airingAt * 1000).toLocaleDateString('en-US', { weekday: 'long' });
+}
+function timeOf(airingAt) {
+  return new Date(airingAt * 1000).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+}
+const PLACEHOLDER_IMG = 'data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 140%22><rect fill=%22%23253746%22 width=%22100%22 height=%22140%22/></svg>';
+const imgErr = `onerror="this.src='${PLACEHOLDER_IMG}'"`;
+
+function indexCard(e) {
+  const title = e.romaji || e.english || 'Unknown';
+  return `<div class="card" onclick="openDetail(${e.id})">
+    <div class="imgwrap">${e.score ? `<span class="score">${e.score}%</span>` : ''}
+    <img loading="lazy" src="${esc(e.cover || '')}" alt="${esc(title)}" ${imgErr}></div>
+    <div class="body"><h4 title="${esc(title)}">${esc(title)}</h4>
+    <p>${esc(e.format || '')}${e.year ? ' · ' + e.year : ''} · ${(e.popularity || 0).toLocaleString()} users</p></div>
+  </div>`;
+}
+
+function searchFilters() {
+  return {
+    genre: document.getElementById('searchGenre')?.value || '',
+    status: document.getElementById('searchStatus')?.value || '',
+    format: document.getElementById('searchFormat')?.value || '',
+    sort: document.getElementById('searchSort')?.value || 'RELEVANCE',
+    adult: document.getElementById('searchAdult')?.checked || false,
+  };
+}
+function applySearchFilters(list) {
+  const f = searchFilters();
+  let out = list.filter((e) => {
+    if (!f.adult && e.adult) return false;
+    if (f.genre && !(e.genres || []).includes(f.genre)) return false;
+    if (f.status && e.status !== f.status) return false;
+    if (f.format && e.format !== f.format) return false;
+    return true;
+  });
+  if (f.sort === 'POPULARITY_DESC') out.sort((a, b) => (b.popularity || 0) - (a.popularity || 0));
+  else if (f.sort === 'SCORE_DESC') out.sort((a, b) => (b.score || 0) - (a.score || 0));
+  else if (f.sort === 'TRENDING_DESC') out.sort((a, b) => (b.trending || 0) - (a.trending || 0));
+  else if (f.sort === 'START_DATE_DESC') out.sort((a, b) => (b.startDate || 0) - (a.startDate || 0));
+  return out;
+}
+function highlightMatch(text, query) {
+  const tokens = searchTokens(query).filter((t) => t.length > 1);
+  let out = esc(text);
+  for (const t of tokens) {
+    const re = new RegExp('(' + t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'ig');
+    out = out.replace(re, '<mark>$1</mark>');
+  }
+  return out;
+}
+
+let searchDebounce = null;
+let dropSel = -1;
+let dropItems = [];
+async function onSearchInput() {
+  clearTimeout(searchDebounce);
+  searchDebounce = setTimeout(renderSearchDropdown, 200);
+}
+function hideDrop() {
+  document.getElementById('searchDrop')?.classList.remove('open');
+  dropSel = -1; dropItems = [];
+}
+async function renderSearchDropdown() {
+  const q = document.getElementById('searchInput').value.trim();
+  const drop = document.getElementById('searchDrop');
+  if (q.length < 2) { hideDrop(); return; }
+  const index = await loadSearchIndex();
+  dropItems = applySearchFilters(rankSearch(index, q, 8));
+  if (!dropItems.length) { hideDrop(); return; }
+  dropSel = -1;
+  drop.innerHTML = dropItems.map((e, i) => {
+    const title = e.romaji || e.english || 'Unknown';
+    return `<div class="drop-item" data-i="${i}" onmousedown="openDetail(${e.id})">
+      <img loading="lazy" src="${esc(e.cover || '')}" ${imgErr}>
+      <div><div class="t">${highlightMatch(title, q)}</div>
+      <div class="s">${e.score ? e.score + '% · ' : ''}${esc(e.format || '')} ${e.year || ''} · ${(e.popularity || 0).toLocaleString()} users</div></div>
+    </div>`;
+  }).join('');
+  drop.classList.add('open');
+}
+function dropKey(e) {
+  const drop = document.getElementById('searchDrop');
+  if (!drop?.classList.contains('open')) {
+    if (e.key === 'Enter') searchAnime();
+    return;
+  }
+  if (e.key === 'ArrowDown') { e.preventDefault(); dropSel = Math.min(dropSel + 1, dropItems.length - 1); paintDropSel(); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); dropSel = Math.max(dropSel - 1, 0); paintDropSel(); }
+  else if (e.key === 'Enter' && dropSel >= 0) { openDetail(dropItems[dropSel].id); hideDrop(); }
+  else if (e.key === 'Enter') { hideDrop(); searchAnime(); }
+  else if (e.key === 'Escape') hideDrop();
+}
+function paintDropSel() {
+  document.querySelectorAll('.drop-item').forEach((el) => {
+    el.classList.toggle('sel', parseInt(el.dataset.i, 10) === dropSel);
+  });
+}
+function saveRecent(q) {
+  try {
+    const k = 'al_recent_searches';
+    let arr = JSON.parse(localStorage.getItem(k) || '[]').filter((x) => x !== q);
+    arr.unshift(q); arr = arr.slice(0, 8);
+    localStorage.setItem(k, JSON.stringify(arr));
+  } catch (e) {}
+}
+function renderRecents() {
+  const box = document.getElementById('searchRecent');
+  if (!box) return;
+  let arr = [];
+  try { arr = JSON.parse(localStorage.getItem('al_recent_searches') || '[]'); } catch (e) {}
+  box.innerHTML = arr.length
+    ? `<p style="color:#8ba0b0;font-size:0.8rem;margin-bottom:0.4rem;">Recent:</p><div class="chips">` +
+      arr.map((q) => `<span class="chip" style="cursor:pointer" onclick="recentSearch('${esc(q)}')">${esc(q)}</span>`).join('') + `</div>`
+    : '';
+}
+function recentSearch(q) {
+  document.getElementById('searchInput').value = q;
+  searchAnime();
+}
+
 async function searchAnime() {
     const query = document.getElementById('searchInput').value.trim();
     if (!query) return;
+    hideDrop();
+    saveRecent(query);
+    renderRecents();
 
     const resultsDiv = document.getElementById('searchResults');
-    resultsDiv.innerHTML = '<div class="loading">Searching...</div>';
+    resultsDiv.innerHTML = '<div class="loading">Searching 14,000+ anime...</div>';
 
     const index = await loadSearchIndex();
-    const q = query.toLowerCase();
-    const matches = index.filter(a =>
-        (a.romaji || '').toLowerCase().includes(q) ||
-        (a.english || '').toLowerCase().includes(q) ||
-        (a.native || '').includes(q) ||
-        (a.synonyms || []).some((s) => String(s).toLowerCase().includes(q))
-    ).slice(0, 20);
+    const ranked = rankSearch(index, query, 400);
+    const matches = applySearchFilters(ranked).slice(0, 24);
 
     if (!matches.length) {
-        resultsDiv.innerHTML = '<p style="color: #8ba0b0;">No results found.</p>';
+        resultsDiv.innerHTML = '<p style="color: #8ba0b0;">No results found. Try fewer words, a synonym, or the Japanese title.</p>';
         return;
     }
 
-    resultsDiv.innerHTML = matches.map(a => `
-        <div class="result-item" onclick="showAnimeDetail(${a.id})">
-            <img src="${a.cover || ''}" alt="${a.romaji}" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 140%22><rect fill=%22%23253746%22 width=%22100%22 height=%22140%22/></svg>'">
+    resultsDiv.innerHTML = `<p style="color:#8ba0b0;font-size:0.85rem;margin-bottom:0.5rem;">${matches.length} results for "${esc(query)}"</p>` +
+      matches.map(a => `
+        <div class="result-item" onclick="openDetail(${a.id})">
+            <img loading="lazy" src="${esc(a.cover || '')}" alt="${esc(a.romaji)}" ${imgErr}>
             <div class="result-info">
-                <h3>${a.romaji || 'Unknown'}</h3>
-                ${a.english && a.english !== a.romaji ? `<p>${a.english}</p>` : ''}
+                <h3>${highlightMatch(a.romaji || 'Unknown', query)}</h3>
+                ${a.english && a.english !== a.romaji ? `<p>${esc(a.english)}</p>` : ''}
                 <div class="result-meta">
                     <span>Score: ${a.score || 'N/A'}</span>
                     <span>Popularity: ${(a.popularity || 0).toLocaleString()}</span>
                     <span>Eps: ${a.episodes || '?'}</span>
-                    <span>${a.format || ''}</span>
-                    <span>${a.status || ''}</span>
+                    <span>${esc(a.format || '')}</span>
+                    <span>${esc(a.status || '')}</span>
                 </div>
             </div>
         </div>
@@ -495,8 +684,8 @@ async function browseAnime() {
     sortMedia(media, sort);
 
     resultsDiv.innerHTML = media.map(a => `
-        <div class="result-item" onclick="showAnimeDetail(${a.id})">
-            <img src="${a.coverImage?.large || ''}" alt="${a.title?.romaji}" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 140%22><rect fill=%22%23253746%22 width=%22100%22 height=%22140%22/></svg>'">
+        <div class="result-item" onclick="openDetail(${a.id})">
+            <img loading="lazy" src="${a.coverImage?.large || ''}" alt="${esc(a.title?.romaji)}" ${imgErr}>
             <div class="result-info">
                 <h3>${a.title?.romaji || 'Unknown'}</h3>
                 ${a.title?.english && a.title.english !== a.title.romaji ? `<p>${a.title.english}</p>` : ''}
@@ -512,36 +701,171 @@ async function browseAnime() {
     `).join('');
 }
 
-async function showAnimeDetail(id) {
-    const query = `{
-        Media(id: ${id}) {
-            id
-            title { romaji english native userPreferred }
-            description
-            coverImage { extraLarge large medium color }
-            bannerImage
-            episodes
-            duration
-            status
-            format
-            season
-            seasonYear
-            averageScore
-            meanScore
-            popularity
-            favourites
-            genres
-            synonyms
-            siteUrl
-        }
-    }`;
-    const result = await executeGraphQL(query);
-    const media = result.data?.Media;
-    if (media) {
-        document.getElementById('queryOutput').textContent = JSON.stringify({ data: { Media: media } }, null, 2);
-        switchTab('playground');
-    }
+const noAdult = (e) => !e.adult;
+function railHtml(title, items) {
+  if (!items.length) return '';
+  return `<h2 class="rail-title">${esc(title)}</h2><div class="rail">${items.map(indexCard).join('')}</div>`;
 }
+async function renderDiscover() {
+  const box = document.getElementById('discoverRails');
+  if (!box) return;
+  const index = await loadSearchIndex();
+  const clean = index.filter(noAdult);
+  const byPop = [...clean].sort((a, b) => (b.popularity || 0) - (a.popularity || 0));
+  const trending = [...clean].sort((a, b) => (b.trending || 0) - (a.trending || 0)).slice(0, 18);
+  const airing = byPop.filter((e) => e.status === 'RELEASING').slice(0, 18);
+  const finished = [...clean].filter((e) => e.status === 'FINISHED')
+    .sort((a, b) => (b.endDate || b.startDate || 0) - (a.endDate || a.startDate || 0)).slice(0, 18);
+  const upcoming = byPop.filter((e) => e.status === 'NOT_YET_RELEASED').slice(0, 18);
+  const topRated = [...clean].filter((e) => (e.score || 0) > 0)
+    .sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 18);
+  box.innerHTML =
+    railHtml('Trending Now', trending) +
+    railHtml('Top Airing', airing) +
+    railHtml('Just Finished', finished) +
+    railHtml('Upcoming', upcoming) +
+    railHtml('Top Rated All Time', topRated);
+}
+
+let scheduleLoaded = false;
+async function renderSchedule() {
+  const box = document.getElementById('scheduleBody');
+  if (!box || scheduleLoaded) return;
+  scheduleLoaded = true;
+  const index = await loadSearchIndex();
+  const cands = index.filter((e) => e.status === 'RELEASING' && !e.adult)
+    .sort((a, b) => (b.popularity || 0) - (a.popularity || 0)).slice(0, 200);
+  box.innerHTML = '<div class="loading">Loading airing data (0/200)...</div>';
+  const now = Date.now() / 1000, week = now + 7 * 86400;
+  const eps = [];
+  let done = 0;
+  const CONC = 12;
+  for (let i = 0; i < cands.length; i += CONC) {
+    const batch = await Promise.all(cands.slice(i, i + CONC).map((e) => loadAnimeById(e.id).catch(() => null)));
+    for (const a of batch) {
+      if (!a) continue;
+      const edges = a.airingSchedule?.edges || [];
+      for (const ed of edges) {
+        const n = ed.node;
+        if (n && n.airingAt >= now - 86400 && n.airingAt <= week) {
+          eps.push({ at: n.airingAt, ep: n.episode, id: a.id, title: a.title?.romaji || a.title?.english, cover: a.coverImage?.large });
+        }
+      }
+      if (a.nextAiringEpisode && a.nextAiringEpisode.airingAt <= week && a.nextAiringEpisode.airingAt >= now - 3600
+          && !eps.some((x) => x.id === a.id && x.ep === a.nextAiringEpisode.episode)) {
+        eps.push({ at: a.nextAiringEpisode.airingAt, ep: a.nextAiringEpisode.episode, id: a.id, title: a.title?.romaji || a.title?.english, cover: a.coverImage?.large });
+      }
+    }
+    done += batch.length;
+    box.innerHTML = `<div class="loading">Loading airing data (${done}/${cands.length})...</div>`;
+  }
+  eps.sort((a, b) => a.at - b.at);
+  if (!eps.length) { box.innerHTML = '<p style="color:#8ba0b0;">No episodes in the next 7 days.</p>'; return; }
+  const days = {};
+  for (const e of eps) {
+    const d = weekdayOf(e.at) + ' · ' + new Date(e.at * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    (days[d] = days[d] || []).push(e);
+  }
+  box.innerHTML = Object.entries(days).map(([d, list]) => `
+    <div class="sched-day"><h3>${esc(d)} (${list.length})</h3>` +
+    list.map((e) => `<div class="sched-row" onclick="openDetail(${e.id})">
+      <span class="time">${timeOf(e.at)} · ${fmtCountdown(e.at)}</span>
+      <img loading="lazy" src="${esc(e.cover || '')}" ${imgErr}>
+      <span>${esc(e.title || 'Unknown')}</span><span class="ep">EP ${e.ep ?? '?'}</span>
+    </div>`).join('') + `</div>`).join('');
+}
+
+function relCard(r) {
+  const n = r.node || {};
+  const t = n.title || {};
+  const title = t.romaji || t.english || 'Unknown';
+  return `<div class="mini" onclick="openDetail(${n.id})" title="${esc(r.relationType || '')}">
+    <img loading="lazy" src="${esc(n.coverImage?.large || '')}" ${imgErr}>
+    <p>${esc(title)}</p><span>${esc((r.relationType || '').replace(/_/g, ' '))}</span>
+  </div>`;
+}
+function recCard(r) {
+  const node = r.node || {};
+  const m = node.mediaRecommendation || node;
+  const t = m.title || {};
+  const title = t.romaji || t.english || 'Unknown';
+  return `<div class="mini" onclick="openDetail(${m.id})">
+    <img loading="lazy" src="${esc(m.coverImage?.large || '')}" ${imgErr}>
+    <p>${esc(title)}</p><span>${node.rating ? '★ ' + node.rating : ''}</span>
+  </div>`;
+}
+function charStrip(a) {
+  const edges = a.characters?.edges || [];
+  if (!edges.length) return '';
+  return `<h3 style="color:#e5c07b;margin:1rem 0 0.3rem;">Characters</h3><div class="strip">` +
+    edges.slice(0, 15).map((e) => {
+      const n = e.node || {};
+      const va = (e.voiceActors || []).find((v) => v.language === 'JAPANESE') || (e.voiceActors || [])[0];
+      return `<div class="mini char"><img loading="lazy" src="${esc(n.image?.large || '')}" ${imgErr}>
+        <p>${esc(n.name?.full || '?')}</p><span>${esc(e.role || '')}${va ? ' · ' + esc(va.name?.full || '') : ''}</span></div>`;
+    }).join('') + `</div>`;
+}
+
+async function openDetail(id) {
+  const back = document.getElementById('modalBack');
+  const box = document.getElementById('modalBox');
+  back.classList.add('open');
+  document.body.style.overflow = 'hidden';
+  box.innerHTML = '<div class="mbody"><div class="loading">Loading...</div></div>';
+  const a = await loadAnimeById(id);
+  if (!a) { box.innerHTML = '<div class="mbody"><p class="error">Anime not found.</p></div>'; return; }
+  const t = a.title || {};
+  const title = t.romaji || t.english || 'Unknown';
+  const studios = (a.studios?.edges || []).map((e) => e.node?.name).filter(Boolean);
+  const rels = (a.relations?.edges || []).filter((e) => e.node?.id);
+  const recs = (a.recommendations?.edges || []).filter((e) => (e.node?.mediaRecommendation || e.node)?.id);
+  const tags = (a.tags || []).slice().sort((x, y) => (y.rank || 0) - (x.rank || 0)).slice(0, 14);
+  const streams = a.streamingEpisodes || [];
+  const links = a.externalLinks || [];
+  box.innerHTML = `
+    <div class="banner" style="background-image:url('${esc(a.bannerImage || a.coverImage?.extraLarge || '')}')"></div>
+    <div class="mbody">
+      <button class="mclose" onclick="closeDetail()">✕</button>
+      <div class="mhead">
+        <img class="cover" src="${esc(a.coverImage?.large || '')}" ${imgErr}>
+        <div><h2>${esc(title)}</h2>
+          ${t.english && t.english !== title ? `<p class="alt">${esc(t.english)}</p>` : ''}
+          ${t.native ? `<p class="alt">${esc(t.native)}</p>` : ''}
+          <div class="chips">
+            ${a.averageScore ? `<span class="chip score">${a.averageScore}%</span>` : ''}
+            <span class="chip">${esc(a.format || '?')}</span>
+            <span class="chip">${esc(a.status || '?')}</span>
+            <span class="chip">${esc(a.season || '')} ${a.seasonYear || ''}</span>
+            <span class="chip">${(a.popularity || 0).toLocaleString()} users</span>
+          </div>
+        </div>
+      </div>
+      ${a.description ? `<p class="desc">${esc(stripHtml(a.description)).slice(0, 1200)}</p>` : ''}
+      <div class="mgrid">
+        <div><b>Episodes</b>${a.episodes ?? '?'}</div>
+        <div><b>Duration</b>${a.duration ? a.duration + ' min' : '?'}</div>
+        <div><b>Source</b>${esc(a.source || '?')}</div>
+        <div><b>Studio</b>${esc(studios.slice(0, 2).join(', ') || '?')}</div>
+        <div><b>Hashtag</b>${esc(a.hashtag || '-')}</div>
+        <div><b>AniList</b><a href="${esc(a.siteUrl || '')}" target="_blank" style="color:#3db4f2">open ↗</a></div>
+      </div>
+      ${(a.genres || []).length ? `<div class="chips">${a.genres.map((g) => `<span class="chip">${esc(g)}</span>`).join('')}</div>` : ''}
+      ${tags.length ? `<div class="chips">${tags.map((g) => `<span class="chip" title="${esc(g.description || '')}">${esc(g.name)}${g.rank ? ' ' + g.rank + '%' : ''}</span>`).join('')}</div>` : ''}
+      ${a.trailer?.site === 'youtube' ? `<p><a href="https://www.youtube.com/watch?v=${esc(a.trailer.id)}" target="_blank" style="color:#e74c3c">▶ Trailer</a></p>` : ''}
+      ${charStrip(a)}
+      ${rels.length ? `<h3 style="color:#e5c07b;margin:1rem 0 0.3rem;">Relations</h3><div class="strip">${rels.slice(0, 15).map(relCard).join('')}</div>` : ''}
+      ${recs.length ? `<h3 style="color:#e5c07b;margin:1rem 0 0.3rem;">Similar Anime — Recommendations</h3><div class="strip">${recs.slice(0, 15).map(recCard).join('')}</div>` : ''}
+      ${streams.length ? `<h3 style="color:#e5c07b;margin:1rem 0 0.3rem;">Watch</h3><div class="chips">${streams.slice(0, 8).map((s) => `<a class="chip" href="${esc(s.url || '')}" target="_blank">${esc(s.site || 'Stream')}</a>`).join('')}</div>` : ''}
+      ${links.length ? `<h3 style="color:#e5c07b;margin:1rem 0 0.3rem;">Links</h3><div class="chips">${links.slice(0, 10).map((s) => `<a class="chip" href="${esc(s.url || '')}" target="_blank">${esc(s.site || 'Link')}</a>`).join('')}</div>` : ''}
+    </div>`;
+  back.scrollTop = 0;
+}
+function closeDetail() {
+  document.getElementById('modalBack')?.classList.remove('open');
+  document.body.style.overflow = '';
+}
+// Backwards-compat: old cards call showAnimeDetail
+async function showAnimeDetail(id) { return openDetail(id); }
 
 async function executeQuery() {
     const query = document.getElementById('queryInput').value;
@@ -653,6 +977,8 @@ function switchTab(tabName) {
     document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
     document.querySelector(`[data-tab="${tabName}"]`)?.classList.add('active');
     document.getElementById(`tab-${tabName}`)?.classList.add('active');
+    if (tabName === 'schedule') renderSchedule();
+    if (tabName === 'discover') renderDiscover();
 }
 
 document.querySelectorAll('.tab').forEach(tab => {

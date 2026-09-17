@@ -829,6 +829,16 @@ class AniListFetcher:
 
         set_metadata(conn, "last_fetch_completed_at", datetime.now(timezone.utc).isoformat())
         set_metadata(conn, "total_anime", str(stats["total_anime"]))
+        # Watermark for incremental mode. Without this, every incremental falls
+        # back to a full walk (the loop this run just hit). post_fetch runs in
+        # ALL modes, so the watermark advances no matter the fetch type.
+        try:
+            row = conn.execute(
+                "SELECT MAX(updated_at) FROM anime WHERE updated_at IS NOT NULL").fetchone()
+            if row and row[0]:
+                set_metadata(conn, "last_updated_at", str(row[0]))
+        except Exception:
+            pass
         conn.commit()
         conn.close()
 
