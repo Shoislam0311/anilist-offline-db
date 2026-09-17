@@ -597,6 +597,12 @@ async function tursoPage(fargs, page, perPage) {
   const clause = where.join(' AND ');
   const countRs = await c.execute({ sql: `SELECT COUNT(*) AS n FROM anime a WHERE ${clause}`, args });
   const total = Number(countRs.rows[0]?.n || 0);
+  if (total === 0) {
+    // Empty result: legit (impossible filter) OR remote not bootstrapped yet.
+    // Only fall back to shards when the remote DB itself is empty.
+    const allRs = await c.execute({ sql: `SELECT COUNT(*) AS n FROM anime`, args: [] });
+    if (Number(allRs.rows[0]?.n || 0) === 0) return null;
+  }
   let order = tursoOrderClause(fargs.sort);
   if (fargs.search && !fargs.sort) {
     const q = String(fargs.search).toLowerCase().trim();
