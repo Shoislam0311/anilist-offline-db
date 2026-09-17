@@ -1,0 +1,45 @@
+{
+  "releaseTag": null,
+  "generatedAt": "2026-09-17T03:08:50.720183+00:00",
+  "schema": "anilist-exact-anime-v2",
+  "shards": [
+    {
+      "file": "shard_0000.json.gz",
+      "sha256": "b23f7e5d1474598d825cd9cb19dabdb45ac76d24dfcae824b85e710dd30621bc",
+      "count": 50,
+      "startId": 21
+    },
+    {
+      "file": "shard_0001.json.gz",
+      "sha256": "f68ce5b92136a556e5602c23d7c03c7ccf61134abe2e38a9d0a97da8eb1526bc",
+      "count": 50,
+      "startId": 149074
+    },
+    {
+      "file": "shard_0002.json.gz",
+      "sha256": "13f5c35c079033fb4b56947ae3fc1e0b8a94609b9725b0054cb9f50e5c37325e",
+      "count": 50,
+      "startId": 180704
+    },
+    {
+      "file": "shard_0003.json.gz",
+      "sha256": "6a639316f430179efd8824e875f323bdf8f0719f0f421f929c1a788c6e5ba92a",
+      "count": 50,
+      "startId": 193883
+    },
+    {
+      "file": "shard_0004.json.gz",
+      "sha256": "10c864bbbd3cef60febfea3004b59bb36ca8c5eaa1f8b31d452f031a1f0d6c3d",
+      "count": 50,
+      "startId": 201910
+    },
+    {
+      "file": "shard_0005.json.gz",
+      "sha256": "c2941dce9c8bb17cbaaa9172becd7136b833dddee535c71593884852fe6a5ad2",
+      "count": 47,
+      "startId": 209982
+    }
+  ],
+  "totalShards": 6,
+  "totalAnime": 297
+}
