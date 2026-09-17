@@ -1175,94 +1175,37 @@ def generate_changelog(conn: sqlite3.Connection, old_data: dict, new_data: dict)
 
 
 def export_json(conn: sqlite3.Connection, output_path: str):
-    rows = conn.execute("""
-        SELECT
-            a.*,
-            GROUP_CONCAT(DISTINCT g.name) as genres_list,
-            GROUP_CONCAT(DISTINCT s.name) as studios_list
-        FROM anime a
-        LEFT JOIN anime_genres ag ON a.id = ag.anime_id
-        LEFT JOIN genres g ON ag.genre_id = g.id
-        LEFT JOIN anime_studios ast ON a.id = ast.anime_id
-        LEFT JOIN studios s ON ast.studio_id = s.id
-        GROUP BY a.id
-        ORDER BY a.id
-    """).fetchall()
+    """Stream exact Media rows to JSON (or .json.gz). Constant memory.
 
-    columns = [desc[0] for desc in conn.execute("SELECT * FROM anime LIMIT 0").description]
-    anime_list = []
-    for row in rows:
-        anime_dict = dict(zip(columns, row))
-        anime_dict["genres"] = (anime_dict.pop("genres_list") or "").split(",") if anime_dict.get("genres_list") else []
-        anime_dict["studios"] = (anime_dict.pop("studios_list") or "").split(",") if anime_dict.get("studios_list") else []
-
-        anime_dict["titles"] = {}
-        for t in conn.execute("SELECT language, title FROM anime_titles WHERE anime_id=?", (anime_dict["id"],)):
-            anime_dict["titles"][t[0]] = t[1]
-
-        anime_dict["descriptions"] = {}
-        for d in conn.execute("SELECT language, description FROM anime_descriptions WHERE anime_id=?", (anime_dict["id"],)):
-            anime_dict["descriptions"][d[0]] = d[1]
-
-        anime_dict["characters"] = []
-        for c in conn.execute("""
-            SELECT c.id, c.name_full, c.name_native, c.image_large, ac.role
-            FROM characters c
-            JOIN anime_characters ac ON c.id = ac.character_id
-            WHERE ac.anime_id=?
-            ORDER BY ac.sort_order
-        """, (anime_dict["id"],)):
-            anime_dict["characters"].append({
-                "id": c[0], "name": c[1], "name_native": c[2], "image": c[3], "role": c[4]
-            })
-
-        anime_dict["relations"] = []
-        for r in conn.execute("""
-            SELECT r.relation_type, a.id, a.title_romaji, a.title_english, a.title_native,
-                   a.cover_large, a.banner_image, a.format, a.status, a.episodes,
-                   a.average_score, a.mean_score, a.popularity, a.source, a.is_adult
-            FROM relations r
-            LEFT JOIN anime a ON r.related_anime_id = a.id
-            WHERE r.anime_id=?
-        """, (anime_dict["id"],)):
-            anime_dict["relations"].append({
-                "relationType": r[0], "id": r[1],
-                "title": {"romaji": r[2], "english": r[3], "native": r[4]},
-                "coverImage": {"large": r[5], "color": None},
-                "bannerImage": r[6], "format": r[7], "status": r[8],
-                "episodes": r[9], "averageScore": r[10], "meanScore": r[11],
-                "popularity": r[12], "source": r[13], "isAdult": bool(r[14]) if r[14] else False,
-                "type": "ANIME",
-            })
-
-        anime_dict["recommendations"] = []
-        for rec in conn.execute("""
-            SELECT r.recommended_anime_id, a.title_romaji, a.title_english, a.title_native,
-                   a.cover_large, a.banner_image, a.format, a.status, a.episodes,
-                   a.average_score, a.mean_score, a.popularity, r.rating
-            FROM recommendations r
-            LEFT JOIN anime a ON r.recommended_anime_id = a.id
-            WHERE r.anime_id=?
-            ORDER BY r.rating DESC
-        """, (anime_dict["id"],)):
-            anime_dict["recommendations"].append({
-                "id": rec[0],
-                "title": {"romaji": rec[1], "english": rec[2], "native": rec[3]},
-                "coverImage": {"large": rec[4], "color": None},
-                "bannerImage": rec[5], "format": rec[6], "status": rec[7],
-                "episodes": rec[8], "averageScore": rec[9], "meanScore": rec[10],
-                "popularity": rec[11], "rating": rec[12],
-                "type": "ANIME",
-            })
-
-        anime_list.append(anime_dict)
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "totalCount": len(anime_list),
-            "exportedAt": datetime.now(timezone.utc).isoformat(),
-            "anime": anime_list
-        }, f, ensure_ascii=False, indent=2)
+    Prefers stored raw_json (byte-identical to AniList); falls back to
+    build_exact_media reconstruction. Never materializes the full list."""
+    import gzip as _gzip
+    total = conn.execute(
+        "SELECT COUNT(*) FROM anime WHERE COALESCE(type,'ANIME')='ANIME'").fetchone()[0]
+    exported_at = datetime.now(timezone.utc).isoformat()
+    opener = (lambda p: _gzip.open(p, "wt", encoding="utf-8")) \
+        if output_path.endswith(".gz") else (lambda p: open(p, "w", encoding="utf-8"))
+    cur = conn.execute(
+        "SELECT id, raw_json FROM anime WHERE COALESCE(type,'ANIME')='ANIME' ORDER BY id")
+    with opener(output_path) as f:
+        f.write('{"totalCount": %d, "exportedAt": "%s", "anime": [' % (total, exported_at))
+        first = True
+        batch = cur.fetchmany(200)
+        while batch:
+            for aid, raw in batch:
+                if raw:
+                    doc = raw
+                else:
+                    try:
+                        doc = json.dumps(build_exact_media(conn, aid), ensure_ascii=False)
+                    except Exception:
+                        continue
+                if not first:
+                    f.write(",")
+                first = False
+                f.write(doc)
+            batch = cur.fetchmany(200)
+        f.write("]}")
 
 
 def get_database_stats(conn: sqlite3.Connection) -> dict:

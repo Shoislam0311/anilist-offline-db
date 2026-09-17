@@ -768,9 +768,9 @@ class AniListFetcher:
         populate_fts(conn)
         conn.commit()
 
-        logger.info("Exporting JSON...")
-        json_path = os.path.join(self.data_dir, "anilist.json")
-        export_json(conn, json_path)
+        logger.info("Exporting JSON (streamed straight to .gz, no 5GB raw file)...")
+        json_gz_path = os.path.join(self.data_dir, "anilist.json.gz")
+        export_json(conn, json_gz_path)
 
         stats = get_database_stats(conn)
         logger.info(f"Database stats: {json.dumps(stats, indent=2)}")

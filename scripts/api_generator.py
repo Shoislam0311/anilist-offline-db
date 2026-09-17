@@ -189,10 +189,62 @@ def generate_metadata(conn, output_dir: str):
     from datetime import datetime, timezone
     stats["generatedAt"] = datetime.now(timezone.utc).isoformat()
     stats["schema"] = "anilist-exact-anime-v2"
+    # Shards live as release assets (git can't hold 4GB). Clients resolve them
+    # via shard_manifest.json + releaseTag below. Filled by workflow after upload.
+    stats["releaseTag"] = os.environ.get("RELEASE_TAG") or None
     with open(os.path.join(output_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2, ensure_ascii=False)
     print(f"Metadata: {stats['totalAnime']} anime, {stats['totalShards']} shards")
     return stats
+
+
+def generate_shard_manifest(output_dir: str, release_tag=None):
+    """Manifest of shard .gz assets: sha256 + count + startId for clients + changed-diff."""
+    import hashlib
+    from datetime import datetime, timezone
+    shard_dir = os.path.join(output_dir, "shards")
+    manifest = {
+        "releaseTag": release_tag,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "schema": "anilist-exact-anime-v2",
+        "shards": [],
+    }
+    for path in sorted(__import__("glob").glob(os.path.join(shard_dir, "shard_*.json.gz"))):
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        name = os.path.basename(path)
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as f:
+                chunk = json.load(f)
+            count = len(chunk)
+            start_id = chunk[0].get("id") if chunk else 0
+        except Exception:
+            count, start_id = 0, 0
+        manifest["shards"].append({
+            "file": name, "sha256": h.hexdigest(), "count": count, "startId": start_id,
+        })
+    manifest["totalShards"] = len(manifest["shards"])
+    manifest["totalAnime"] = sum(s["count"] for s in manifest["shards"])
+    with open(os.path.join(output_dir, "shard_manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+    print(f"Manifest: {manifest['totalShards']} shards, {manifest['totalAnime']} anime")
+    return manifest
+
+
+def stamp_release_tag(output_dir: str, release_tag: str):
+    """Point metadata + manifest at the release holding the shard assets."""
+    for name in ("metadata.json", "shard_manifest.json"):
+        path = os.path.join(output_dir, name)
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        data["releaseTag"] = release_tag
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    print(f"Stamped release tag {release_tag} into metadata + manifest")
 
 
 def generate_sample_data(conn, output_dir: str):
@@ -217,6 +269,13 @@ def main():
     data_dir = os.path.join(base_dir, "data")
     db_path = get_db_path(data_dir)
     api_dir = os.path.join(base_dir, "docs", "api")
+    # helper modes for the workflow (no DB needed)
+    if len(sys.argv) > 1 and sys.argv[1] == "stamp" and len(sys.argv) > 2:
+        stamp_release_tag(api_dir, sys.argv[2])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "manifest":
+        generate_shard_manifest(api_dir)
+        return
     if not os.path.exists(db_path):
         print(f"Error: Database not found at {db_path}")
         sys.exit(1)
@@ -233,6 +292,7 @@ def main():
         generate_search_index(conn, api_dir)
         generate_metadata(conn, api_dir)
         generate_sample_data(conn, api_dir)
+        generate_shard_manifest(api_dir)
         print(f"\nAPI data generated in {api_dir}")
     finally:
         conn.close()

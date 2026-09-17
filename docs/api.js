@@ -42,6 +42,26 @@ async function fetchFirst(urls) {
 }
 const apiUrl = (p) => `${API_BASE}/${p}`;
 
+const GH_REPO = 'Shoislam0311/anilist-offline-db';
+function releaseShardUrls(padded, tag) {
+  const urls = [];
+  if (tag) urls.push(`https://github.com/${GH_REPO}/releases/download/${tag}/shard_${padded}.json.gz`);
+  urls.push(`https://github.com/${GH_REPO}/releases/latest/download/shard_${padded}.json.gz`);
+  return urls;
+}
+async function decodeGzResponse(resp, url) {
+  const buf = new Uint8Array(await resp.arrayBuffer());
+  if (!url.endsWith('.gz')) return JSON.parse(new TextDecoder().decode(buf));
+  try {
+    if (typeof DecompressionStream !== 'undefined') {
+      const ds = new DecompressionStream('gzip');
+      const stream = new Blob([buf]).stream().pipeThrough(ds);
+      return JSON.parse(await new Response(stream).text());
+    }
+  } catch (e) { /* fall through to raw parse */ }
+  return JSON.parse(new TextDecoder().decode(buf));
+}
+
 async function init() {
     try {
         const resp = await fetch(`${API_BASE}/metadata.json`).catch(() => null);
@@ -95,14 +115,23 @@ async function loadShard(shardIdx) {
     }
     loadingShards.add(key);
     try {
-        let resp = await fetch(`${API_BASE}/shards/${key}.json`);
-        if (!resp.ok) {
-          const data = await fetchFirst(API_BASES.map((b) => `${b}/shards/${key}.json`));
-          shardCache[key] = data;
-          return data;
+        // Release assets first (exact, full dataset); git + CDN mirrors as fallback
+        // so the playground keeps working while a full re-scrape is in flight.
+        const tag = metadata?.releaseTag;
+        const urls = [
+            ...releaseShardUrls(key, tag),
+            ...API_BASES.map((b) => `${b}/shards/${key}.json`),
+        ];
+        for (const u of urls) {
+            try {
+                const resp = await fetch(u);
+                if (!resp.ok) continue;
+                if (u.endsWith('.json')) { shardCache[key] = await resp.json(); return shardCache[key]; }
+                shardCache[key] = await decodeGzResponse(resp, u);
+                return shardCache[key];
+            } catch (e) { /* next mirror */ }
         }
-        shardCache[key] = await resp.json();
-        return shardCache[key];
+        return [];
     } catch (e) {
         return [];
     } finally {

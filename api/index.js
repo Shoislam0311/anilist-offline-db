@@ -1,4 +1,5 @@
 import { parse, Kind } from 'graphql';
+import { gunzipSync } from 'node:zlib';
 
 /* AniList Offline GraphQL API — EXACT anime-only mirror.
  * Shards already contain AniList-exact Media objects (camelCase, FuzzyDate).
@@ -134,11 +135,47 @@ async function getShardStartIds() {
   }
   return builtShardStartIds;
 }
+const REPO = 'Shoislam0311/anilist-offline-db';
+const releaseShardUrls = (padded, tag) => {
+  const urls = [];
+  if (tag) urls.push(`https://github.com/${REPO}/releases/download/${tag}/shard_${padded}.json.gz`);
+  urls.push(`https://github.com/${REPO}/releases/latest/download/shard_${padded}.json.gz`);
+  return urls;
+};
+
+async function decodeBody(r, url) {
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (url.endsWith('.gz')) {
+    try {
+      return JSON.parse(gunzipSync(buf).toString('utf8'));
+    } catch {
+      return JSON.parse(buf.toString('utf8')); // transparently decoded upstream
+    }
+  }
+  return JSON.parse(buf.toString('utf8'));
+}
+
 async function getShard(idx) {
   let entry = shardCache.get(idx);
   if (!fresh(entry)) {
     const padded = String(idx).padStart(4, '0');
-    const data = await fetchJSON(`${DATA_BASE}/shards/shard_${padded}.json`);
+    const meta = await getMetadata().catch(() => null);
+    // Release assets first (exact, full dataset); git shards as legacy fallback
+    // so the API keeps serving while a full re-scrape is in flight.
+    const urls = [
+      ...releaseShardUrls(padded, meta?.releaseTag),
+      `${DATA_BASE}/shards/shard_${padded}.json`,
+    ];
+    let data = null, lastErr = null;
+    for (const u of urls) {
+      try {
+        const r = await fetch(u);
+        if (!r.ok) continue;
+        data = await decodeBody(r, u);
+        break;
+      } catch (e) { lastErr = e; }
+    }
+    if (!data) throw lastErr || new Error(`shard ${idx} unavailable on all mirrors`);
     entry = { data, time: Date.now() };
     shardCache.set(idx, entry);
     if (shardCache.size > MAX_SHARD_CACHE) {

@@ -4,17 +4,18 @@ __pycache__/
 *$py.class
 *.so
 .Python
-env/
+.env
 venv/
 .venv/
 
-# Data files (large, tracked by workflow)
+# Data files (large: DB + shards live on Releases + actions/cache, never in git)
 data/*.db
 data/*.json
 data/*.db.gz
 data/*.json.gz
 data/shards/
 data/.checkpoint.json
+docs/api/shards/
 *.tar.gz
 
 # Keep changelog

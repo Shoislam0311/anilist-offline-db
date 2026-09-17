@@ -1,9 +1,16 @@
 name: Update AniList Database
 
+# Architecture (exact anime mirror, zero credentials beyond GITHUB_TOKEN):
+# - Shards (~15MB each, ~300 total) live as RELEASE ASSETS, never in git
+#   (git cannot hold 4GB: 2GB push cap, 100MB/file block, 1GB repo guideline).
+# - Git tracks only small files: metadata, search_index, sample, manifest, site.
+# - The SQLite DB persists between ephemeral runners via actions/cache.
+# - Full and scheduled runs use SEPARATE concurrency groups so the daily
+#   airing refresh can never cancel a multi-hour full re-scrape.
+
 on:
   schedule:
-    - cron: '0 4 * * *'    # Daily at 04:00 UTC -> airing refresh
-    - cron: '0 4 * * 0'    # Weekly Sunday 04:00 UTC -> full exact re-scrape
+    - cron: '0 4 * * *'    # Daily at 04:00 UTC -> airing refresh (or full on Sundays)
   workflow_dispatch:
     inputs:
       fetch_mode:
@@ -23,7 +30,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: "anilist-update"
+  group: "anilist-update-${{ github.event.inputs.fetch_mode || 'scheduled' }}"
   cancel-in-progress: true
 
 jobs:
@@ -65,6 +72,26 @@ jobs:
             fi
           fi
 
+      - name: Restore database cache (runners are ephemeral)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            data/anilist.db
+            data/.checkpoint.json
+          key: anilist-db-${{ steps.mode.outputs.mode }}-${{ github.run_id }}
+          restore-keys: |
+            anilist-db-
+
+      - name: Fail-safe (never rebuild shards from a partial DB)
+        run: |
+          MODE="${{ steps.mode.outputs.mode }}"
+          COUNT=$(python -c "import sys,os; sys.path.insert(0,'scripts'); from db_utils import connect_db; p='data/anilist.db'; print(connect_db(p).execute('SELECT COUNT(*) FROM anime').fetchone()[0] if os.path.exists(p) else 0)")
+          echo "Existing DB rows: $COUNT (mode=$MODE)"
+          if [ "$MODE" != "full" ] && [ "$COUNT" -lt 10000 ]; then
+            echo "::error::DB has only $COUNT rows — refusing $MODE run that would shrink 14k shards to partial data. Run a full fetch first."
+            exit 1
+          fi
+
       - name: Run fetcher
         env:
           FETCH_MODE: ${{ steps.mode.outputs.mode }}
@@ -82,25 +109,113 @@ jobs:
       - name: Verify EXACT shards (fail if snake_case leaks or FuzzyDate broken)
         run: |
           python - <<'EOF'
-          import json, glob, sys
+          import json, glob
           shards = sorted(glob.glob('docs/api/shards/shard_*.json'))
           assert shards, 'no shards generated'
           sample = json.load(open(shards[0]))[0]
           assert 'title' in sample and isinstance(sample['title'], dict), 'shard not exact: title object missing'
-          assert 'title_romaji' not in sample, 'snake_case leak: title_romaji still present (break-now exact only)'
+          assert 'title_romaji' not in sample, 'snake_case leak (break-now exact only)'
           assert isinstance(sample.get('startDate'), dict), 'startDate must be FuzzyDate {year,month,day}'
           assert isinstance(sample.get('coverImage'), dict), 'coverImage must be object'
           assert sample.get('type') == 'ANIME', 'anime-only mirror must set type=ANIME'
           print(f"EXACT check OK: {len(shards)} shards, sample id={sample.get('id')}")
           EOF
-          echo "docs/api/shards contents:"
           ls docs/api/shards/shard_*.json | wc -l
           gzip -kf docs/api/search_index.json || true
-          ls -lh docs/api/*.json* | head -10
+          python scripts/api_generator.py manifest
 
-      - name: Commit changes
+      - name: Resolve release tag
+        id: rel
         run: |
-          git add -f data/ docs/
+          MODE="${{ steps.mode.outputs.mode }}"
+          DATE=$(date -u +'%Y-%m-%d')
+          if [ "$MODE" = "full" ]; then
+            echo "tag=db-$DATE" >> $GITHUB_OUTPUT
+            echo "create=true" >> $GITHUB_OUTPUT
+          else
+            TAG=$(gh release view --json tagName -q .tagName 2>/dev/null || echo "")
+            if [ -z "$TAG" ]; then
+              echo "::error::No release exists yet — run a full fetch first."
+              exit 1
+            fi
+            echo "tag=$TAG" >> $GITHUB_OUTPUT
+            echo "create=false" >> $GITHUB_OUTPUT
+          fi
+          ANIME_COUNT=$(python -c "import sys; sys.path.insert(0, 'scripts'); from db_utils import connect_db; conn = connect_db('data/anilist.db'); print(conn.execute('SELECT COUNT(*) FROM anime').fetchone()[0]); conn.close()")
+          echo "anime_count=$ANIME_COUNT" >> $GITHUB_OUTPUT
+          echo "date=$DATE" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create release (full only)
+        if: steps.rel.outputs.create == 'true'
+        run: |
+          gh release create "${{ steps.rel.outputs.tag }}" --title "AniList Database - ${{ steps.rel.outputs.date }}" \
+            --notes "## AniList Offline Database (exact anime mirror)
+
+          **Date:** ${{ steps.rel.outputs.date }}
+          **Total Anime:** ${{ steps.rel.outputs.anime_count }}
+          **Schema:** anilist-exact-anime-v2 (same fields as graphql.anilist.co)
+
+          ### Files
+          - \`anilist.db.gz\` - Compressed SQLite database (raw AniList JSON + indexes)
+          - \`anilist.json.gz\` - Compressed full JSON export (streamed)
+          - \`shard_*.json.gz\` - GraphQL API shards (50 anime each, AniList-exact Media objects)
+
+          ### Use without rate limits
+          \`\`\`graphql
+          # Point any AniList client at the Vercel endpoint or Pages mirror
+          { Page(page: 1, perPage: 10) { media(sort: POPULARITY_DESC, type: ANIME) { id title { romaji } } } }
+          \`\`\`" --latest || echo "Release may already exist, continuing"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload shard assets (full = all, others = changed only)
+        run: |
+          cd docs/api/shards
+          if [ "${{ steps.mode.outputs.mode }}" = "full" ]; then
+            ls shard_*.json.gz | xargs -P 8 -n 20 gh release upload "${{ steps.rel.outputs.tag }}" --clobber
+          else
+            echo "changed-shard diff not yet implemented; uploading all shards"
+            ls shard_*.json.gz | xargs -P 8 -n 20 gh release upload "${{ steps.rel.outputs.tag }}" --clobber
+          fi
+          cd ../../..
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Free disk (shards are now on the release)
+        run: |
+          rm -rf docs/api/shards
+          df -h / | tail -1
+
+      - name: Compress database archives
+        run: |
+          gzip -k -f data/anilist.db
+          ls -lh data/*.gz
+          test -f data/anilist.json.gz || gzip -k -f data/anilist.json || true
+          ls -lh data/*.gz
+
+      - name: Upload database archives
+        run: |
+          gh release upload "${{ steps.rel.outputs.tag }}" --clobber data/anilist.db.gz data/anilist.json.gz || \
+          gh release upload "${{ steps.rel.outputs.tag }}" --clobber data/anilist.db.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stamp release tag (clients resolve shards from it)
+        run: |
+          python scripts/api_generator.py stamp "${{ steps.rel.outputs.tag }}"
+          cat docs/api/shard_manifest.json | head -12
+
+      - name: Commit small files only (never DB/shards — see header)
+        run: |
+          git rm --cached -r --ignore-unmatch docs/api/shards data/anilist.db data/anilist.json data/anilist.db.gz data/anilist.json.gz || true
+          git add docs/api/metadata.json docs/api/search_index.json docs/api/search_index.json.gz \
+            docs/api/sample.json docs/api/shard_manifest.json docs/index.html docs/api.js \
+            data/changelog.md .github/workflows/update-db.yml
+          echo "Refusing to push any staged file over 90MB (fail fast, not after a 2-min push):"
+          git diff --cached --name-only -z | xargs -0 -I{} sh -c 'test -f "{}" && stat -c "%s {}" "{}"' | \
+            awk '$1 > 90000000 {print "TOO BIG:", $0; bad=1} END {if (bad) exit 1}'
           CHANGES=$(git diff --cached --stat)
           if [ -z "$CHANGES" ]; then
             echo "No changes to commit"
@@ -108,69 +223,20 @@ jobs:
             echo "Changes detected:"
             echo "$CHANGES"
             TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
-            ANIME_COUNT=$(python -c "import sys; sys.path.insert(0, 'scripts'); from db_utils import connect_db; conn = connect_db('data/anilist.db'); count = conn.execute('SELECT COUNT(*) FROM anime').fetchone()[0]; conn.close(); print(count)")
-            git commit -m "update: ${{ steps.mode.outputs.mode }} fetch - $ANIME_COUNT anime - $TIMESTAMP"
+            git commit -m "update: ${{ steps.mode.outputs.mode }} fetch - ${{ steps.rel.outputs.anime_count }} anime - $TIMESTAMP"
           fi
 
       - name: Push changes
         run: git push
 
-      - name: Get database stats for release
-        id: stats
-        if: steps.mode.outputs.mode == 'full'
-        run: |
-          ANIME_COUNT=$(python -c "import sys; sys.path.insert(0, 'scripts'); from db_utils import connect_db; conn = connect_db('data/anilist.db'); count = conn.execute('SELECT COUNT(*) FROM anime').fetchone()[0]; conn.close(); print(count)")
-          echo "anime_count=$ANIME_COUNT" >> $GITHUB_OUTPUT
-          echo "date=$(date -u +'%Y-%m-%d')" >> $GITHUB_OUTPUT
-
-      - name: Create compressed archives
-        if: steps.mode.outputs.mode == 'full'
-        run: |
-          cd data
-          tar -czf ../anilist-db-${{ steps.stats.outputs.date }}.tar.gz anilist.db anilist.json
-          cd ..
-          gzip -k -f data/anilist.db
-          gzip -k -f data/anilist.json
-          ls -lh *.gz data/*.gz 2>/dev/null
-
-      - name: Create GitHub Release
-        if: steps.mode.outputs.mode == 'full'
-        uses: softprops/action-gh-release@v2
+      - name: Save database cache
+        uses: actions/cache/save@v4
+        if: always()
         with:
-          tag_name: "db-${{ steps.stats.outputs.date }}"
-          name: "AniList Database - ${{ steps.stats.outputs.date }}"
-          body: |
-            ## AniList Offline Database Update
-
-            **Date:** ${{ steps.stats.outputs.date }}
-            **Mode:** ${{ steps.mode.outputs.mode }}
-            **Total Anime:** ${{ steps.stats.outputs.anime_count }}
-
-            ### Files
-            - `anilist-db-${{ steps.stats.outputs.date }}.tar.gz` - Full database archive
-            - `anilist.db.gz` - Compressed SQLite database
-            - `anilist.json.gz` - Compressed JSON export
-
-            ### Usage
-            ```bash
-            # Download and extract
-            tar -xzf anilist-db-${{ steps.stats.outputs.date }}.tar.gz
-
-            # Query with SQLite
-            sqlite3 anilist.db "SELECT title_romaji, average_score FROM anime ORDER BY popularity DESC LIMIT 10;"
-            ```
-
-            ### API
-            Visit the GitHub Pages site for the full GraphQL API with zero rate limits.
-          files: |
-            anilist-db-${{ steps.stats.outputs.date }}.tar.gz
-            data/anilist.db.gz
-            data/anilist.json.gz
-          make_latest: true
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          path: |
+            data/anilist.db
+            data/.checkpoint.json
+          key: anilist-db-${{ steps.mode.outputs.mode }}-${{ github.run_id }}
 
   deploy-pages:
     needs: fetch-and-build
