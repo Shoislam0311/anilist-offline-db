@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       fetch_mode:
-        description: 'Fetch mode (weekly incremental+upcoming+counters, daily airing+counters automatic; full = bootstrap only)'
+        description: 'Fetch mode (full retired after bootstrap — weekly/daily cover rails)'
         required: false
         default: 'daily'
         type: choice
@@ -26,7 +26,6 @@ on:
           - airing
           - counters
           - upcoming
-          - full
           - incremental
 
 permissions:

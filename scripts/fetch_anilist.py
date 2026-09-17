@@ -717,10 +717,17 @@ class AniListFetcher:
             updated_after = int(last_updated)
             logger.info(f"Incremental: fetching anime updated after {last_updated}")
         else:
-            updated_after = None
-            logger.info("No previous update found. Running full fetch...")
+            # No full re-walks, ever: the one bootstrap full already happened.
+            # Empty DB -> true bootstrap; warm DB -> refresh rails only.
+            count = conn.execute("SELECT COUNT(*) FROM anime").fetchone()[0]
             conn.close()
-            return self.full_fetch()
+            if count == 0:
+                logger.warning("Empty DB with no watermark: running one-time bootstrap full fetch...")
+                return self.full_fetch()
+            logger.warning(
+                f"No watermark but DB holds {count} rows: skipping straight to "
+                "upcoming/counters refresh (full walks are retired).")
+            return 0
 
         old_anime_data = {}
         for row in conn.execute("SELECT id, title_romaji, episodes, status, average_score, popularity, favourites, trending FROM anime"):
