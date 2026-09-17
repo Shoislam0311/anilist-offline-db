@@ -1,0 +1,32 @@
+name: Warm API
+
+# Keeps Vercel instances + shard caches hot so users rarely pay a cold start.
+# Public URLs only, no secrets. Runs every 5 minutes, costs nothing.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: "api-warm"
+  cancel-in-progress: true
+
+jobs:
+  warm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Hit hot queries (rails + search + detail)
+        run: |
+          BASE="https://anilist-offline-db-phi.vercel.app"
+          curl -s -o /dev/null -w "trending %{time_total}s\n" \
+            --get --data-urlencode 'query={ Page(page: 1, perPage: 18) { media(type: ANIME, sort: TRENDING_DESC, isAdult: false) { id } } }' \
+            "$BASE/" || true
+          curl -s -o /dev/null -w "search %{time_total}s\n" \
+            --get --data-urlencode 'query={ Page(page: 1, perPage: 5) { media(search: "one piece") { id } } }' \
+            "$BASE/" || true
+          curl -s -o /dev/null -w "detail %{time_total}s\n" \
+            -X POST -H 'Content-Type: application/json' \
+            -d '{"query":"{ Media(id: 21) { id title { romaji } } }"}' \
+            "$BASE/" || true

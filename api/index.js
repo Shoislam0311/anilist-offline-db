@@ -1,5 +1,12 @@
 import { parse, Kind } from 'graphql';
 import { gunzipSync } from 'node:zlib';
+import { createClient } from '@libsql/client';
+// Deploy-time snapshot of the small files (search_index ~4MB, metadata tiny).
+// Bundled into the function -> hot path needs ZERO network for index/metadata,
+// and can never serve a stale CDN copy. Refreshed on every data deploy.
+// If the bundler ever drops them, the fetch fallback below takes over.
+import bundledIndex from '../docs/api/search_index.json' with { type: 'json' };
+import bundledMeta from '../docs/api/metadata.json' with { type: 'json' };
 
 /* AniList Offline GraphQL API — EXACT anime-only mirror.
  * Shards already contain AniList-exact Media objects (camelCase, FuzzyDate).
@@ -16,7 +23,7 @@ const DATA_BASE = (typeof process !== 'undefined' && process.env?.DATA_BASE_URL)
 // githack:    https://raw.githack.com/Shoislam0311/anilist-offline-db/main/docs/api
 // Pages:      https://shoislam0311.github.io/anilist-offline-db/api
 const CACHE_TTL_MS = 10 * 60 * 1000;
-const MAX_SHARD_CACHE = 25;
+const MAX_SHARD_CACHE = 12; // decompressed shards are ~15MB each; cap RAM (~180MB)
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -89,15 +96,26 @@ async function fetchJSON(url) {
 }
 function fresh(entry) { return entry && Date.now() - entry.time < CACHE_TTL_MS; }
 
+function bundledFirst(kind) {
+  // Bundled snapshot wins when it looks complete; otherwise fall back to fetch.
+  try {
+    if (kind === 'meta' && bundledMeta?.totalAnime > 1000) return bundledMeta;
+    if (kind === 'index' && Array.isArray(bundledIndex) && bundledIndex.length > 1000) return bundledIndex;
+  } catch { /* bundler dropped the files; fetch instead */ }
+  return null;
+}
+
 async function getMetadata() {
   if (!fresh(metaEntry)) {
-    metaEntry = { data: await fetchJSON(`${DATA_BASE}/metadata.json`), time: Date.now() };
+    const local = bundledFirst('meta');
+    metaEntry = { data: local || await fetchJSON(`${DATA_BASE}/metadata.json`), time: Date.now() };
   }
   return metaEntry.data;
 }
 async function getSearchIndex() {
   if (!fresh(indexEntry)) {
-    indexEntry = { data: await fetchJSON(`${DATA_BASE}/search_index.json`), time: Date.now() };
+    const local = bundledFirst('index');
+    indexEntry = { data: local || await fetchJSON(`${DATA_BASE}/search_index.json`), time: Date.now() };
   }
   return indexEntry.data;
 }
@@ -207,28 +225,41 @@ async function getAnimeById(id) {
 }
 async function getAnimeBatch(ids) {
   const shardStartIds = await getShardStartIds();
+  // One shard per id (not idx±1): the old fan-out fetched up to 3x shards per
+  // id — hundreds of 2.5MB downloads per Page query -> 300s Vercel timeouts.
   const byShard = new Map();
   for (const id of ids) {
     const idx = shardIdxForId(shardStartIds, id);
-    for (const tryIdx of [idx, idx - 1, idx + 1]) {
-      if (tryIdx < 0 || tryIdx >= shardStartIds.length) continue;
-      if (!byShard.has(tryIdx)) byShard.set(tryIdx, []);
-      if (!byShard.get(tryIdx).includes(id)) byShard.get(tryIdx).push(id);
-    }
+    if (!byShard.has(idx)) byShard.set(idx, []);
+    if (!byShard.get(idx).includes(id)) byShard.get(idx).push(id);
   }
   const found = new Map();
-  const results = [];
+  // Parallel fetch: one batch, not sequential.
+  const shards = await Promise.all(
+    [...byShard.keys()].map((shardIdx) =>
+      getShard(shardIdx).then((s) => ({ shardIdx, s })).catch(() => ({ shardIdx, s: [] }))));
+  const byIdx = new Map(shards.map(({ shardIdx, s }) => [shardIdx, s]));
+  const missing = [];
   for (const [shardIdx, shardIds] of byShard) {
-    const shard = await getShard(shardIdx).catch(() => []);
+    const shard = byIdx.get(shardIdx) || [];
     for (const id of shardIds) {
       if (found.has(id)) continue;
       const item = shard.find((a) => a.id === id);
-      if (item) { found.set(id, true); results.push(asExactMedia(item)); }
+      if (item) found.set(id, asExactMedia(item));
+      else missing.push({ id, shardIdx });
+    }
+  }
+  // Narrow fallback only for ids truly absent from their home shard.
+  for (const { id, shardIdx } of missing) {
+    for (const tryIdx of [shardIdx - 1, shardIdx + 1]) {
+      if (found.has(id) || tryIdx < 0 || tryIdx >= shardStartIds.length) continue;
+      const shard = await getShard(tryIdx).catch(() => []);
+      const item = shard.find((a) => a.id === id);
+      if (item) found.set(id, asExactMedia(item));
     }
   }
   // preserve requested order
-  const byId = new Map(results.map((r) => [r.id, r]));
-  return ids.map((id) => byId.get(id)).filter(Boolean);
+  return ids.map((id) => found.get(id)).filter(Boolean);
 }
 
 /* ----------------------------- field resolver ----------------------------- */
@@ -443,6 +474,181 @@ function collectArgs(fieldNode, variables) {
   return args;
 }
 
+/* ------------------------- Turso edge-SQL read path -------------------------
+ * Indexed SQL (~50-200ms) instead of downloading 2.5MB shards per request.
+ * Any failure or missing env falls back to the shard logic below untouched.
+ */
+let turso;
+function tursoClient() {
+  if (turso !== undefined) return turso;
+  try {
+    const url = (typeof process !== 'undefined' && process.env?.TURSO_URL) || '';
+    const token = (typeof process !== 'undefined' && process.env?.TURSO_AUTH_TOKEN) || '';
+    turso = (url && token) ? createClient({ url, authToken: token }) : null;
+  } catch { turso = null; }
+  return turso;
+}
+
+const HAY = `lower(coalesce(a.title_romaji,'') || ' ' || coalesce(a.title_english,'') || ' ' || coalesce(a.title_native,'') || ' ' || coalesce(a.synonyms,''))`;
+function escLike(s) { return String(s).replace(/[\\%_]/g, (c) => '\\' + c).toLowerCase(); }
+function searchTokensSql(q) {
+  return String(q || '').toLowerCase().trim()
+    .split(/[\s_.,;:!?()[\]{}'"\/\\|-]+/).map((t) => t.trim()).filter((t) => t.length > 1);
+}
+function tursoSearchWhere(search, where, args) {
+  const q = String(search || '').toLowerCase().trim();
+  if (!q) return;
+  const tokens = searchTokensSql(q);
+  if (!tokens.length) { where.push(`${HAY} LIKE ? ESCAPE '\\'`); args.push(`%${escLike(q)}%`); return; }
+  for (const t of tokens) { where.push(`${HAY} LIKE ? ESCAPE '\\'`); args.push(`%${escLike(t)}%`); }
+}
+const TURSO_SORTS = {
+  ID: ['a.id'], TITLE_ROMAJI: ['a.title_romaji COLLATE NOCASE'],
+  TITLE_ENGLISH: ['a.title_english COLLATE NOCASE'], TITLE_NATIVE: ['a.title_native COLLATE NOCASE'],
+  TYPE: ['a.type'], FORMAT: ['a.format'], STATUS: ['a.status'],
+  POPULARITY: ['a.popularity'], SCORE: ['a.average_score'], TRENDING: ['a.trending'],
+  FAVOURITES: ['a.favourites'], EPISODES: ['a.episodes'], DURATION: ['a.duration'],
+  CHAPTERS: ['a.chapters'], VOLUMES: ['a.volumes'],
+  START_DATE: ['a.start_year', 'a.start_month', 'a.start_day'],
+  END_DATE: ['a.end_year', 'a.end_month', 'a.end_day'],
+  UPDATED_AT: ['a.updated_at'], SEARCH_MATCH: ['a.popularity'],
+};
+function tursoOrderClause(sort) {
+  const sorts = (Array.isArray(sort) ? sort : [sort]).filter(Boolean);
+  if (!sorts.length) sorts.push('POPULARITY_DESC');
+  const terms = [];
+  for (const s of sorts) {
+    const desc = s.endsWith('_DESC');
+    const field = s.replace(/_DESC$/, '').replace(/_ASC$/, '');
+    const cols = TURSO_SORTS[field] || TURSO_SORTS.POPULARITY;
+    for (const c of cols) terms.push(`${c} ${desc ? 'DESC' : 'ASC'} NULLS LAST`);
+  }
+  return terms.join(', ');
+}
+function numFilter(col, v, op, where, args) {
+  if (v === undefined || v === null) return;
+  where.push(`${col} ${op} ?`);
+  args.push(v);
+}
+function tursoWhere(fargs) {
+  const where = [`COALESCE(a.type,'ANIME') = 'ANIME'`];
+  const args = [];
+  const a = fargs;
+  if (a.type && a.type !== 'ANIME') return { where: ['1 = 0'], args: [] };
+  if (a.id !== undefined) { where.push('a.id = ?'); args.push(a.id); }
+  if (a.id_in) { where.push(`a.id IN (${a.id_in.map(() => '?').join(',')})`); args.push(...a.id_in); }
+  if (a.id_not !== undefined) { where.push('a.id != ?'); args.push(a.id_not); }
+  if (a.id_not_in) { where.push(`a.id NOT IN (${a.id_not_in.map(() => '?').join(',')})`); args.push(...a.id_not_in); }
+  if (a.idMal !== undefined) { where.push('a.id_mal = ?'); args.push(a.idMal); }
+  if (a.idMal_in) { where.push(`a.id_mal IN (${a.idMal_in.map(() => '?').join(',')})`); args.push(...a.idMal_in); }
+  if (a.search) tursoSearchWhere(a.search, where, args);
+  if (a.genre) { where.push(`EXISTS (SELECT 1 FROM anime_genres ag JOIN genres g ON g.id = ag.genre_id WHERE ag.anime_id = a.id AND g.name = ?)`); args.push(a.genre); }
+  if (a.genre_in) { where.push(`EXISTS (SELECT 1 FROM anime_genres ag JOIN genres g ON g.id = ag.genre_id WHERE ag.anime_id = a.id AND g.name IN (${a.genre_in.map(() => '?').join(',')}))`); args.push(...a.genre_in); }
+  if (a.genre_not_in) { where.push(`NOT EXISTS (SELECT 1 FROM anime_genres ag JOIN genres g ON g.id = ag.genre_id WHERE ag.anime_id = a.id AND g.name IN (${a.genre_not_in.map(() => '?').join(',')}))`); args.push(...a.genre_not_in); }
+  if (a.tag) { where.push(`EXISTS (SELECT 1 FROM anime_tags at WHERE at.anime_id = a.id AND at.tag_name = ?)`); args.push(a.tag); }
+  if (a.tag_in) { where.push(`EXISTS (SELECT 1 FROM anime_tags at WHERE at.anime_id = a.id AND at.tag_name IN (${a.tag_in.map(() => '?').join(',')}))`); args.push(...a.tag_in); }
+  if (a.tag_not_in) { where.push(`NOT EXISTS (SELECT 1 FROM anime_tags at WHERE at.anime_id = a.id AND at.tag_name IN (${a.tag_not_in.map(() => '?').join(',')}))`); args.push(...a.tag_not_in); }
+  if (a.tagCategory_in) { where.push(`EXISTS (SELECT 1 FROM anime_tags at JOIN tags t ON t.name = at.tag_name WHERE at.anime_id = a.id AND t.category IN (${a.tagCategory_in.map(() => '?').join(',')}))`); args.push(...a.tagCategory_in); }
+  if (a.tagCategory_not_in) { where.push(`NOT EXISTS (SELECT 1 FROM anime_tags at JOIN tags t ON t.name = at.tag_name WHERE at.anime_id = a.id AND t.category IN (${a.tagCategory_not_in.map(() => '?').join(',')}))`); args.push(...a.tagCategory_not_in); }
+  if (a.minimumTagRank !== undefined) { where.push(`EXISTS (SELECT 1 FROM anime_tags at WHERE at.anime_id = a.id AND at.tag_rank >= ?)`); args.push(a.minimumTagRank); }
+  if (a.format) { where.push('a.format = ?'); args.push(a.format); }
+  if (a.format_in) { where.push(`a.format IN (${a.format_in.map(() => '?').join(',')})`); args.push(...a.format_in); }
+  if (a.format_not) { where.push('a.format != ?'); args.push(a.format_not); }
+  if (a.format_not_in) { where.push(`a.format NOT IN (${a.format_not_in.map(() => '?').join(',')})`); args.push(...a.format_not_in); }
+  if (a.status) { where.push('a.status = ?'); args.push(a.status); }
+  if (a.status_in) { where.push(`a.status IN (${a.status_in.map(() => '?').join(',')})`); args.push(...a.status_in); }
+  if (a.status_not) { where.push('a.status != ?'); args.push(a.status_not); }
+  if (a.status_not_in) { where.push(`a.status NOT IN (${a.status_not_in.map(() => '?').join(',')})`); args.push(...a.status_not_in); }
+  if (a.season) { where.push('a.season = ?'); args.push(a.season); }
+  if (a.seasonYear !== undefined) { where.push('a.season_year = ?'); args.push(a.seasonYear); }
+  if (a.source_in) { where.push(`a.source IN (${a.source_in.map(() => '?').join(',')})`); args.push(...a.source_in); }
+  if (a.countryOfOrigin) { where.push('a.country_of_origin = ?'); args.push(a.countryOfOrigin); }
+  if (a.isAdult !== undefined) { where.push('a.is_adult = ?'); args.push(a.isAdult ? 1 : 0); }
+  numFilter('a.episodes', a.episodes_greater, '>', where, args);
+  numFilter('a.episodes', a.episodes_lesser, '<', where, args);
+  numFilter('a.duration', a.duration_greater, '>', where, args);
+  numFilter('a.duration', a.duration_lesser, '<', where, args);
+  numFilter('a.chapters', a.chapters_greater, '>', where, args);
+  numFilter('a.chapters', a.chapters_lesser, '<', where, args);
+  numFilter('a.volumes', a.volumes_greater, '>', where, args);
+  numFilter('a.volumes', a.volumes_lesser, '<', where, args);
+  if (a.averageScore !== undefined) { where.push('a.average_score = ?'); args.push(a.averageScore); }
+  if (a.averageScore_not !== undefined) { where.push('a.average_score != ?'); args.push(a.averageScore_not); }
+  numFilter('a.average_score', a.averageScore_greater, '>', where, args);
+  numFilter('a.average_score', a.averageScore_lesser, '<', where, args);
+  if (a.popularity !== undefined) { where.push('a.popularity = ?'); args.push(a.popularity); }
+  if (a.popularity_not !== undefined) { where.push('a.popularity != ?'); args.push(a.popularity_not); }
+  numFilter('a.popularity', a.popularity_greater, '>', where, args);
+  numFilter('a.popularity', a.popularity_lesser, '<', where, args);
+  const fuzzy = (prefix, col) => {
+    const expr = `(a.${prefix}_year * 10000 + COALESCE(a.${prefix}_month, 0) * 100 + COALESCE(a.${prefix}_day, 0))`;
+    if (a[`${col}_greater`] !== undefined) { where.push(`${expr} > ?`); args.push(a[`${col}_greater`]); }
+    if (a[`${col}_lesser`] !== undefined) { where.push(`${expr} < ?`); args.push(a[`${col}_lesser`]); }
+    if (a[`${col}_like`] !== undefined) { where.push(`${expr} = ?`); args.push(a[`${col}_like`]); }
+  };
+  fuzzy('start', 'startDate');
+  fuzzy('end', 'endDate');
+  return { where, args };
+}
+async function tursoPage(fargs, page, perPage) {
+  const c = tursoClient();
+  if (!c) return null;
+  const { where, args } = tursoWhere(fargs);
+  const clause = where.join(' AND ');
+  const countRs = await c.execute({ sql: `SELECT COUNT(*) AS n FROM anime a WHERE ${clause}`, args });
+  const total = Number(countRs.rows[0]?.n || 0);
+  let order = tursoOrderClause(fargs.sort);
+  if (fargs.search && !fargs.sort) {
+    const q = String(fargs.search).toLowerCase().trim();
+    order = `CASE WHEN lower(coalesce(a.title_romaji,'')) = ? OR lower(coalesce(a.title_english,'')) = ? OR lower(coalesce(a.title_native,'')) = ? THEN 0 ELSE 1 END, ${order}`;
+    args.push(q, q, q);
+  }
+  const dataRs = await c.execute({
+    sql: `SELECT a.raw_json AS raw_json FROM anime a WHERE ${clause} ORDER BY ${order} LIMIT ? OFFSET ?`,
+    args: [...args, perPage, (page - 1) * perPage],
+  });
+  const items = [];
+  for (const row of dataRs.rows) {
+    try { if (row.raw_json) items.push(asExactMedia(JSON.parse(row.raw_json))); } catch { /* skip bad row */ }
+  }
+  return { total, items };
+}
+async function tursoMediaByArgs(args) {
+  const c = tursoClient();
+  if (!c) return null;
+  let sql, sqlArgs;
+  if (args.id) { sql = `SELECT raw_json FROM anime WHERE id = ?`; sqlArgs = [args.id]; }
+  else if (args.idMal) { sql = `SELECT raw_json FROM anime WHERE id_mal = ?`; sqlArgs = [args.idMal]; }
+  else if (args.search) {
+    const where = [`COALESCE(type,'ANIME') = 'ANIME'`];
+    const wargs = [];
+    tursoSearchWhere(args.search, where, wargs);
+    const q = String(args.search).toLowerCase().trim();
+    sql = `SELECT raw_json FROM anime a WHERE ${where.join(' AND ')} ORDER BY CASE WHEN lower(coalesce(title_romaji,'')) = ? OR lower(coalesce(title_english,'')) = ? OR lower(coalesce(title_native,'')) = ? THEN 0 ELSE 1 END, popularity DESC NULLS LAST LIMIT 1`;
+    sqlArgs = [...wargs, q, q, q];
+  } else return null;
+  const rs = await c.execute({ sql, args: sqlArgs });
+  const raw = rs.rows[0]?.raw_json;
+  if (!raw) return null;
+  const anime = asExactMedia(JSON.parse(raw));
+  if (args.type && args.type !== 'ANIME') return null;
+  return anime;
+}
+
+function pageOut(fieldNode, fragments, paged, total, page, perPage) {
+  const out = {};
+  for (const s of fieldNode.selectionSet?.selections || []) {
+    if (s.kind !== Kind.FIELD) continue;
+    const k = s.alias?.value || s.name.value;
+    if (s.name.value === 'media') {
+      out[k] = paged.map((item) => pick(item, collectSelections(s, fragments), fragments));
+    } else if (s.name.value === 'pageInfo') {
+      out[k] = pick(buildPageInfo(total, page, perPage), collectSelections(s, fragments), fragments);
+    } else out[k] = null;
+  }
+  return out;
+}
+
 async function resolvePage(fieldNode, fragments, variables, pageArgs) {
   const index = await getSearchIndex();
   const mediaFieldNode = fieldNode.selectionSet?.selections?.find(
@@ -452,6 +658,12 @@ async function resolvePage(fieldNode, fragments, variables, pageArgs) {
   // AniList allows args on Page or on media — merge both
   const page = fargs.page || 1;
   const perPage = Math.min(fargs.perPage || 25, 50);
+
+  // Fast path: indexed edge SQL (milliseconds). Falls back to shards on any error.
+  try {
+    const t = await tursoPage(fargs, page, perPage);
+    if (t) return pageOut(fieldNode, fragments, t.items, t.total, page, perPage);
+  } catch { /* shard fallback below */ }
 
   const needFull = fargs.sort || fargs.tagCategory_in || fargs.tagCategory_not_in
     || fargs.minimumTagRank !== undefined;
@@ -477,17 +689,7 @@ async function resolvePage(fieldNode, fragments, variables, pageArgs) {
     paged = await getAnimeBatch(pagedIds);
   }
 
-  const out = {};
-  for (const s of fieldNode.selectionSet?.selections || []) {
-    if (s.kind !== Kind.FIELD) continue;
-    const k = s.alias?.value || s.name.value;
-    if (s.name.value === 'media') {
-      out[k] = paged.map((item) => pick(item, collectSelections(s, fragments), fragments));
-    } else if (s.name.value === 'pageInfo') {
-      out[k] = pick(buildPageInfo(total, page, perPage), collectSelections(s, fragments), fragments);
-    } else out[k] = null;
-  }
-  return out;
+  return pageOut(fieldNode, fragments, paged, total, page, perPage);
 }
 
 async function scanNested(kind, args) {
@@ -540,6 +742,10 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
       case 'Page':
         return resolvePage(fieldNode, fragments, variables, args);
       case 'Media': {
+        try {
+          const t = await tursoMediaByArgs(args);
+          if (t) return pick(t, sels, fragments);
+        } catch { /* shard fallback below */ }
         if (args.id) {
           const anime = await getAnimeById(args.id);
           if (!anime || (args.type && args.type !== 'ANIME')) {

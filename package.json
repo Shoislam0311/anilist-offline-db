@@ -4,6 +4,7 @@
   "type": "module",
   "main": "api/index.js",
   "dependencies": {
+    "@libsql/client": "^0.18.0",
     "graphql": "^16.10.0"
   }
 }

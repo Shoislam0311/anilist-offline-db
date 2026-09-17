@@ -280,6 +280,20 @@ class AniListFetcher:
         })
         self.request_count = 0
         self.last_request_time = 0
+        # Delta tracking for Turso sync: only these IDs get pushed upstream,
+        # keeping monthly row writes far under the free cap.
+        self.touched_full = set()
+        self.touched_counters = set()
+
+    def _save_touched(self):
+        try:
+            with open(os.path.join(self.data_dir, "touched_full.json"), "w") as f:
+                json.dump(sorted(self.touched_full), f)
+            with open(os.path.join(self.data_dir, "touched_counters.json"), "w") as f:
+                json.dump(sorted(self.touched_counters), f)
+            logger.info(f"Touched: {len(self.touched_full)} full + {len(self.touched_counters)} counters")
+        except Exception as e:
+            logger.warning(f"Could not save touched lists: {e}")
 
     def _rate_limit(self):
         global request_timestamps
@@ -369,6 +383,7 @@ class AniListFetcher:
         if media.get("type") and media.get("type") != "ANIME":
             return
         media["type"] = "ANIME"
+        self.touched_full.add(media["id"])
         upsert_anime(conn, media)
         upsert_anime_titles(conn, media["id"], media.get("title", {}) or {})
 
@@ -933,6 +948,7 @@ class AniListFetcher:
                         continue
                     try:
                         update_counters(conn, media["id"], media)
+                        self.touched_counters.add(media["id"])
                         total_updated += 1
                     except Exception as e:
                         logger.warning(f"Counters update failed for {media.get('id')}: {e}")
@@ -1062,6 +1078,7 @@ def main():
     else:
         fetcher.incremental_fetch()
 
+    fetcher._save_touched()
     fetcher.post_fetch()
 
     elapsed = time.time() - start_time

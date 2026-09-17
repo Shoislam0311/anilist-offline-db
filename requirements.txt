@@ -1,1 +1,2 @@
 requests>=2.31.0
+libsql-experimental>=0.2.0  # Turso sync (delta pushes, free-tier write budget)

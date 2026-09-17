@@ -20,8 +20,6 @@ const API_BASES = (() => {
 let API_BASE = API_BASES[0];
 let metadata = null;
 let searchIndex = null;
-let shardCache = {};
-let loadingShards = new Set();
 
 async function fetchFirst(urls) {
   let lastErr = null;
@@ -42,25 +40,32 @@ async function fetchFirst(urls) {
 }
 const apiUrl = (p) => `${API_BASE}/${p}`;
 
-const GH_REPO = 'Shoislam0311/anilist-offline-db';
-function releaseShardUrls(padded, tag) {
-  const urls = [];
-  if (tag) urls.push(`https://github.com/${GH_REPO}/releases/download/${tag}/shard_${padded}.json.gz`);
-  urls.push(`https://github.com/${GH_REPO}/releases/latest/download/shard_${padded}.json.gz`);
-  return urls;
+/**
+ * AniList Offline — site data layer (EXACT anime-only mirror)
+ *
+ * Browsers CANNOT fetch release assets directly: github.com sends no
+ * CORS headers (every release fetch dies with ERR_FAILED), release URLs
+ * 404/302 unpredictably, and git no longer holds shards. So ALL anime
+ * payloads go through our own Vercel GraphQL API (open CORS, exact same
+ * schema as graphql.anilist.co), which reads the release shards server-side.
+ * Only tiny git-tracked files (metadata, search_index) load directly.
+ */
+
+const VERCEL_API = 'https://anilist-offline-db-phi.vercel.app/';
+
+async function apiQuery(query, variables = {}) {
+  const r = await fetch(VERCEL_API, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!r.ok) throw new Error('API offline (HTTP ' + r.status + ')');
+  const d = await r.json();
+  if (d.errors && !d.data) throw new Error(d.errors[0]?.message || 'API error');
+  return d.data;
 }
-async function decodeGzResponse(resp, url) {
-  const buf = new Uint8Array(await resp.arrayBuffer());
-  if (!url.endsWith('.gz')) return JSON.parse(new TextDecoder().decode(buf));
-  try {
-    if (typeof DecompressionStream !== 'undefined') {
-      const ds = new DecompressionStream('gzip');
-      const stream = new Blob([buf]).stream().pipeThrough(ds);
-      return JSON.parse(await new Response(stream).text());
-    }
-  } catch (e) { /* fall through to raw parse */ }
-  return JSON.parse(new TextDecoder().decode(buf));
-}
+// Force https on every rendered image (kills Mixed Content blocks).
+const https = (u) => String(u || '').replace(/^http:\/\//i, 'https://');
 
 async function init() {
     try {
@@ -132,68 +137,30 @@ async function loadSearchIndex() {
     }
 }
 
-async function loadShard(shardIdx) {
-    const key = `shard_${String(shardIdx).padStart(4, '0')}`;
-    if (shardCache[key]) return shardCache[key];
-    if (loadingShards.has(key)) {
-        while (loadingShards.has(key)) await new Promise(r => setTimeout(r, 50));
-        return shardCache[key];
-    }
-    loadingShards.add(key);
-    try {
-        // Release assets first (exact, full dataset); git + CDN mirrors as fallback
-        // so the playground keeps working while a full re-scrape is in flight.
-        const tag = metadata?.releaseTag;
-        const urls = [
-            ...releaseShardUrls(key, tag),
-            ...API_BASES.map((b) => `${b}/shards/${key}.json`),
-        ];
-        for (const u of urls) {
-            try {
-                const resp = await fetch(u);
-                if (!resp.ok) continue;
-                if (u.endsWith('.json')) { shardCache[key] = await resp.json(); return shardCache[key]; }
-                shardCache[key] = await decodeGzResponse(resp, u);
-                return shardCache[key];
-            } catch (e) { /* next mirror */ }
-        }
-        return [];
-    } catch (e) {
-        return [];
-    } finally {
-        loadingShards.delete(key);
-    }
-}
-
-async function loadAllAnime() {
-    if (!metadata) return [];
-    const all = [];
-    const totalShards = Math.ceil(metadata.totalAnime / metadata.shardSize);
-    const promises = [];
-    for (let i = 0; i < totalShards; i++) {
-        promises.push(loadShard(i));
-    }
-    const shards = await Promise.all(promises);
-    shards.forEach(shard => all.push(...shard));
-    return all;
-}
+const CARD_FIELDS = `id title { romaji english } coverImage { large } averageScore popularity favourites trending format status season seasonYear episodes`;
+const DETAIL_FIELDS = `id idMal title { romaji english native userPreferred } description
+  coverImage { extraLarge large medium color } bannerImage episodes duration status format
+  season seasonYear averageScore meanScore popularity trending favourites
+  genres synonyms siteUrl hashtag source trailer { id site }
+  studios { edges { isMain node { name } } }
+  tags { name rank description }
+  characters(page: 1, perPage: 15) { edges { role node { id name { full } image { large } } voiceActors(language: JAPANESE) { name { full } language } } }
+  relations { edges { relationType node { id title { romaji english } coverImage { large } } } }
+  recommendations(page: 1, perPage: 15, sort: RATING_DESC) { edges { node { rating mediaRecommendation { id title { romaji english } coverImage { large } } } } }
+  airingSchedule { edges { node { episode airingAt } } } nextAiringEpisode { episode airingAt }
+  streamingEpisodes { title url site } externalLinks { site url }`;
 
 async function loadAnimeById(id) {
-    if (!metadata) return null;
-    let shardIdx = 0;
-    if (metadata.shardStartIds) {
-        const starts = metadata.shardStartIds;
-        let lo = 0, hi = starts.length - 1;
-        while (lo < hi) {
-            const mid = (lo + hi + 1) >> 1;
-            if (starts[mid] <= id) lo = mid; else hi = mid - 1;
-        }
-        shardIdx = lo;
-    } else {
-        shardIdx = Math.floor(id / metadata.shardSize);
-    }
-    const shard = await loadShard(shardIdx);
-    return shard.find(a => a.id === id) || null;
+  try {
+    const d = await apiQuery(`{ Media(id: ${parseInt(id, 10)}) { ${DETAIL_FIELDS} } }`);
+    return d?.Media || null;
+  } catch (e) { return null; }
+}
+async function fetchRail({ sort, status, limit = 18 }) {
+  const args = [`type: ANIME`, `sort: ${sort}`, `isAdult: false`];
+  if (status) args.push(`status: ${status}`);
+  const d = await apiQuery(`{ Page(page: 1, perPage: ${limit}) { media(${args.join(', ')}) { ${CARD_FIELDS} } } }`);
+  return d?.Page?.media || [];
 }
 
 /* ---------- minimal GraphQL parser: variables, aliases, args, fragments ---- */
@@ -514,7 +481,7 @@ function indexCard(e) {
   const title = e.romaji || e.english || 'Unknown';
   return `<div class="card" onclick="openDetail(${e.id})">
     <div class="imgwrap">${e.score ? `<span class="score">${e.score}%</span>` : ''}
-    <img loading="lazy" src="${esc(e.cover || '')}" alt="${esc(title)}" ${imgErr}></div>
+    <img loading="lazy" src="${esc(https(e.cover || ''))}" alt="${esc(title)}" ${imgErr}></div>
     <div class="body"><h4 title="${esc(title)}">${esc(title)}</h4>
     <p>${esc(e.format || '')}${e.year ? ' · ' + e.year : ''} · ${(e.popularity || 0).toLocaleString()} users</p></div>
   </div>`;
@@ -576,7 +543,7 @@ async function renderSearchDropdown() {
   drop.innerHTML = dropItems.map((e, i) => {
     const title = e.romaji || e.english || 'Unknown';
     return `<div class="drop-item" data-i="${i}" onmousedown="openDetail(${e.id})">
-      <img loading="lazy" src="${esc(e.cover || '')}" ${imgErr}>
+      <img loading="lazy" src="${esc(https(e.cover || ''))}" ${imgErr}>
       <div><div class="t">${highlightMatch(title, q)}</div>
       <div class="s">${e.score ? e.score + '% · ' : ''}${esc(e.format || '')} ${e.year || ''} · ${(e.popularity || 0).toLocaleString()} users</div></div>
     </div>`;
@@ -645,7 +612,7 @@ async function searchAnime() {
     resultsDiv.innerHTML = `<p style="color:#8ba0b0;font-size:0.85rem;margin-bottom:0.5rem;">${matches.length} results for "${esc(query)}"</p>` +
       matches.map(a => `
         <div class="result-item" onclick="openDetail(${a.id})">
-            <img loading="lazy" src="${esc(a.cover || '')}" alt="${esc(a.romaji)}" ${imgErr}>
+            <img loading="lazy" src="${esc(https(a.cover || ''))}" alt="${esc(a.romaji)}" ${imgErr}>
             <div class="result-info">
                 <h3>${highlightMatch(a.romaji || 'Unknown', query)}</h3>
                 ${a.english && a.english !== a.romaji ? `<p>${esc(a.english)}</p>` : ''}
@@ -661,6 +628,17 @@ async function searchAnime() {
     `).join('');
 }
 
+function mediaCard(a) {
+  const t = a.title || {};
+  const title = t.romaji || t.english || 'Unknown';
+  return `<div class="card" onclick="openDetail(${a.id})">
+    <div class="imgwrap">${a.averageScore ? `<span class="score">${a.averageScore}%</span>` : ''}
+    <img loading="lazy" src="${https(a.coverImage?.large || '')}" alt="${esc(title)}" ${imgErr}></div>
+    <div class="body"><h4 title="${esc(title)}">${esc(title)}</h4>
+    <p>${esc(a.format || '')}${a.seasonYear ? ' · ' + a.seasonYear : ''} · ${(a.popularity || 0).toLocaleString()} users</p></div>
+  </div>`;
+}
+
 async function browseAnime() {
     const genre = document.getElementById('browseGenre').value;
     const status = document.getElementById('browseStatus').value;
@@ -670,61 +648,64 @@ async function browseAnime() {
     const resultsDiv = document.getElementById('browseResults');
     resultsDiv.innerHTML = '<div class="loading">Loading...</div>';
 
-    const index = await loadSearchIndex();
-    let hits = index.filter((e) => {
-      if (genre && !(e.genres || []).includes(genre)) return false;
-      if (status && e.status !== status) return false;
-      if (format && e.format !== format) return false;
-      return true;
-    });
-    // sort via exact field using hydrated page (top 50 only for speed)
-    const ids = hits.slice(0, 200).map((e) => e.id);
-    let media = [];
-    for (const id of ids.slice(0, 50)) { const a = await loadAnimeById(id); if (a) media.push(a); }
-    sortMedia(media, sort);
-
-    resultsDiv.innerHTML = media.map(a => `
+    try {
+      const args = ['type: ANIME', 'isAdult: false'];
+      if (genre) args.push(`genre: "${genre}"`);
+      if (status) args.push(`status: ${status}`);
+      if (format) args.push(`format: ${format}`);
+      if (sort) args.push(`sort: ${sort}`);
+      const d = await apiQuery(
+        `{ Page(page: 1, perPage: 24) { media(${args.join(', ')}) { ${CARD_FIELDS} } } }`);
+      const media = d?.Page?.media || [];
+      if (!media.length) { resultsDiv.innerHTML = '<p style="color:#8ba0b0;">No anime match.</p>'; return; }
+      resultsDiv.innerHTML = media.map(a => `
         <div class="result-item" onclick="openDetail(${a.id})">
-            <img loading="lazy" src="${a.coverImage?.large || ''}" alt="${esc(a.title?.romaji)}" ${imgErr}>
+            <img loading="lazy" src="${https(a.coverImage?.large || '')}" alt="${esc(a.title?.romaji)}" ${imgErr}>
             <div class="result-info">
-                <h3>${a.title?.romaji || 'Unknown'}</h3>
-                ${a.title?.english && a.title.english !== a.title.romaji ? `<p>${a.title.english}</p>` : ''}
+                <h3>${esc(a.title?.romaji || 'Unknown')}</h3>
+                ${a.title?.english && a.title.english !== a.title.romaji ? `<p>${esc(a.title.english)}</p>` : ''}
                 <div class="result-meta">
                     <span>Score: ${a.averageScore || 'N/A'}</span>
                     <span>Popularity: ${(a.popularity || 0).toLocaleString()}</span>
                     <span>Eps: ${a.episodes || '?'}</span>
-                    <span>${a.format || ''}</span>
-                    <span>${a.season || ''} ${a.seasonYear || ''}</span>
+                    <span>${esc(a.format || '')}</span>
+                    <span>${esc(a.season || '')} ${a.seasonYear || ''}</span>
                 </div>
             </div>
         </div>
     `).join('');
+    } catch (e) {
+      resultsDiv.innerHTML = `<p class="error">Browse failed: ${esc(e.message)} — try again in a few seconds (cold start).</p>`;
+    }
 }
 
 const noAdult = (e) => !e.adult;
 function railHtml(title, items) {
   if (!items.length) return '';
-  return `<h2 class="rail-title">${esc(title)}</h2><div class="rail">${items.map(indexCard).join('')}</div>`;
+  return `<h2 class="rail-title">${esc(title)}</h2><div class="rail">${items.map(mediaCard).join('')}</div>`;
 }
 async function renderDiscover() {
   const box = document.getElementById('discoverRails');
-  if (!box) return;
-  const index = await loadSearchIndex();
-  const clean = index.filter(noAdult);
-  const byPop = [...clean].sort((a, b) => (b.popularity || 0) - (a.popularity || 0));
-  const trending = [...clean].sort((a, b) => (b.trending || 0) - (a.trending || 0)).slice(0, 18);
-  const airing = byPop.filter((e) => e.status === 'RELEASING').slice(0, 18);
-  const finished = [...clean].filter((e) => e.status === 'FINISHED')
-    .sort((a, b) => (b.endDate || b.startDate || 0) - (a.endDate || a.startDate || 0)).slice(0, 18);
-  const upcoming = byPop.filter((e) => e.status === 'NOT_YET_RELEASED').slice(0, 18);
-  const topRated = [...clean].filter((e) => (e.score || 0) > 0)
-    .sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 18);
-  box.innerHTML =
-    railHtml('Trending Now', trending) +
-    railHtml('Top Airing', airing) +
-    railHtml('Just Finished', finished) +
-    railHtml('Upcoming', upcoming) +
-    railHtml('Top Rated All Time', topRated);
+  if (!box || box.dataset.done) return;
+  try {
+    const [trending, airing, finished, upcoming, topRated] = await Promise.all([
+      fetchRail({ sort: 'TRENDING_DESC', limit: 18 }),
+      fetchRail({ sort: 'POPULARITY_DESC', status: 'RELEASING', limit: 18 }),
+      fetchRail({ sort: 'END_DATE_DESC', status: 'FINISHED', limit: 18 }),
+      fetchRail({ sort: 'POPULARITY_DESC', status: 'NOT_YET_RELEASED', limit: 18 }),
+      fetchRail({ sort: 'SCORE_DESC', limit: 18 }),
+    ]);
+    // Just Finished by end date needs full objects; API returns END_DATE_DESC order already.
+    box.innerHTML =
+      railHtml('Trending Now', trending) +
+      railHtml('Top Airing', airing) +
+      railHtml('Just Finished', finished) +
+      railHtml('Upcoming', upcoming) +
+      railHtml('Top Rated All Time', topRated);
+    box.dataset.done = '1';
+  } catch (e) {
+    box.innerHTML = `<p class="error">Discover failed to load: ${esc(e.message)} — retry in a few seconds (cold start).</p>`;
+  }
 }
 
 let scheduleLoaded = false;
@@ -732,34 +713,28 @@ async function renderSchedule() {
   const box = document.getElementById('scheduleBody');
   if (!box || scheduleLoaded) return;
   scheduleLoaded = true;
-  const index = await loadSearchIndex();
-  const cands = index.filter((e) => e.status === 'RELEASING' && !e.adult)
-    .sort((a, b) => (b.popularity || 0) - (a.popularity || 0)).slice(0, 200);
-  box.innerHTML = '<div class="loading">Loading airing data (0/200)...</div>';
-  const now = Date.now() / 1000, week = now + 7 * 86400;
-  const eps = [];
-  let done = 0;
-  const CONC = 12;
-  for (let i = 0; i < cands.length; i += CONC) {
-    const batch = await Promise.all(cands.slice(i, i + CONC).map((e) => loadAnimeById(e.id).catch(() => null)));
-    for (const a of batch) {
-      if (!a) continue;
-      const edges = a.airingSchedule?.edges || [];
-      for (const ed of edges) {
+  box.innerHTML = '<div class="loading">Loading this week\'s episodes...</div>';
+  try {
+    const F = `id title { romaji english } coverImage { large } airingSchedule { edges { node { episode airingAt } } } nextAiringEpisode { episode airingAt }`;
+    const pages = await Promise.all([1, 2, 3, 4].map((p) =>
+      apiQuery(`{ Page(page: ${p}, perPage: 50) { media(type: ANIME, status: RELEASING, sort: POPULARITY_DESC, isAdult: false) { ${F} } } }`)
+        .then((d) => d?.Page?.media || []).catch(() => [])));
+    const now = Date.now() / 1000, week = now + 7 * 86400;
+    const eps = [];
+    for (const a of pages.flat()) {
+      for (const ed of a.airingSchedule?.edges || []) {
         const n = ed.node;
         if (n && n.airingAt >= now - 86400 && n.airingAt <= week) {
           eps.push({ at: n.airingAt, ep: n.episode, id: a.id, title: a.title?.romaji || a.title?.english, cover: a.coverImage?.large });
         }
       }
-      if (a.nextAiringEpisode && a.nextAiringEpisode.airingAt <= week && a.nextAiringEpisode.airingAt >= now - 3600
-          && !eps.some((x) => x.id === a.id && x.ep === a.nextAiringEpisode.episode)) {
-        eps.push({ at: a.nextAiringEpisode.airingAt, ep: a.nextAiringEpisode.episode, id: a.id, title: a.title?.romaji || a.title?.english, cover: a.coverImage?.large });
+      const nx = a.nextAiringEpisode;
+      if (nx && nx.airingAt <= week && nx.airingAt >= now - 3600
+          && !eps.some((x) => x.id === a.id && x.ep === nx.episode)) {
+        eps.push({ at: nx.airingAt, ep: nx.episode, id: a.id, title: a.title?.romaji || a.title?.english, cover: a.coverImage?.large });
       }
     }
-    done += batch.length;
-    box.innerHTML = `<div class="loading">Loading airing data (${done}/${cands.length})...</div>`;
-  }
-  eps.sort((a, b) => a.at - b.at);
+    eps.sort((a, b) => a.at - b.at);
   if (!eps.length) { box.innerHTML = '<p style="color:#8ba0b0;">No episodes in the next 7 days.</p>'; return; }
   const days = {};
   for (const e of eps) {
@@ -770,9 +745,12 @@ async function renderSchedule() {
     <div class="sched-day"><h3>${esc(d)} (${list.length})</h3>` +
     list.map((e) => `<div class="sched-row" onclick="openDetail(${e.id})">
       <span class="time">${timeOf(e.at)} · ${fmtCountdown(e.at)}</span>
-      <img loading="lazy" src="${esc(e.cover || '')}" ${imgErr}>
+      <img loading="lazy" src="${esc(https(e.cover || ''))}" ${imgErr}>
       <span>${esc(e.title || 'Unknown')}</span><span class="ep">EP ${e.ep ?? '?'}</span>
     </div>`).join('') + `</div>`).join('');
+  } catch (e) {
+    box.innerHTML = `<p class="error">Schedule failed to load: ${esc(e.message)} — retry in a few seconds (cold start).</p>`;
+  }
 }
 
 function relCard(r) {
@@ -780,7 +758,7 @@ function relCard(r) {
   const t = n.title || {};
   const title = t.romaji || t.english || 'Unknown';
   return `<div class="mini" onclick="openDetail(${n.id})" title="${esc(r.relationType || '')}">
-    <img loading="lazy" src="${esc(n.coverImage?.large || '')}" ${imgErr}>
+    <img loading="lazy" src="${esc(https(n.coverImage?.large || ''))}" ${imgErr}>
     <p>${esc(title)}</p><span>${esc((r.relationType || '').replace(/_/g, ' '))}</span>
   </div>`;
 }
@@ -790,7 +768,7 @@ function recCard(r) {
   const t = m.title || {};
   const title = t.romaji || t.english || 'Unknown';
   return `<div class="mini" onclick="openDetail(${m.id})">
-    <img loading="lazy" src="${esc(m.coverImage?.large || '')}" ${imgErr}>
+    <img loading="lazy" src="${esc(https(m.coverImage?.large || ''))}" ${imgErr}>
     <p>${esc(title)}</p><span>${node.rating ? '★ ' + node.rating : ''}</span>
   </div>`;
 }
@@ -801,7 +779,7 @@ function charStrip(a) {
     edges.slice(0, 15).map((e) => {
       const n = e.node || {};
       const va = (e.voiceActors || []).find((v) => v.language === 'JAPANESE') || (e.voiceActors || [])[0];
-      return `<div class="mini char"><img loading="lazy" src="${esc(n.image?.large || '')}" ${imgErr}>
+      return `<div class="mini char"><img loading="lazy" src="${esc(https(n.image?.large || ''))}" ${imgErr}>
         <p>${esc(n.name?.full || '?')}</p><span>${esc(e.role || '')}${va ? ' · ' + esc(va.name?.full || '') : ''}</span></div>`;
     }).join('') + `</div>`;
 }
@@ -823,11 +801,11 @@ async function openDetail(id) {
   const streams = a.streamingEpisodes || [];
   const links = a.externalLinks || [];
   box.innerHTML = `
-    <div class="banner" style="background-image:url('${esc(a.bannerImage || a.coverImage?.extraLarge || '')}')"></div>
+    <div class="banner" style="background-image:url('${esc(https(a.bannerImage || a.coverImage?.extraLarge || ''))}')"></div>
     <div class="mbody">
       <button class="mclose" onclick="closeDetail()">✕</button>
       <div class="mhead">
-        <img class="cover" src="${esc(a.coverImage?.large || '')}" ${imgErr}>
+        <img class="cover" src="${esc(https(a.coverImage?.large || ''))}" ${imgErr}>
         <div><h2>${esc(title)}</h2>
           ${t.english && t.english !== title ? `<p class="alt">${esc(t.english)}</p>` : ''}
           ${t.native ? `<p class="alt">${esc(t.native)}</p>` : ''}
