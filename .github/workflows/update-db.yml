@@ -92,13 +92,20 @@ jobs:
           cp data/search_index.json docs/api/ 2>/dev/null || true
           cp data/metadata.json docs/api/ 2>/dev/null || true
           cp data/sample.json docs/api/ 2>/dev/null || true
+          echo "docs/api/shards contents:"
+          ls -la docs/api/shards/ 2>/dev/null | head -5
+          echo "Total shards in docs/api/shards:"
+          ls docs/api/shards/shard_*.json 2>/dev/null | wc -l
 
       - name: Commit changes
         run: |
-          git add data/ docs/
-          if git diff --cached --quiet; then
+          git add -f data/ docs/
+          CHANGES=$(git diff --cached --stat)
+          if [ -z "$CHANGES" ]; then
             echo "No changes to commit"
           else
+            echo "Changes detected:"
+            echo "$CHANGES"
             TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
             ANIME_COUNT=$(python -c "import sys; sys.path.insert(0, 'scripts'); from db_utils import connect_db; conn = connect_db('data/anilist.db'); count = conn.execute('SELECT COUNT(*) FROM anime').fetchone()[0]; conn.close(); print(count)")
             git commit -m "update: ${{ steps.mode.outputs.mode }} fetch - $ANIME_COUNT anime - $TIMESTAMP"
