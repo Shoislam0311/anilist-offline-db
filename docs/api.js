@@ -851,10 +851,16 @@ async function executeQuery() {
     output.innerHTML = '<span style="color: #8ba0b0;">Executing...</span>';
 
     try {
-        const result = await executeGraphQL(query);
+        // Single hop straight to the edge API (exact schema, Turso-fast).
+        const r = await fetch(VERCEL_API, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query }),
+        });
+        const result = await r.json();
         output.textContent = JSON.stringify(result, null, 2);
     } catch (e) {
-        output.innerHTML = `<span class="error">${e.message}</span>`;
+        output.innerHTML = `<span class="error">${esc(e.message)}</span>`;
     }
 }
 
