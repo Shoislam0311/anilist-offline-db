@@ -16,12 +16,13 @@ on:
   workflow_dispatch:
     inputs:
       fetch_mode:
-        description: 'Fetch mode (weekly incremental + daily airing+counters is automatic)'
+        description: 'Fetch mode (weekly incremental+upcoming+counters, daily airing+counters automatic; full = bootstrap only)'
         required: false
         default: 'daily'
         type: choice
         options:
           - daily
+          - weekly
           - airing
           - counters
           - upcoming
@@ -62,7 +63,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Determine fetch mode (weekly incremental + daily airing+counters)
+      - name: Determine fetch mode (weekly rails refresh + daily airing+counters)
         id: mode
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -70,13 +71,15 @@ jobs:
           else
             DOW=$(date -u +%-u)
             if [ "$DOW" = "7" ]; then
-              # True refresh: only entries changed on AniList (full payloads).
-              # `full` is bootstrap/repair only (manual dispatch) — on a warm DB
-              # its sweeps re-walk ~1700 empty pages for zero gain.
-              echo "mode=incremental" >> $GITHUB_OUTPUT
+              # Weekly rails refresh: incremental (Just Finished flips + new
+              # Upcoming, full payloads) + upcoming sweep (announcements) +
+              # counters (Trending). `full` is bootstrap/repair only (manual
+              # dispatch) — never scheduled.
+              echo "mode=weekly" >> $GITHUB_OUTPUT
             else
               echo "mode=daily" >> $GITHUB_OUTPUT
             fi
+          fi
           fi
 
       - name: Restore database cache (runners are ephemeral)

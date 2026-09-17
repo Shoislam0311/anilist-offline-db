@@ -1063,10 +1063,21 @@ def main():
     start_time = time.time()
 
     if mode == "full":
+        # Bootstrap / repair ONLY (manual dispatch). Never scheduled:
+        # on a warm DB the sweeps re-walk history for zero gain.
         fetcher.full_fetch()
+    elif mode == "weekly":
+        # Sunday refresh: everything the UI rails need, nothing it doesn't.
+        # incremental -> changed entries incl. Just Finished flips + new Upcoming (full payloads)
+        # upcoming    -> NOT_YET_RELEASED/RELEASING season sweep for announcements
+        # counters    -> trending/popularity/scores merged catalog-wide
+        fetcher.incremental_fetch()
+        fetcher.upcoming_fetch()
+        fetcher.counters_refresh()
     elif mode == "daily":
         # Daily schedule: airing titles fully refreshed + live counters
         # (trending/popularity/scores) merged across the whole catalog.
+        # Covers Airing rail + 7-day Schedule + Trending rail.
         fetcher.airing_fetch()
         fetcher.counters_refresh()
     elif mode == "airing":
