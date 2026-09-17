@@ -21,8 +21,9 @@ from db_utils import (
     init_db, init_fts, populate_fts, set_metadata, get_metadata,
     upsert_anime, upsert_anime_titles, upsert_anime_descriptions,
     upsert_genres, upsert_tags, upsert_studios, upsert_characters,
-    upsert_relations, upsert_recommendations, upsert_airing_schedule,
+    upsert_staff, upsert_relations, upsert_recommendations, upsert_airing_schedule,
     upsert_external_links, upsert_streaming_episodes, upsert_statistics,
+    upsert_rankings, upsert_trends, upsert_reviews,
     generate_changelog, export_json, get_database_stats, connect_db
 )
 
@@ -45,75 +46,143 @@ request_timestamps = []
 MEDIA_FIELDS = """
       id
       idMal
-      title { romaji english native }
-      description(asHtml: false)
-      coverImage { large color }
-      bannerImage
-      episodes
-      duration
-      status
+      title { romaji english native userPreferred }
+      type
       format
+      status(version: 2)
+      description(asHtml: false)
+      startDate { year month day }
+      endDate { year month day }
       season
       seasonYear
+      seasonInt
+      episodes
+      duration
+      chapters
+      volumes
+      countryOfOrigin
+      isLicensed
+      source(version: 3)
+      hashtag
+      trailer { id site thumbnail }
+      updatedAt
+      coverImage { extraLarge large medium color }
+      bannerImage
+      genres
+      synonyms
       averageScore
       meanScore
       popularity
-      favourites
+      isLocked
       trending
-      genres
-      tags { name rank description category }
-      studios(isMain: true) { edges { node { id name } isMain } }
-      characters(sort: ROLE, perPage: 25) {
-        edges {
-          node {
-            id
-            name { full native }
-            image { large medium }
-            description
-            favourites
-            gender
-            dateOfBirth { year month day }
-            age
-          }
-          role
-          voiceActors(language: JAPANESE) {
-            id
-            name { full native }
-            image { large medium }
-            favourites
-            language
-          }
-        }
-      }
+      favourites
+      isAdult
+      tags { id name description category rank isGeneralSpoiler isMediaSpoiler isAdult userId }
       relations {
         edges {
-          node { id title { romaji english } type coverImage { large } }
-          relationType
-        }
-      }
-      recommendations(perPage: 10) {
-        edges {
+          id
+          relationType(version: 2)
           node {
-            mediaRecommendation { id title { romaji english } coverImage { large } }
-            rating
-            userRating
+            id idMal title { romaji english native userPreferred }
+            type format status(version: 2)
+            episodes duration averageScore meanScore popularity favourites trending
+            coverImage { extraLarge large medium color }
+            bannerImage genres synonyms season seasonYear
+            startDate { year month day } endDate { year month day }
+            source siteUrl isAdult
           }
         }
       }
-      nextAiringEpisode { episode airingAt timeUntilAiring }
-      airingSchedule(notYetAired: true, perPage: 50) {
-        edges { node { episode airingAt timeUntilAiring } }
+      characters(sort: [ROLE], page: 1, perPage: 25) {
+        edges {
+          id role favouriteOrder
+          node {
+            id
+            name { first middle last full native alternative alternativeSpoiler userPreferred }
+            image { large medium }
+            description(asHtml: false)
+            gender dateOfBirth { year month day } age bloodType
+            isFavourite isFavouriteBlocked siteUrl favourites
+          }
+          voiceActors {
+            id
+            name { first middle last full native alternative userPreferred }
+            language image { large medium }
+            description primaryOccupations gender
+            dateOfBirth { year month day } dateOfDeath { year month day }
+            age yearsActive homeTown bloodType
+            isFavourite isFavouriteBlocked siteUrl favourites
+          }
+          media { id type }
+        }
+        pageInfo { total perPage currentPage lastPage hasNextPage }
       }
-      externalLinks { site url language color icon isDisabled notes }
-      streamingEpisodes { title thumbnail site }
-      startDate { year month day }
-      endDate { year month day }
-      source
-      hashtag
-      countryOfOrigin
-      isAdult
-      updatedAt
-      synonyms
+      staff(sort: [RELEVANCE], page: 1, perPage: 25) {
+        edges {
+          id role favouriteOrder
+          node {
+            id
+            name { first middle last full native alternative userPreferred }
+            language image { large medium }
+            description primaryOccupations gender
+            dateOfBirth { year month day } dateOfDeath { year month day }
+            age yearsActive homeTown bloodType
+            isFavourite isFavouriteBlocked siteUrl favourites
+          }
+        }
+        pageInfo { total perPage currentPage lastPage hasNextPage }
+      }
+      studios {
+        edges {
+          id isMain favouriteOrder
+          node { id name isAnimationStudio siteUrl favourites }
+        }
+      }
+      isFavourite
+      isFavouriteBlocked
+      nextAiringEpisode { id airingAt timeUntilAiring episode mediaId }
+      airingSchedule(page: 1, perPage: 50) {
+        edges { node { id airingAt timeUntilAiring episode mediaId } }
+        pageInfo { total perPage currentPage lastPage hasNextPage }
+      }
+      trends(page: 1, perPage: 10, releasing: true) {
+        edges { node { mediaId date trending averageScore popularity episode releasing } }
+      }
+      externalLinks { id site url type language color icon }
+      streamingEpisodes { title thumbnail url site }
+      rankings { id rank type format year season allTime context }
+      recommendations(page: 1, perPage: 25, sort: [RATING_DESC]) {
+        edges {
+          node {
+            id rating userRating
+            mediaRecommendation {
+              id idMal title { romaji english native userPreferred }
+              type format status(version: 2)
+              episodes duration averageScore meanScore popularity favourites trending
+              coverImage { extraLarge large medium color }
+              bannerImage genres synonyms season seasonYear source siteUrl isAdult
+            }
+            user { id name avatar { large medium } siteUrl }
+          }
+        }
+        pageInfo { total perPage currentPage lastPage hasNextPage }
+      }
+      reviews(page: 1, perPage: 10, sort: [RATING_DESC]) {
+        edges {
+          node {
+            id userId mediaId summary rating userRating score
+            body(asHtml: false) createdAt updatedAt siteUrl
+            user { id name avatar { large medium } siteUrl }
+          }
+        }
+        pageInfo { total perPage currentPage lastPage hasNextPage }
+      }
+      stats { scoreDistribution { score amount } statusDistribution { status amount } }
+      siteUrl
+      autoCreateForumThread
+      isRecommendationBlocked
+      isReviewBlocked
+      modNotes
 """
 
 FULL_FETCH_QUERY = """
@@ -152,7 +221,18 @@ query ($page: Int, $perPage: Int, $status: MediaStatus) {
 INCREMENTAL_FETCH_QUERY = """
 query ($page: Int, $perPage: Int, $updatedAt_greater: Int) {
   Page(page: $page, perPage: $perPage) {
-    media(type: ANIME, sort: UPDATED_AT, updatedAt_greater: $updatedAt_greater) {
+    media(type: ANIME, sort: UPDATED_AT_DESC, updatedAt_greater: $updatedAt_greater) {
+      %s
+    }
+    pageInfo { total hasNextPage currentPage lastPage }
+  }
+}
+""" % MEDIA_FIELDS
+
+ID_FETCH_QUERY = """
+query ($page: Int, $perPage: Int, $id_greater: Int) {
+  Page(page: $page, perPage: $perPage) {
+    media(type: ANIME, sort: ID, id_greater: $id_greater) {
       %s
     }
     pageInfo { total hasNextPage currentPage lastPage }
@@ -271,25 +351,49 @@ class AniListFetcher:
             os.remove(self.checkpoint_path)
 
     def _process_anime(self, conn, media: dict):
+        # Enforce anime-only exact mirror (skip manga if API ever returns it)
+        if media.get("type") and media.get("type") != "ANIME":
+            return
+        media["type"] = "ANIME"
         upsert_anime(conn, media)
-        upsert_anime_titles(conn, media["id"], media.get("title", {}))
+        upsert_anime_titles(conn, media["id"], media.get("title", {}) or {})
 
-        synonyms = media.get("synonyms", []) or []
-        upsert_anime_descriptions(conn, media["id"], media.get("description", ""), synonyms)
+        upsert_anime_descriptions(conn, media["id"], media.get("description", ""), media.get("synonyms", []) or [])
 
         upsert_genres(conn, media["id"], media.get("genres", []) or [])
         upsert_tags(conn, media["id"], media.get("tags", []) or [])
-        upsert_studios(conn, media["id"], media.get("studios", {}))
-        upsert_characters(conn, media["id"], media.get("characters", {}))
-        upsert_relations(conn, media["id"], media.get("relations", {}))
-        upsert_recommendations(conn, media["id"], media.get("recommendations", {}))
+        upsert_studios(conn, media["id"], media.get("studios", {}) or {})
+        upsert_characters(conn, media["id"], media.get("characters", {}) or {})
+        # NEW: full staff / rankings / trends / reviews — required for exact parity
+        try:
+            upsert_staff(conn, media["id"], media.get("staff", {}) or {})
+        except Exception:
+            pass
+        upsert_relations(conn, media["id"], media.get("relations", {}) or {})
+        upsert_recommendations(conn, media["id"], media.get("recommendations", {}) or {})
+        try:
+            upsert_rankings(conn, media["id"], media.get("rankings", []) or [])
+        except Exception:
+            pass
+        try:
+            upsert_trends(conn, media["id"], media.get("trends", {}) or {})
+        except Exception:
+            pass
+        try:
+            upsert_reviews(conn, media["id"], media.get("reviews", {}) or {})
+        except Exception:
+            pass
+        try:
+            upsert_statistics(conn, media["id"], media.get("stats", {}) or {})
+        except Exception:
+            pass
 
-        airing_schedule = []
-        if media.get("airingSchedule") and media["airingSchedule"].get("edges"):
-            airing_schedule = [e["node"] for e in media["airingSchedule"]["edges"]]
+        # airingSchedule is { edges: [{ node: {...} }] } — pass edges so IDs are kept
+        sched = media.get("airingSchedule") or {}
+        if isinstance(sched, dict) and sched.get("edges"):
+            upsert_airing_schedule(conn, media["id"], sched.get("edges") or [])
         elif media.get("nextAiringEpisode"):
-            airing_schedule = [media["nextAiringEpisode"]]
-        upsert_airing_schedule(conn, media["id"], airing_schedule)
+            upsert_airing_schedule(conn, media["id"], [media["nextAiringEpisode"]])
 
         upsert_external_links(conn, media["id"], media.get("externalLinks", []) or [])
         upsert_streaming_episodes(conn, media["id"], media.get("streamingEpisodes", []) or [])
@@ -402,6 +506,52 @@ class AniListFetcher:
 
         return total
 
+    def _fetch_by_id_sweep(self, conn, seen_ids: set) -> int:
+        """Walk IDs ascending via id_greater so null-season/year entries are not missed.
+        Relations/recommendations point at these IDs — without this pass they stay dangling."""
+        total = 0
+        id_greater = 0
+        page = 1
+        while True:
+            data = self._request(ID_FETCH_QUERY, {
+                "page": 1, "perPage": PER_PAGE, "id_greater": id_greater
+            })
+            if not data or "data" not in data:
+                time.sleep(3)
+                data = self._request(ID_FETCH_QUERY, {
+                    "page": 1, "perPage": PER_PAGE, "id_greater": id_greater
+                })
+                if not data or "data" not in data:
+                    logger.error(f"ID sweep failed at id_greater={id_greater}, stopping")
+                    break
+            media_list = data["data"]["Page"].get("media", [])
+            page_info = data["data"]["Page"].get("pageInfo", {})
+            if not media_list:
+                break
+            new_in_batch = 0
+            for media in media_list:
+                aid = media.get("id")
+                if aid is None:
+                    continue
+                id_greater = max(id_greater, aid)
+                if aid not in seen_ids:
+                    seen_ids.add(aid)
+                    self._process_anime(conn, media)
+                    total += 1
+                    new_in_batch += 1
+            if total % 200 == 0:
+                conn.commit()
+            # id_greater always advances; stop only when API returns empty
+            if not page_info.get("hasNextPage") and new_in_batch == 0:
+                # still advance to avoid infinite loop on fully-seen windows
+                if not media_list:
+                    break
+            page += 1
+            if page > 20000:  # safety: ~1M IDs
+                break
+        conn.commit()
+        return total
+
     def full_fetch(self):
         logger.info("Starting full fetch of ALL anime from AniList...")
         logger.info("Strategy: season+year combos + status fallback for complete coverage")
@@ -462,6 +612,13 @@ class AniListFetcher:
             total_fetched += new_count
             if new_count > 0:
                 logger.info(f"Status sweep complete: +{new_count} anime (total: {total_fetched})")
+
+            # ID sweep catches entries with null season/year that both passes miss.
+            # This is what guarantees "same as AniList at any cost" for relations/recommendations targets.
+            id_new = self._fetch_by_id_sweep(conn, seen_ids)
+            total_fetched += id_new
+            if id_new > 0:
+                logger.info(f"ID sweep complete: +{id_new} anime (total: {total_fetched})")
 
             conn.commit()
             logger.info(f"Full fetch complete. Total unique anime: {total_fetched}")

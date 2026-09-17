@@ -32,3 +32,8 @@ Thumbs.db
 
 # Node.js
 node_modules/
+
+# Env (never commit keys)
+.env
+.env.*
+!.env.example

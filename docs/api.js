@@ -1,25 +1,62 @@
 /**
- * AniList Offline API - Client-side GraphQL Engine
- * Resolves GraphQL queries against pre-built JSON data shards.
- * Zero rate limits. Same schema as graphql.anilist.co.
+ * AniList Offline API - Client-side GraphQL Engine (EXACT anime-only mirror)
+ * BREAKING: shards are now AniList-exact Media objects (camelCase, FuzzyDate).
+ * No snake_case. Same response shape as graphql.anilist.co.
+ * Free + fastest delivery: same-origin `api/` -> jsDelivr CDN -> Vercel.
  */
 
-const API_BASE = 'api';
+const API_BASES = (() => {
+  // 100% credential-free: all of these mirror the public GitHub repo, no keys/signup.
+  // Order = fastest/most reliable first. fetchFirst() tries each in turn.
+  const USER = 'Shoislam0311', REPO = 'anilist-offline-db', BRANCH = 'main';
+  return [
+    'api', // same-origin (Pages) — fastest when user is already on the site
+    `https://cdn.jsdelivr.net/gh/${USER}/${REPO}@${BRANCH}/docs/api`, // global edge, brotli, immutable tags
+    `https://cdn.statically.io/gh/${USER}/${REPO}/${BRANCH}/docs/api`, // second independent CDN, no key
+    `https://raw.githack.com/${USER}/${REPO}/${BRANCH}/docs/api`, // raw proxy w/ caching, no key
+    `https://${USER.toLowerCase()}.github.io/${REPO}/api`, // Pages origin fallback
+  ];
+})();
+let API_BASE = API_BASES[0];
 let metadata = null;
 let searchIndex = null;
 let shardCache = {};
 let loadingShards = new Set();
 
+async function fetchFirst(urls) {
+  let lastErr = null;
+  for (const u of urls) {
+    try {
+      const r = await fetch(u);
+      if (r.ok) {
+        API_BASE = u.slice(0, u.lastIndexOf('/api') > 0 ? u.lastIndexOf('/api') : u.length);
+        if (API_BASE.endsWith('/')) API_BASE = API_BASE.slice(0, -1);
+        // normalize: keep full base for subsequent calls
+        const m = u.match(/^(.*)\/api\//);
+        if (m) API_BASE = m[1] + '/api';
+        return await r.json();
+      }
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('all API bases failed');
+}
+const apiUrl = (p) => `${API_BASE}/${p}`;
+
 async function init() {
     try {
-        const resp = await fetch(`${API_BASE}/metadata.json`);
-        metadata = await resp.json();
-        document.getElementById('apiEndpoint').textContent = window.location.origin + '/' + API_BASE + '/graphql';
-        document.getElementById('docBaseUrl').textContent = window.location.origin + '/' + API_BASE + '/graphql';
-        document.getElementById('statTotal').textContent = metadata.totalAnime.toLocaleString();
-        document.getElementById('statCharacters').textContent = metadata.totalCharacters.toLocaleString();
-        document.getElementById('statStudios').textContent = metadata.totalStudios.toLocaleString();
-        document.getElementById('statGenres').textContent = metadata.totalGenres || metadata.genres?.length || 0;
+        const resp = await fetch(`${API_BASE}/metadata.json`).catch(() => null);
+        if (resp && resp.ok) {
+          metadata = await resp.json();
+        } else {
+          metadata = await fetchFirst(API_BASES.map((b) => `${b}/metadata.json`));
+        }
+        const base = API_BASE.replace(/\/api$/, '');
+        document.getElementById('apiEndpoint').textContent = window.location.origin + '/api/graphql (Vercel) + this Pages mirror';
+        document.getElementById('docBaseUrl').textContent = base + '/api/';
+        document.getElementById('statTotal').textContent = (metadata.totalAnime || 0).toLocaleString();
+        document.getElementById('statCharacters').textContent = (metadata.totalCharacters || 0).toLocaleString();
+        document.getElementById('statStudios').textContent = (metadata.totalStudios || 0).toLocaleString();
+        document.getElementById('statGenres').textContent = metadata.genres?.length || 0;
 
         const genreSelect = document.getElementById('browseGenre');
         if (metadata.genres) {
@@ -30,7 +67,6 @@ async function init() {
                 genreSelect.appendChild(opt);
             });
         }
-
         browseAnime();
     } catch (e) {
         console.error('Failed to init:', e);
@@ -41,7 +77,8 @@ async function loadSearchIndex() {
     if (searchIndex) return searchIndex;
     try {
         const resp = await fetch(`${API_BASE}/search_index.json`);
-        searchIndex = await resp.json();
+        if (resp.ok) { searchIndex = await resp.json(); return searchIndex; }
+        searchIndex = await fetchFirst(API_BASES.map((b) => `${b}/search_index.json`));
         return searchIndex;
     } catch (e) {
         console.error('Failed to load search index:', e);
@@ -58,8 +95,12 @@ async function loadShard(shardIdx) {
     }
     loadingShards.add(key);
     try {
-        const resp = await fetch(`${API_BASE}/shards/${key}.json`);
-        if (!resp.ok) return [];
+        let resp = await fetch(`${API_BASE}/shards/${key}.json`);
+        if (!resp.ok) {
+          const data = await fetchFirst(API_BASES.map((b) => `${b}/shards/${key}.json`));
+          shardCache[key] = data;
+          return data;
+        }
         shardCache[key] = await resp.json();
         return shardCache[key];
     } catch (e) {
@@ -100,247 +141,267 @@ async function loadAnimeById(id) {
     return shard.find(a => a.id === id) || null;
 }
 
-function parseQuery(query) {
-    const trimmed = query.trim();
-    const match = trimmed.match(/^\{?\s*query\s*\(([^)]*)\)\s*\{([\s\S]*)\}\s*\}?$/);
-    if (match) {
-        return { variables: parseVariables(match[1]), selections: parseSelections(match[2]) };
+/* ---------- minimal GraphQL parser: variables, aliases, args, fragments ---- */
+function tokenizeArgs(argStr, variables) {
+  // parses: key: value, key2: [A, B], key3: $var, key4: "str", key5: 123
+  const args = {};
+  if (!argStr || !argStr.trim()) return args;
+  // split top-level commas (respect brackets/quotes)
+  const parts = [];
+  let cur = '', depth = 0, inStr = false;
+  for (let i = 0; i < argStr.length; i++) {
+    const c = argStr[i];
+    if (c === '"' && argStr[i - 1] !== '\\') inStr = !inStr;
+    if (!inStr) {
+      if (c === '[' || c === '{') depth++;
+      if (c === ']' || c === '}') depth--;
+      if (c === ',' && depth === 0) { parts.push(cur); cur = ''; continue; }
     }
-    const match2 = trimmed.match(/^\{?\s*(\w+)\s*(?:\(([^)]*)\))?\s*\{([\s\S]*)\}\s*\}?$/);
-    if (match2) {
-        return { operation: match2[1], variables: parseVariables(match2[2] || ''), selections: parseSelections(match2[3]) };
+    cur += c;
+  }
+  if (cur.trim()) parts.push(cur);
+  for (const p of parts) {
+    const m = p.match(/^\s*(\w+)\s*:\s*([\s\S]+)\s*$/);
+    if (!m) continue;
+    args[m[1]] = parseValue(m[2].trim(), variables);
+  }
+  return args;
+}
+function parseValue(s, variables) {
+  if (!s) return undefined;
+  if (s.startsWith('$')) return variables?.[s.slice(1)];
+  if (s.startsWith('"') && s.endsWith('"')) return JSON.parse(s);
+  if (s === 'true') return true;
+  if (s === 'false') return false;
+  if (s === 'null') return null;
+  if (/^-?\d+$/.test(s)) return parseInt(s, 10);
+  if (/^-?\d*\.\d+$/.test(s)) return parseFloat(s);
+  if (s.startsWith('[') && s.endsWith(']')) {
+    const inner = s.slice(1, -1).trim();
+    if (!inner) return [];
+    return splitTop(inner).map((x) => parseValue(x.trim(), variables));
+  }
+  return s; // enum
+}
+function splitTop(s) {
+  const out = []; let cur = '', depth = 0, inStr = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '"' && s[i - 1] !== '\\') inStr = !inStr;
+    if (!inStr) {
+      if (c === '[' || c === '{') depth++;
+      if (c === ']' || c === '}') depth--;
+      if (c === ',' && depth === 0) { out.push(cur); cur = ''; continue; }
     }
-    return { selections: parseSelections(trimmed.replace(/^\{|\}$/g, '')) };
+    cur += c;
+  }
+  if (cur.trim()) out.push(cur);
+  return out;
 }
 
-function parseVariables(varStr) {
-    const vars = {};
-    if (!varStr.trim()) return vars;
-    const regex = /(\w+)\s*:\s*(?:"([^"]*)"|(\d+)|(\w+))/g;
-    let m;
-    while ((m = regex.exec(varStr))) {
-        if (m[2] !== undefined) vars[m[1]] = m[2];
-        else if (m[3] !== undefined) vars[m[1]] = parseInt(m[3]);
-        else if (m[4] !== undefined) {
-            if (m[4] === 'true') vars[m[1]] = true;
-            else if (m[4] === 'false') vars[m[1]] = false;
-            else vars[m[1]] = m[4];
-        }
+// Recursive descent over { field(arg){ sub } alias: field } with fragments inlined.
+function parseBlock(s, i, variables, fragments) {
+  const selections = [];
+  let n = s.length;
+  const skip = () => { while (i < n && /[\s,}]/.test(s[i]) && s[i] !== '}') i++; while (i < n && /\s/.test(s[i])) i++; };
+  while (i < n) {
+    while (i < n && /\s|,/.test(s[i])) i++;
+    if (i >= n || s[i] === '}') { i++; break; }
+    if (s.startsWith('...', i)) {
+      const m = s.slice(i).match(/^\.\.\.(\w+)/);
+      if (m) {
+        const frag = fragments[m[1]];
+        if (frag) selections.push(...frag);
+        i += m[0].length;
+        continue;
+      }
+      // inline fragment ... on Type { }
+      const b = s.indexOf('{', i);
+      if (b >= 0) { const [sub, ni] = parseBlock(s, b + 1, variables, fragments); selections.push(...sub); i = ni; continue; }
+      i += 3; continue;
     }
-    return vars;
+    const m = s.slice(i).match(/^([\w]+)(\s*:\s*([\w]+))?(\s*\(([^()]*|\([^()]*\))*\))?(\s*\{)?/);
+    if (!m) { i++; continue; }
+    let name = m[1], alias = null;
+    if (m[3]) { alias = m[1]; name = m[3]; }
+    const argStr = m[4] ? m[4].slice(1, -1) : '';
+    const hasBlock = !!m[6];
+    i += m[0].length;
+    let children = null;
+    if (hasBlock) {
+      const [sub, ni] = parseBlock(s, i, variables, fragments);
+      children = sub; i = ni;
+    }
+    selections.push({ name, alias, args: tokenizeArgs(argStr, variables), children });
+  }
+  return [selections, i];
+}
+function parseQuery(query, variables = {}) {
+  const fragments = {};
+  const fragRe = /fragment\s+(\w+)\s+on\s+\w+\s*\{/g;
+  let m;
+  // extract fragments with brace matching
+  while ((m = fragRe.exec(query))) {
+    let depth = 1, j = fragRe.lastIndex;
+    while (j < query.length && depth > 0) {
+      if (query[j] === '{') depth++;
+      if (query[j] === '}') depth--;
+      j++;
+    }
+    const body = query.slice(fragRe.lastIndex, j - 1);
+    const [sel] = parseBlock(body, 0, variables, {});
+    fragments[m[1]] = sel;
+  }
+  const bodyOnly = query.replace(/fragment\s+\w+\s+on\s+\w+\s*\{[\s\S]*?\n\}/g, '');
+  const b = bodyOnly.indexOf('{');
+  const e = bodyOnly.lastIndexOf('}');
+  const inner = b >= 0 ? bodyOnly.slice(b + 1, e) : bodyOnly;
+  // strip query(...) / mutation header: find first top-level {
+  const [selections] = parseBlock(inner, 0, variables, fragments);
+  // selections[0] may be `query` wrapper if user wrote `query { Page... }` without our strip
+  return { selections, fragments };
 }
 
-function parseSelections(selStr) {
-    const selections = [];
-    const lines = selStr.split('\n').map(l => l.trim()).filter(l => l);
-    const stack = [{ children: selections, indent: -1 }];
-
-    for (const line of lines) {
-        const indent = line.search(/\S/);
-        const clean = line.replace(/\s*{.*$/, '');
-        const hasChildren = line.includes('{');
-
-        while (stack.length > 1 && stack[stack.length - 1].indent >= indent) {
-            stack.pop();
-        }
-
-        const field = { name: clean.split('(')[0].split(':')[0].trim(), args: {}, children: null };
-        const argsMatch = clean.match(/\(([^)]+)\)/);
-        if (argsMatch) {
-            field.args = parseVariables(argsMatch[1]);
-        }
-        const aliasMatch = clean.match(/^(\w+)\s*:\s*(\w+)/);
-        if (aliasMatch) {
-            field.alias = aliasMatch[1];
-            field.name = aliasMatch[2];
-        }
-        if (hasChildren) {
-            field.children = [];
-            stack[stack.length - 1].children.push(field);
-            stack.push({ children: field.children, indent: indent + 2 });
-        } else {
-            stack[stack.length - 1].children.push(field);
-        }
-    }
-    return selections;
+function pickExact(obj, selections) {
+  if (obj == null || !selections || !selections.length) return obj;
+  const out = {};
+  for (const s of selections) {
+    const key = s.alias || s.name;
+    if (s.name === '__typename') { out[key] = obj.__typename || 'Media'; continue; }
+    const val = obj[s.name];
+    if (val === undefined) { out[key] = null; continue; }
+    if (!s.children) { out[key] = val; continue; }
+    if (Array.isArray(val)) out[key] = val.map((v) => (v && typeof v === 'object' ? pickExact(v, s.children) : v));
+    else if (val && typeof val === 'object') out[key] = pickExact(val, s.children);
+    else out[key] = val;
+  }
+  return out;
 }
 
-function resolveField(obj, fieldName) {
-    if (obj === null || obj === undefined) return null;
-    const aliases = { titleRomaji: 'title_romaji', titleEnglish: 'title_english', titleNative: 'title_native',
-        coverLarge: 'cover_large', bannerImage: 'banner_image', averageScore: 'average_score',
-        meanScore: 'mean_score', seasonYear: 'season_year', nextAiringEpisode: 'next_airing_episode',
-        nextAiringAt: 'next_airing_at', startDate: 'start_date', endDate: 'end_date',
-        countryOfOrigin: 'country_of_origin', isAdult: 'is_adult', createdAt: 'created_at',
-        updatedAt: 'updated_at', idMal: 'id_mal' };
-
-    if (fieldName in obj) return obj[fieldName];
-    if (fieldName in aliases && aliases[fieldName] in obj) return obj[aliases[fieldName]];
-    if (camelToSnake(fieldName) in obj) return obj[camelToSnake(fieldName)];
-    return null;
+/* ---------------- exact filter + sort (mirrors Vercel) -------------------- */
+function matchExact(e, full, a) {
+  if (a.type && a.type !== 'ANIME') return false;
+  if (a.id !== undefined && e.id !== a.id) return false;
+  if (a.id_in && !a.id_in.includes(e.id)) return false;
+  if (a.id_not !== undefined && e.id === a.id_not) return false;
+  if (a.id_not_in && a.id_not_in.includes(e.id)) return false;
+  if (a.idMal !== undefined && e.idMal !== a.idMal) return false;
+  if (a.search) {
+    const q = String(a.search).toLowerCase();
+    const hay = [e.romaji, e.english, e.native, ...(e.synonyms || [])].filter(Boolean).map((x) => String(x).toLowerCase());
+    if (!hay.some((h) => h.includes(q))) return false;
+  }
+  if (a.genre && !(e.genres || []).includes(a.genre)) return false;
+  if (a.genre_in && !a.genre_in.some((x) => (e.genres || []).includes(x))) return false;
+  if (a.genre_not_in && a.genre_not_in.some((x) => (e.genres || []).includes(x))) return false;
+  if (a.tag && !(e.tags || []).includes(a.tag)) return false;
+  if (a.tag_in && !a.tag_in.some((x) => (e.tags || []).includes(x))) return false;
+  if (a.tag_not_in && a.tag_not_in.some((x) => (e.tags || []).includes(x))) return false;
+  if (a.format && e.format !== a.format) return false;
+  if (a.format_in && !a.format_in.includes(e.format)) return false;
+  if (a.status && e.status !== a.status) return false;
+  if (a.status_in && !a.status_in.includes(e.status)) return false;
+  if (a.season && e.season !== a.season) return false;
+  if (a.seasonYear !== undefined && e.year !== a.seasonYear) return false;
+  if (a.source_in && !a.source_in.includes(e.source)) return false;
+  if (a.countryOfOrigin && e.country !== a.countryOfOrigin) return false;
+  if (a.isAdult !== undefined && e.adult !== a.isAdult) return false;
+  if (a.averageScore_greater !== undefined && !((e.score ?? -1) > a.averageScore_greater)) return false;
+  if (a.averageScore_lesser !== undefined && !((e.score ?? 1e9) < a.averageScore_lesser)) return false;
+  if (a.popularity_greater !== undefined && !((e.popularity ?? -1) > a.popularity_greater)) return false;
+  if (a.popularity_lesser !== undefined && !((e.popularity ?? 1e9) < a.popularity_lesser)) return false;
+  if (full && (a.tagCategory_in || a.minimumTagRank !== undefined)) {
+    const tags = full.tags || [];
+    if (a.tagCategory_in && !tags.some((t) => a.tagCategory_in.includes(t.category))) return false;
+    if (a.minimumTagRank !== undefined && !tags.some((t) => (t.rank ?? 0) >= a.minimumTagRank)) return false;
+  }
+  return true;
 }
-
-function camelToSnake(str) {
-    return str.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
+function sortVal(m, f) {
+  switch (f) {
+    case 'ID': return m.id ?? 0;
+    case 'TITLE_ROMAJI': return (m.title?.romaji || '').toLowerCase();
+    case 'TITLE_ENGLISH': return (m.title?.english || m.title?.romaji || '').toLowerCase();
+    case 'SCORE': return m.averageScore ?? 0;
+    case 'POPULARITY': return m.popularity ?? 0;
+    case 'TRENDING': return m.trending ?? 0;
+    case 'FAVOURITES': return m.favourites ?? 0;
+    case 'EPISODES': return m.episodes ?? 0;
+    case 'START_DATE': return (m.startDate?.year || 0) * 10000 + (m.startDate?.month || 0) * 100 + (m.startDate?.day || 0);
+    case 'UPDATED_AT': return m.updatedAt ?? 0;
+    default: return m.popularity ?? 0;
+  }
 }
-
-function resolveSelections(data, selections) {
-    if (!selections || !selections.length) return data;
-    const result = {};
-    for (const sel of selections) {
-        const key = sel.alias || sel.name;
-        if (sel.name === 'id' || sel.name === 'romaji' || sel.name === 'english' || sel.name === 'native') {
-            if (sel.children) {
-                if (typeof data === 'object' && !Array.isArray(data)) {
-                    result[key] = resolveSelections(data, sel.children);
-                }
-            } else {
-                result[key] = resolveField(data, sel.name);
-            }
-        } else if (sel.children) {
-            const childData = resolveField(data, sel.name);
-            if (sel.name === 'title') {
-                result[key] = {
-                    romaji: resolveField(data, 'title_romaji') || resolveField(data, 'romaji'),
-                    english: resolveField(data, 'title_english') || resolveField(data, 'english'),
-                    native: resolveField(data, 'title_native') || resolveField(data, 'native')
-                };
-            } else if (sel.name === 'coverImage') {
-                result[key] = {
-                    large: resolveField(data, 'cover_large'),
-                    color: resolveField(data, 'cover_color'),
-                    medium: resolveField(data, 'cover_large')
-                };
-            } else if (sel.name === 'relations' && data.relations) {
-                result[key] = { edges: data.relations.map(r => ({ node: r, relationType: r.relationType })) };
-            } else if (sel.name === 'recommendations' && data.recommendations) {
-                result[key] = { edges: data.recommendations.map(r => ({ node: { mediaRecommendation: r, rating: r.rating } })) };
-            } else if (sel.name === 'characters' && data.characters) {
-                result[key] = { edges: data.characters.map(c => ({ node: c, role: c.role })) };
-            } else if (sel.name === 'studios' && data.studios) {
-                result[key] = { edges: data.studios.map(s => ({ node: s, isMain: s.isMain })) };
-            } else if (sel.name === 'tags' && data.tags) {
-                result[key] = data.tags;
-            } else if (sel.name === 'airingSchedule' && data.airingSchedule) {
-                result[key] = { edges: data.airingSchedule.map(a => ({ node: a })) };
-            } else if (sel.name === 'nextAiringEpisode') {
-                result[key] = data.nextAiringEpisode || null;
-            } else if (sel.name === 'startDate') {
-                result[key] = data.startDate ? { year: parseInt(data.startDate?.substring(0,4)), month: parseInt(data.startDate?.substring(5,7)), day: parseInt(data.startDate?.substring(8,10)) } : null;
-            } else if (sel.name === 'endDate') {
-                result[key] = data.endDate ? { year: parseInt(data.endDate?.substring(0,4)), month: parseInt(data.endDate?.substring(5,7)), day: parseInt(data.endDate?.substring(8,10)) } : null;
-            } else {
-                const childData = resolveField(data, sel.name);
-                if (Array.isArray(childData)) {
-                    result[key] = childData.map(item => resolveSelections(item, sel.children));
-                } else if (childData) {
-                    result[key] = resolveSelections(childData, sel.children);
-                } else {
-                    result[key] = null;
-                }
-            }
-        } else {
-            result[key] = resolveField(data, sel.name);
-        }
-    }
-    return result;
-}
-
-function sortMedia(media, sortBy) {
-    const sortMap = {
-        'POPULARITY_DESC': (a, b) => (b.popularity || 0) - (a.popularity || 0),
-        'POPULARITY': (a, b) => (a.popularity || 0) - (b.popularity || 0),
-        'SCORE_DESC': (a, b) => (b.average_score || b.averageScore || 0) - (a.average_score || a.averageScore || 0),
-        'SCORE': (a, b) => (a.average_score || a.averageScore || 0) - (b.average_score || b.averageScore || 0),
-        'UPDATED_AT_DESC': (a, b) => (b.updated_at || b.updatedAt || 0) - (a.updated_at || a.updatedAt || 0),
-        'UPDATED_AT': (a, b) => (a.updated_at || a.updatedAt || 0) - (b.updated_at || b.updatedAt || 0),
-        'START_DATE_DESC': (a, b) => (b.start_date || '').localeCompare(a.start_date || ''),
-        'START_DATE': (a, b) => (a.start_date || '').localeCompare(b.start_date || ''),
-        'FAVOURITES_DESC': (a, b) => (b.favourites || 0) - (a.favourites || 0),
-        'TRENDING_DESC': (a, b) => (b.trending || 0) - (a.trending || 0),
-        'ID_DESC': (a, b) => b.id - a.id,
-        'ID': (a, b) => a.id - b.id,
-        'TITLE_ENGLISH_DESC': (a, b) => (b.title_english || b.title_romaji || '').localeCompare(a.title_english || a.title_romaji || ''),
-        'TITLE_ROMAJI_DESC': (a, b) => (b.title_romaji || '').localeCompare(a.title_romaji || ''),
-    };
-    return media.sort(sortMap[sortBy] || sortMap['POPULARITY_DESC']);
-}
-
-function filterMedia(media, vars) {
-    let filtered = [...media];
-    if (vars.search) {
-        const q = vars.search.toLowerCase();
-        filtered = filtered.filter(a =>
-            (a.title_romaji || '').toLowerCase().includes(q) ||
-            (a.title_english || '').toLowerCase().includes(q) ||
-            (a.title_native || '').includes(q)
-        );
-    }
-    if (vars.genre) {
-        filtered = filtered.filter(a => a.genres && a.genres.includes(vars.genre));
-    }
-    if (vars.format) {
-        filtered = filtered.filter(a => a.format === vars.format);
-    }
-    if (vars.status) {
-        filtered = filtered.filter(a => a.status === vars.status);
-    }
-    if (vars.season) {
-        filtered = filtered.filter(a => a.season === vars.season);
-    }
-    if (vars.seasonYear) {
-        filtered = filtered.filter(a => a.season_year === vars.seasonYear);
-    }
-    if (vars.id) {
-        filtered = filtered.filter(a => a.id === vars.id);
-    }
-    if (vars.id_in) {
-        const ids = Array.isArray(vars.id_in) ? vars.id_in : [vars.id_in];
-        filtered = filtered.filter(a => ids.includes(a.id));
-    }
-    if (vars.type && vars.type !== 'ANIME') {
-        return [];
-    }
-    return filtered;
+function sortMedia(media, sort) {
+  const sorts = (Array.isArray(sort) ? sort : [sort]).filter(Boolean);
+  if (!sorts.length) sorts.push('POPULARITY_DESC');
+  for (let i = sorts.length - 1; i >= 0; i--) {
+    const s = sorts[i];
+    const desc = s.endsWith('_DESC');
+    const field = s.replace(/_DESC$/, '').replace(/_ASC$/, '');
+    media.sort((a, b) => {
+      const av = sortVal(a, field), bv = sortVal(b, field);
+      if (av === bv) return 0;
+      return desc ? (av > bv ? -1 : 1) : (av > bv ? 1 : -1);
+    });
+  }
+  return media;
 }
 
 async function executeGraphQL(query, variables = {}) {
-    const parsed = parseQuery(query);
-    const allVars = { ...parsed.variables, ...variables };
+    const { selections } = parseQuery(query, variables);
+    const root = selections[0];
+    const isPage = root?.name === 'Page' || (!root?.name?.match(/^(Media|Character|Staff|Studio)$/) && selections.some((s) => s.name === 'Page'));
+    const pageSel = root?.name === 'Page' ? root : selections.find((s) => s.name === 'Page');
 
-    if (parsed.operation === 'query' || parsed.selections?.[0]?.name === 'Page' || !parsed.operation) {
-        let media = await loadAllAnime();
-        media = filterMedia(media, allVars);
-
-        const sort = allVars.sort || 'POPULARITY_DESC';
-        media = sortMedia(media, sort);
-
-        const page = allVars.page || 1;
-        const perPage = Math.min(allVars.perPage || 10, 50);
-        const start = (page - 1) * perPage;
-        const paged = media.slice(start, start + perPage);
-
-        const mediaSelections = parsed.selections?.[0]?.children?.find(s => s.name === 'media');
-        const resolvedMedia = paged.map(item => resolveSelections(item, mediaSelections?.children));
-
-        return {
-            data: {
-                Page: {
-                    media: resolvedMedia,
-                    pageInfo: {
-                        total: media.length,
-                        perPage: perPage,
-                        currentPage: page,
-                        lastPage: Math.ceil(media.length / perPage),
-                        hasNextPage: start + perPage < media.length,
-                        hasPreviousPage: page > 1
-                    }
-                }
-            }
-        };
+    if (root?.name === 'Media' || root?.name === 'media') {
+      const args = { ...root.args, ...variables };
+      let anime = null;
+      if (args.id) anime = await loadAnimeById(args.id);
+      else if (args.search) {
+        const index = await loadSearchIndex();
+        const q = String(args.search).toLowerCase();
+        const hit = index.find((e) => [e.romaji, e.english, e.native].filter(Boolean).some((t) => String(t).toLowerCase().includes(q)));
+        if (hit) anime = await loadAnimeById(hit.id);
+      }
+      if (!anime) return { data: null, errors: [{ message: 'Media not found', status: 404 }] };
+      return { data: { Media: pickExact(anime, root.children) } };
     }
 
-    return { errors: [{ message: 'Unknown operation' }] };
+    if (!pageSel) return { errors: [{ message: 'Only Page and Media roots are supported in Pages mirror (use Vercel for Character/Staff/Studio)', status: 400 }] };
+    const allVars = { ...(pageSel.args || {}), ...variables };
+    const mediaSel = (pageSel.children || []).find((s) => s.name === 'media');
+    Object.assign(allVars, mediaSel?.args || {});
+
+    const index = await loadSearchIndex();
+    const hits = index.filter((e) => matchExact(e, null, allVars)).map((e) => e.id);
+    // hydrate page slice only (fastest free path), then sort slice when sort present
+    const page = allVars.page || 1;
+    const perPage = Math.min(allVars.perPage || 10, 50);
+    let paged;
+    if (allVars.sort || allVars.tagCategory_in || allVars.minimumTagRank !== undefined) {
+      const all = [];
+      for (const id of hits) { const a = await loadAnimeById(id); if (a && matchExact(index.find((e) => e.id === id) || {}, a, allVars)) all.push(a); }
+      sortMedia(all, allVars.sort);
+      paged = all.slice((page - 1) * perPage, page * perPage);
+      const total = all.length;
+      return {
+        data: { Page: {
+          media: paged.map((a) => pickExact(a, mediaSel?.children)),
+          pageInfo: { total, perPage, currentPage: page, lastPage: Math.max(1, Math.ceil(total / perPage)), hasNextPage: page * perPage < total, hasPreviousPage: page > 1 },
+        } },
+      };
+    }
+    const total = hits.length;
+    const ids = hits.slice((page - 1) * perPage, page * perPage);
+    paged = [];
+    for (const id of ids) { const a = await loadAnimeById(id); if (a) paged.push(a); }
+    return {
+      data: { Page: {
+        media: paged.map((a) => pickExact(a, mediaSel?.children)),
+        pageInfo: { total, perPage, currentPage: page, lastPage: Math.max(1, Math.ceil(total / perPage)), hasNextPage: page * perPage < total, hasPreviousPage: page > 1 },
+      } },
+    };
 }
 
 async function searchAnime() {
@@ -355,7 +416,8 @@ async function searchAnime() {
     const matches = index.filter(a =>
         (a.romaji || '').toLowerCase().includes(q) ||
         (a.english || '').toLowerCase().includes(q) ||
-        (a.native || '').includes(q)
+        (a.native || '').includes(q) ||
+        (a.synonyms || []).some((s) => String(s).toLowerCase().includes(q))
     ).slice(0, 20);
 
     if (!matches.length) {
@@ -390,25 +452,31 @@ async function browseAnime() {
     const resultsDiv = document.getElementById('browseResults');
     resultsDiv.innerHTML = '<div class="loading">Loading...</div>';
 
-    let media = await loadAllAnime();
-    if (genre) media = media.filter(a => a.genres && a.genres.includes(genre));
-    if (status) media = media.filter(a => a.status === status);
-    if (format) media = media.filter(a => a.format === format);
-    media = sortMedia(media, sort);
-    media = media.slice(0, 50);
+    const index = await loadSearchIndex();
+    let hits = index.filter((e) => {
+      if (genre && !(e.genres || []).includes(genre)) return false;
+      if (status && e.status !== status) return false;
+      if (format && e.format !== format) return false;
+      return true;
+    });
+    // sort via exact field using hydrated page (top 50 only for speed)
+    const ids = hits.slice(0, 200).map((e) => e.id);
+    let media = [];
+    for (const id of ids.slice(0, 50)) { const a = await loadAnimeById(id); if (a) media.push(a); }
+    sortMedia(media, sort);
 
     resultsDiv.innerHTML = media.map(a => `
         <div class="result-item" onclick="showAnimeDetail(${a.id})">
-            <img src="${a.cover_large || ''}" alt="${a.title_romaji}" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 140%22><rect fill=%22%23253746%22 width=%22100%22 height=%22140%22/></svg>'">
+            <img src="${a.coverImage?.large || ''}" alt="${a.title?.romaji}" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 140%22><rect fill=%22%23253746%22 width=%22100%22 height=%22140%22/></svg>'">
             <div class="result-info">
-                <h3>${a.title_romaji || 'Unknown'}</h3>
-                ${a.title_english && a.title_english !== a.title_romaji ? `<p>${a.title_english}</p>` : ''}
+                <h3>${a.title?.romaji || 'Unknown'}</h3>
+                ${a.title?.english && a.title.english !== a.title.romaji ? `<p>${a.title.english}</p>` : ''}
                 <div class="result-meta">
-                    <span>Score: ${a.average_score || 'N/A'}</span>
+                    <span>Score: ${a.averageScore || 'N/A'}</span>
                     <span>Popularity: ${(a.popularity || 0).toLocaleString()}</span>
                     <span>Eps: ${a.episodes || '?'}</span>
                     <span>${a.format || ''}</span>
-                    <span>${a.season || ''} ${a.season_year || ''}</span>
+                    <span>${a.season || ''} ${a.seasonYear || ''}</span>
                 </div>
             </div>
         </div>
@@ -416,14 +484,12 @@ async function browseAnime() {
 }
 
 async function showAnimeDetail(id) {
-    const anime = await loadAnimeById(id);
-    if (!anime) return;
     const query = `{
         Media(id: ${id}) {
             id
-            title { romaji english native }
+            title { romaji english native userPreferred }
             description
-            coverImage { large color }
+            coverImage { extraLarge large medium color }
             bannerImage
             episodes
             duration
@@ -436,20 +502,14 @@ async function showAnimeDetail(id) {
             popularity
             favourites
             genres
-            tags { name rank }
-            studios { edges { node { name } isMain } }
-            characters { edges { node { name full } role } }
-            relations { edges { relationType node { id title { romaji } } } }
-            nextAiringEpisode { episode airingAt }
-            startDate { year month day }
-            endDate { year month day }
+            synonyms
+            siteUrl
         }
     }`;
     const result = await executeGraphQL(query);
-    const media = result.data?.Page?.media?.[0] || result.data?.Media;
+    const media = result.data?.Media;
     if (media) {
-        const output = JSON.stringify({ data: { Media: media } }, null, 2);
-        document.getElementById('queryOutput').textContent = output;
+        document.getElementById('queryOutput').textContent = JSON.stringify({ data: { Media: media } }, null, 2);
         switchTab('playground');
     }
 }
@@ -493,8 +553,8 @@ function loadSampleQuery(type) {
   }
 }`,
         search: `{
-  Page(page: 1, perPage: 5, search: "one piece") {
-    media(type: ANIME) {
+  Page(page: 1, perPage: 5) {
+    media(search: "one piece", type: ANIME) {
       id
       title {
         romaji
@@ -503,20 +563,12 @@ function loadSampleQuery(type) {
       episodes
       averageScore
       genres
-      studios {
-        edges {
-          node {
-            name
-          }
-          isMain
-        }
-      }
     }
   }
 }`,
         filter: `{
-  Page(page: 1, perPage: 10, genre: "Psychological", seasonYear: 2024, sort: SCORE_DESC) {
-    media(type: ANIME) {
+  Page(page: 1, perPage: 10) {
+    media(genre: "Action", seasonYear: 2024, sort: SCORE_DESC, type: ANIME) {
       id
       title {
         romaji
@@ -532,93 +584,35 @@ function loadSampleQuery(type) {
   }
 }`,
         details: `{
-  Page(page: 1, perPage: 1, id: 16498) {
-    media {
-      id
-      title {
-        romaji
-        english
-        native
-      }
-      description
-      episodes
-      duration
-      status
-      format
-      season
-      seasonYear
-      averageScore
-      meanScore
-      popularity
-      favourites
-      trending
-      genres
-      tags {
-        name
-        rank
-      }
-      studios {
-        edges {
-          node {
-            name
-          }
-          isMain
-        }
-      }
-      characters {
-        edges {
-          node {
-            name {
-              full
-            }
-          }
-          role
-        }
-      }
-      relations {
-        edges {
-          relationType
-          node {
-            id
-            title {
-              romaji
-            }
-          }
-        }
-      }
-      recommendations {
-        edges {
-          node {
-            mediaRecommendation {
-              id
-              title {
-                romaji
-              }
-            }
-            rating
-          }
-        }
-      }
-      nextAiringEpisode {
-        episode
-        airingAt
-      }
-      startDate {
-        year
-        month
-        day
-      }
-      endDate {
-        year
-        month
-        day
-      }
-      coverImage {
-        large
-        color
-      }
-      bannerImage
-    }
+  Media(id: 21) {
+    id
+    idMal
+    title { romaji english native userPreferred }
+    type format status
+    description
+    startDate { year month day }
+    endDate { year month day }
+    season seasonYear seasonInt
+    episodes duration chapters volumes
+    countryOfOrigin isLicensed source hashtag
+    trailer { id site thumbnail }
+    updatedAt
+    coverImage { extraLarge large medium color }
+    bannerImage
+    genres synonyms
+    averageScore meanScore popularity trending favourites
+    isAdult siteUrl
+    tags { id name description category rank isGeneralSpoiler isMediaSpoiler isAdult }
+    studios { edges { isMain node { id name isAnimationStudio siteUrl } } }
+    characters(page: 1, perPage: 5) { edges { role node { id name { full } } voiceActors { id name { full } language } } }
+    staff(page: 1, perPage: 5) { edges { role node { id name { full } } } }
+    relations { edges { relationType node { id title { romaji } } } }
+    recommendations(page: 1, perPage: 5) { edges { node { rating mediaRecommendation { id title { romaji } } } } }
+    nextAiringEpisode { episode airingAt timeUntilAiring mediaId }
+    externalLinks { site url type }
+    streamingEpisodes { title url site }
+    rankings { rank type year season allTime }
+    stats { scoreDistribution { score amount } statusDistribution { status amount } }
   }
 }`
     };

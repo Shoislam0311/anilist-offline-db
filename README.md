@@ -300,6 +300,17 @@ anilist-offline-db/
 └── README.md
 ```
 
+## Hosting (free + fastest — Vercel + GitHub + jsDelivr CDN)
+
+No paid infra. Same stack you have, tuned for exact full-embed shards:
+
+- **Origin:** GitHub Pages `docs/api/` (shards `50/shard` ≈ 15MB raw, ≈2-4MB `.gz`).
+- **Free global CDN:** jsDelivr `https://cdn.jsdelivr.net/gh/<user>/<repo>@main/docs/api/` — both `docs/api.js` and Vercel `api/index.js` try jsDelivr first, Pages origin as fallback. Purges automatically a few minutes after push.
+- **GraphQL edge:** Vercel serverless `api/index.js`. Optional free speedup: set `DATA_BASE_URL=https://cdn.jsdelivr.net/gh/<user>/<repo>@main/docs/api` in Vercel env so cold starts fetch from CDN, not Pages origin.
+- **Downloads (no rate limit):** GitHub Releases on every weekly `full` run — `anilist.db.gz`, `anilist.json.gz`, full tarball. Shards are also individually downloadable from Pages/jsDelivr.
+- **Size warning (full-embed):** exact anime Media ≈ 300KB each → ~6GB for 20k anime, far over GitHub's 1GB repo guideline. If `docs/api` exceeds ~800MB: move shards to a second repo (e.g. `anilist-offline-db-data`) and point `DATA_BASE_URL` + `API_BASES` at it, or ship only `.gz` + Releases and keep latest ~500 shards in git. SQLite `anilist.db` (≈ raw size + indexes) lives in Releases only, never in git.
+- **Schedule (wired in workflow):** Sunday `full` ID-sweep (catches null-season/year + refreshes relations/recommendations), daily `airing` (RELEASING only). `workflow_dispatch` still offers `incremental/upcoming` manually.
+
 ## Contributing
 
 1. Fork the repository

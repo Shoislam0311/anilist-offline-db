@@ -1,8 +1,21 @@
 import { parse, Kind } from 'graphql';
 
-const DATA_BASE = 'https://shoislam0311.github.io/anilist-offline-db/api';
+/* AniList Offline GraphQL API — EXACT anime-only mirror.
+ * Shards already contain AniList-exact Media objects (camelCase, FuzzyDate).
+ * This layer only filters/sorts/paginates + field-selects. No snake_case leaks.
+ * Data: GitHub Pages static JSON (zero rate limit, downloadable).
+ * Better hosting (recommended): Cloudflare R2 + Workers (see README Hosting section).
+ * Env override: DATA_BASE_URL
+ */
+const DATA_BASE = (typeof process !== 'undefined' && process.env?.DATA_BASE_URL)
+  || 'https://cdn.jsdelivr.net/gh/Shoislam0311/anilist-offline-db@main/docs/api';
+// Credential-free fallback chain (tried in order by the client; Vercel uses DATA_BASE first):
+// 1. jsDelivr  2. Statically  3. raw.githack  4. GitHub Pages origin
+// Statically: https://cdn.statically.io/gh/Shoislam0311/anilist-offline-db/main/docs/api
+// githack:    https://raw.githack.com/Shoislam0311/anilist-offline-db/main/docs/api
+// Pages:      https://shoislam0311.github.io/anilist-offline-db/api
 const CACHE_TTL_MS = 10 * 60 * 1000;
-const MAX_SHARD_CACHE = 15;
+const MAX_SHARD_CACHE = 25;
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -12,11 +25,11 @@ const CORS = {
 };
 
 const INFO = {
-  message: 'AniList Offline GraphQL API',
-  documentation: 'https://anilist.gitbook.io/anilist-apiv2-docs/overview/graphql/getting-started',
-  usage: 'POST /graphql with { "query": "...", "variables": {...} }',
+  message: 'AniList Offline GraphQL API (anime-only, exact mirror)',
+  documentation: 'https://docs.anilist.co/',
+  usage: 'POST / with { "query": "...", "variables": {...} } — same as graphql.anilist.co',
   data: 'https://shoislam0311.github.io/anilist-offline-db/api/',
-  totalAnime: 14546,
+  type: 'ANIME',
   rateLimit: 'None — zero rate limits!',
 };
 
@@ -28,55 +41,18 @@ function json(data, status = 200) {
 }
 
 /* ------------------------------- data layer ------------------------------ */
-
-function transformAnime(anime) {
+// Shards are exact Media objects — no transform needed except safety defaults.
+function asExactMedia(a) {
+  if (!a || typeof a !== 'object') return a;
+  if (a.__typename) return a;
   return {
-    ...anime,
     __typename: 'Media',
-    title: {
-      romaji: anime.title_romaji,
-      english: anime.title_english,
-      native: anime.title_native,
-      __typename: 'MediaTitle',
-    },
-    coverImage: {
-      large: anime.cover_large,
-      color: anime.cover_color,
-      medium: anime.cover_large?.replace('/large/', '/medium/'),
-      __typename: 'CoverImage',
-    },
-    averageScore: anime.average_score,
-    seasonYear: anime.season_year,
-    startDate: anime.start_date || null,
-    endDate: anime.end_date || null,
-    genres: anime.genres || [],
-    studios: anime.studios || [],
-    characters: anime.characters || [],
-    relations: anime.relations || [],
-    recommendations: anime.recommendations || [],
-    tags: anime.tags || [],
-    airingSchedule: anime.airing_schedule || null,
-    nextAiringEpisode: anime.next_airing_episode || null,
-    streamingEpisodes: anime.streaming_episodes || [],
-    status: anime.status || null,
-    format: anime.format || null,
-    season: anime.season || null,
-    episodes: anime.episodes || null,
-    duration: anime.duration || null,
-    description: anime.description || null,
-    bannerImage: anime.banner_image || null,
-    popularity: anime.popularity || 0,
-    trending: anime.trending || 0,
-    favourites: anime.favourites || 0,
-    isAdult: anime.is_adult || false,
-    source: anime.source || null,
-    countryOfOrigin: anime.country_of_origin || null,
-    hashtag: anime.hashtag || null,
-    synonyms: anime.synonyms || [],
-    trailer: anime.trailer || null,
-    externalLinks: anime.external_links || [],
-    rankings: anime.rankings || [],
-    stats: anime.stats || null,
+    type: 'ANIME',
+    isFavourite: false,
+    ...a,
+    __typename: 'Media',
+    type: a.type || 'ANIME',
+    siteUrl: a.siteUrl || `https://anilist.co/anime/${a.id}`,
   };
 }
 
@@ -86,14 +62,31 @@ const shardCache = new Map();
 let builtShardStartIds = null;
 
 async function fetchJSON(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`upstream ${r.status} for ${url}`);
-  return r.json();
+  // Credential-free multi-CDN: if the primary base fails, retry same path on mirrors.
+  const mirrors = [];
+  const m = url.match(/^(https:\/\/[^/]+)(\/.*)$/);
+  if (m) {
+    const path = m[2]; // e.g. /.../docs/api/shards/shard_0000.json or /api/...
+    const file = path.slice(path.lastIndexOf('/api/') + 4); // /metadata.json | /shards/...
+    mirrors.push(
+      `https://cdn.jsdelivr.net/gh/Shoislam0311/anilist-offline-db@main/docs/api${file}`,
+      `https://cdn.statically.io/gh/Shoislam0311/anilist-offline-db/main/docs/api${file}`,
+      `https://raw.githack.com/Shoislam0311/anilist-offline-db/main/docs/api${file}`,
+      `https://shoislam0311.github.io/anilist-offline-db/api${file}`,
+    );
+  }
+  const tried = new Set();
+  for (const u of [url, ...mirrors]) {
+    if (tried.has(u)) continue;
+    tried.add(u);
+    try {
+      const r = await fetch(u);
+      if (r.ok) return r.json();
+    } catch { /* try next mirror */ }
+  }
+  throw new Error(`all mirrors failed for ${url}`);
 }
-
-function fresh(entry) {
-  return entry && Date.now() - entry.time < CACHE_TTL_MS;
-}
+function fresh(entry) { return entry && Date.now() - entry.time < CACHE_TTL_MS; }
 
 async function getMetadata() {
   if (!fresh(metaEntry)) {
@@ -101,28 +94,22 @@ async function getMetadata() {
   }
   return metaEntry.data;
 }
-
 async function getSearchIndex() {
   if (!fresh(indexEntry)) {
     indexEntry = { data: await fetchJSON(`${DATA_BASE}/search_index.json`), time: Date.now() };
   }
   return indexEntry.data;
 }
-
 async function getShardStartIds() {
-  const meta = await getMetadata();
-  if (meta.shardStartIds?.length) return meta.shardStartIds;
+  const meta = await getMetadata().catch(() => null);
+  if (meta?.shardStartIds?.length) return meta.shardStartIds;
   if (builtShardStartIds) return builtShardStartIds;
-  // Parallel cold-start probe: fetch shards 0-15 in parallel to find the
-  // boundary, then fetch remaining shards in batches of 10 in parallel.
-  // Drops cold-start from ~100s sequential to ~5-10s total.
   builtShardStartIds = [];
   const BATCH = 10;
-  let i = 0;
-  // Phase 1: probe first 16 shards (covers ~3200 anime, enough to find boundary)
   const phase1 = await Promise.allSettled(
     Array.from({ length: 16 }, (_, k) => getShard(k).then((s) => ({ k, s })))
   );
+  let i = 0;
   for (const r of phase1) {
     if (r.status === 'fulfilled' && r.value.s.length) {
       builtShardStartIds[r.value.k] = r.value.s[0].id;
@@ -130,7 +117,6 @@ async function getShardStartIds() {
     }
   }
   if (!builtShardStartIds.length) return builtShardStartIds;
-  // Phase 2: continue in parallel batches until a gap
   for (let start = i; start < 2000; start += BATCH) {
     const batch = await Promise.allSettled(
       Array.from({ length: BATCH }, (_, k) => {
@@ -142,15 +128,12 @@ async function getShardStartIds() {
     for (const r of batch) {
       if (r.status === 'fulfilled' && r.value.s.length) {
         builtShardStartIds[r.value.idx] = r.value.s[0].id;
-      } else {
-        hitGap = true;
-      }
+      } else hitGap = true;
     }
     if (hitGap) break;
   }
   return builtShardStartIds;
 }
-
 async function getShard(idx) {
   let entry = shardCache.get(idx);
   if (!fresh(entry)) {
@@ -165,38 +148,33 @@ async function getShard(idx) {
   }
   return entry.data;
 }
-
-async function getAnimeById(id) {
-  const shardStartIds = await getShardStartIds();
-  const totalShards = shardStartIds.length;
-  let lo = 0, hi = totalShards - 1, idx = 0;
+function shardIdxForId(shardStartIds, id) {
+  let lo = 0, hi = shardStartIds.length - 1, idx = 0;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
     if (shardStartIds[mid] <= id) { idx = mid; lo = mid + 1; } else hi = mid - 1;
   }
-  idx = Math.min(idx, totalShards - 1);
+  return Math.min(idx, shardStartIds.length - 1);
+}
+async function getAnimeById(id) {
+  const shardStartIds = await getShardStartIds();
+  if (!shardStartIds.length) return null;
+  const idx = shardIdxForId(shardStartIds, id);
   for (const tryIdx of [idx, idx - 1, idx + 1]) {
-    if (tryIdx < 0 || tryIdx >= totalShards) continue;
-    const shard = await getShard(tryIdx);
+    if (tryIdx < 0 || tryIdx >= shardStartIds.length) continue;
+    const shard = await getShard(tryIdx).catch(() => []);
     const found = shard.find((a) => a.id === id);
-    if (found) return transformAnime(found);
+    if (found) return asExactMedia(found);
   }
   return null;
 }
-
 async function getAnimeBatch(ids) {
   const shardStartIds = await getShardStartIds();
-  const totalShards = shardStartIds.length;
   const byShard = new Map();
   for (const id of ids) {
-    let lo = 0, hi = totalShards - 1, idx = 0;
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1;
-      if (shardStartIds[mid] <= id) { idx = mid; lo = mid + 1; } else hi = mid - 1;
-    }
-    idx = Math.min(idx, totalShards - 1);
+    const idx = shardIdxForId(shardStartIds, id);
     for (const tryIdx of [idx, idx - 1, idx + 1]) {
-      if (tryIdx < 0 || tryIdx >= totalShards) continue;
+      if (tryIdx < 0 || tryIdx >= shardStartIds.length) continue;
       if (!byShard.has(tryIdx)) byShard.set(tryIdx, []);
       if (!byShard.get(tryIdx).includes(id)) byShard.get(tryIdx).push(id);
     }
@@ -204,18 +182,19 @@ async function getAnimeBatch(ids) {
   const found = new Map();
   const results = [];
   for (const [shardIdx, shardIds] of byShard) {
-    const shard = await getShard(shardIdx);
+    const shard = await getShard(shardIdx).catch(() => []);
     for (const id of shardIds) {
       if (found.has(id)) continue;
       const item = shard.find((a) => a.id === id);
-      if (item) { found.set(id, true); results.push(transformAnime(item)); }
+      if (item) { found.set(id, true); results.push(asExactMedia(item)); }
     }
   }
-  return results;
+  // preserve requested order
+  const byId = new Map(results.map((r) => [r.id, r]));
+  return ids.map((id) => byId.get(id)).filter(Boolean);
 }
 
 /* ----------------------------- field resolver ----------------------------- */
-
 function collectSelections(node, fragments) {
   if (!node?.selectionSet) return [];
   const out = [];
@@ -230,25 +209,23 @@ function collectSelections(node, fragments) {
   }
   return out;
 }
-
 function pick(obj, sels, fragments) {
+  if (obj == null) return obj;
   if (!sels || !sels.length) return obj;
   const out = {};
   for (const s of sels) {
     const key = s.alias?.value || s.name.value;
-    if (s.name.value === '__typename') { out[key] = obj.__typename; continue; }
+    if (s.name.value === '__typename') { out[key] = obj.__typename || 'Media'; continue; }
     const sub = s.selectionSet ? collectSelections(s, fragments) : null;
     if (!sub || !sub.length) {
-      out[key] = obj[key] ?? null;
+      out[key] = obj[s.name.value] ?? null;
       continue;
     }
-    const val = obj[key];
+    const val = obj[s.name.value];
     if (Array.isArray(val)) {
-      out[key] = val.map((item) => {
-        if (item && typeof item === 'object') return pick(item, sub, fragments);
-        return item;
-      });
+      out[key] = val.map((item) => (item && typeof item === 'object' ? pick(item, sub, fragments) : item));
     } else if (val && typeof val === 'object') {
+      // connection { edges { node } } stays generic — no special-casing needed (exact shape)
       out[key] = pick(val, sub, fragments);
     } else {
       out[key] = val ?? null;
@@ -257,254 +234,347 @@ function pick(obj, sels, fragments) {
   return out;
 }
 
-function filterMedia(animeList, args, fieldNode, fragments) {
-  let list = [...animeList];
-  if (args.search) {
-    const q = args.search.toLowerCase();
-    list = list.filter((a) => {
-      const t = a.title || {};
-      return (t.romaji || '').toLowerCase().includes(q) ||
-        (t.english || '').toLowerCase().includes(q) ||
-        (t.native || '').toLowerCase().includes(q);
+/* ------------------------- AniList filter + sort -------------------------- */
+function str(v) { return typeof v === 'string' ? v.toLowerCase() : v; }
+
+function matchMedia(e, full, a) {
+  // e = search-index row, full = exact Media (may be null when index-only filtering)
+  const g = (k) => (full ? full[k] : undefined);
+  if (a.type && a.type !== 'ANIME') return false;
+  if (a.id !== undefined && e.id !== a.id) return false;
+  if (a.id_in && !a.id_in.includes(e.id)) return false;
+  if (a.id_not !== undefined && e.id === a.id_not) return false;
+  if (a.id_not_in && a.id_not_in.includes(e.id)) return false;
+  if (a.idMal !== undefined && e.idMal !== a.idMal) return false;
+  if (a.idMal_in && !a.idMal_in.includes(e.idMal)) return false;
+  if (a.search) {
+    const q = String(a.search).toLowerCase();
+    const hay = [e.romaji, e.english, e.native, ...(e.synonyms || [])].filter(Boolean).map((s) => String(s).toLowerCase());
+    if (!hay.some((h) => h.includes(q))) return false;
+  }
+  if (a.genre && !(e.genres || []).includes(a.genre)) return false;
+  if (a.genre_in && !a.genre_in.some((x) => (e.genres || []).includes(x))) return false;
+  if (a.genre_not_in && a.genre_not_in.some((x) => (e.genres || []).includes(x))) return false;
+  if (a.tag && !(e.tags || []).includes(a.tag)) return false;
+  if (a.tag_in && !a.tag_in.some((x) => (e.tags || []).includes(x))) return false;
+  if (a.tag_not_in && a.tag_not_in.some((x) => (e.tags || []).includes(x))) return false;
+  if (a.format && e.format !== a.format) return false;
+  if (a.format_in && !a.format_in.includes(e.format)) return false;
+  if (a.format_not && e.format === a.format_not) return false;
+  if (a.format_not_in && a.format_not_in.includes(e.format)) return false;
+  if (a.status && e.status !== a.status) return false;
+  if (a.status_in && !a.status_in.includes(e.status)) return false;
+  if (a.status_not && e.status === a.status_not) return false;
+  if (a.status_not_in && a.status_not_in.includes(e.status)) return false;
+  if (a.season && e.season !== a.season) return false;
+  if (a.seasonYear !== undefined && e.year !== a.seasonYear) return false;
+  if (a.source_in && !a.source_in.includes(e.source)) return false;
+  if (a.countryOfOrigin && e.country !== a.countryOfOrigin) return false;
+  if (a.isAdult !== undefined && e.adult !== a.isAdult) return false;
+  if (a.episodes_greater !== undefined && !((e.episodes ?? -1) > a.episodes_greater)) return false;
+  if (a.episodes_lesser !== undefined && !((e.episodes ?? 1e9) < a.episodes_lesser)) return false;
+  if (a.duration_greater !== undefined && !((e.duration ?? -1) > a.duration_greater)) return false;
+  if (a.duration_lesser !== undefined && !((e.duration ?? 1e9) < a.duration_lesser)) return false;
+  if (a.chapters_greater !== undefined && !((e.chapters ?? -1) > a.chapters_greater)) return false;
+  if (a.chapters_lesser !== undefined && !((e.chapters ?? 1e9) < a.chapters_lesser)) return false;
+  if (a.volumes_greater !== undefined && !((e.volumes ?? -1) > a.volumes_greater)) return false;
+  if (a.volumes_lesser !== undefined && !((e.volumes ?? 1e9) < a.volumes_lesser)) return false;
+  if (a.averageScore !== undefined && e.score !== a.averageScore) return false;
+  if (a.averageScore_not !== undefined && e.score === a.averageScore_not) return false;
+  if (a.averageScore_greater !== undefined && !((e.score ?? -1) > a.averageScore_greater)) return false;
+  if (a.averageScore_lesser !== undefined && !((e.score ?? 1e9) < a.averageScore_lesser)) return false;
+  if (a.popularity !== undefined && e.popularity !== a.popularity) return false;
+  if (a.popularity_not !== undefined && e.popularity === a.popularity_not) return false;
+  if (a.popularity_greater !== undefined && !((e.popularity ?? -1) > a.popularity_greater)) return false;
+  if (a.popularity_lesser !== undefined && !((e.popularity ?? 1e9) < a.popularity_lesser)) return false;
+  if (a.startDate_greater !== undefined && !((e.startDate ?? -1) > a.startDate_greater)) return false;
+  if (a.startDate_lesser !== undefined && !((e.startDate ?? 1e9) < a.startDate_lesser)) return false;
+  if (a.startDate_like !== undefined && String(e.startDate ?? '') !== String(a.startDate_like)) return false;
+  if (a.endDate_greater !== undefined && !((e.endDate ?? -1) > a.endDate_greater)) return false;
+  if (a.endDate_lesser !== undefined && !((e.endDate ?? 1e9) < a.endDate_lesser)) return false;
+  if (a.endDate_like !== undefined && String(e.endDate ?? '') !== String(a.endDate_like)) return false;
+  // tag category / minimumTagRank need full object (post-filter below)
+  if (full && (a.tagCategory_in || a.tagCategory_not_in || a.minimumTagRank !== undefined)) {
+    const tags = full.tags || [];
+    if (a.tagCategory_in && !tags.some((t) => a.tagCategory_in.includes(t.category))) return false;
+    if (a.tagCategory_not_in && tags.some((t) => a.tagCategory_not_in.includes(t.category))) return false;
+    if (a.minimumTagRank !== undefined && !tags.some((t) => (t.rank ?? 0) >= a.minimumTagRank)) return false;
+  }
+  void g;
+  return true;
+}
+
+function mediaSortValue(m, field) {
+  switch (field) {
+    case 'ID': return m.id ?? 0;
+    case 'TITLE_ROMAJI': return (m.title?.romaji || '').toLowerCase();
+    case 'TITLE_ENGLISH': return (m.title?.english || m.title?.romaji || '').toLowerCase();
+    case 'TITLE_NATIVE': return (m.title?.native || '').toLowerCase();
+    case 'TYPE': return m.type || '';
+    case 'FORMAT': return m.format || '';
+    case 'STATUS': return m.status || '';
+    case 'POPULARITY': return m.popularity ?? 0;
+    case 'SCORE': return m.averageScore ?? m.meanScore ?? 0;
+    case 'TRENDING': return m.trending ?? 0;
+    case 'FAVOURITES': return m.favourites ?? 0;
+    case 'EPISODES': return m.episodes ?? 0;
+    case 'DURATION': return m.duration ?? 0;
+    case 'CHAPTERS': return m.chapters ?? 0;
+    case 'VOLUMES': return m.volumes ?? 0;
+    case 'START_DATE': return (m.startDate?.year || 0) * 10000 + (m.startDate?.month || 0) * 100 + (m.startDate?.day || 0);
+    case 'END_DATE': return (m.endDate?.year || 0) * 10000 + (m.endDate?.month || 0) * 100 + (m.endDate?.day || 0);
+    case 'UPDATED_AT': return m.updatedAt ?? 0;
+    case 'SEARCH_MATCH': return m.popularity ?? 0;
+    default: return m.popularity ?? 0;
+  }
+}
+function sortMediaList(list, sort) {
+  const sorts = (Array.isArray(sort) ? sort : [sort]).filter(Boolean);
+  if (!sorts.length) sorts.push('POPULARITY_DESC');
+  // apply last-first for stable multi-sort
+  for (let i = sorts.length - 1; i >= 0; i--) {
+    const s = sorts[i];
+    const desc = s.endsWith('_DESC');
+    const field = s.replace(/_DESC$/, '').replace(/_ASC$/, '');
+    list.sort((a, b) => {
+      const av = mediaSortValue(a, field), bv = mediaSortValue(b, field);
+      if (av === bv) return 0;
+      const cmp = av > bv ? 1 : -1;
+      return desc ? -cmp : cmp;
     });
   }
-  if (args.id) list = list.filter((a) => a.id === args.id);
-  if (args.id_in) list = list.filter((a) => args.id_in.includes(a.id));
-  if (args.genre) list = list.filter((a) => (a.genres || []).includes(args.genre));
-  if (args.genre_in) list = list.filter((a) => args.genre_in.some((g) => (a.genres || []).includes(g)));
-  if (args.format) list = list.filter((a) => a.format === args.format);
-  if (args.format_in) list = list.filter((a) => args.format_in.includes(a.format));
-  if (args.status) list = list.filter((a) => a.status === args.status);
-  if (args.status_in) list = list.filter((a) => args.status_in.includes(a.status));
-  if (args.season) list = list.filter((a) => a.season === args.season);
-  if (args.seasonYear) list = list.filter((a) => a.seasonYear === args.seasonYear);
-  if (args.popularity_greater) list = list.filter((a) => (a.popularity || 0) > args.popularity_greater);
-  if (args.averageScore_greater) list = list.filter((a) => (a.averageScore || 0) > args.averageScore_greater);
-  if (args.averageScore_lesser) list = list.filter((a) => (a.averageScore || 0) < args.averageScore_lesser);
-
-  if (args.sort) {
-    const sorts = Array.isArray(args.sort) ? args.sort : [args.sort];
-    for (const s of sorts) {
-      const desc = s.endsWith('_DESC');
-      const field = s.replace(/_DESC$/, '').replace(/_ASC$/, '').toLowerCase();
-      list.sort((a, b) => {
-        const av = a[field] ?? 0, bv = b[field] ?? 0;
-        return desc ? (bv > av ? 1 : bv < av ? -1 : 0) : (av > bv ? 1 : av < bv ? -1 : 0);
-      });
-    }
-  }
-
-  const sels = fieldNode ? collectSelections(fieldNode, fragments) : null;
-  return list.map((item) => pick(item, sels, fragments));
+  return list;
 }
 
 function buildPageInfo(total, page, perPage) {
-  const lastPage = Math.ceil(total / perPage) || 1;
-  return { total, perPage, currentPage: page, lastPage, hasNextPage: page < lastPage };
+  const lastPage = Math.max(1, Math.ceil(total / perPage));
+  return {
+    __typename: 'PageInfo',
+    total, perPage, currentPage: page, lastPage,
+    hasNextPage: page < lastPage, hasPreviousPage: page > 1,
+  };
 }
 
 /* ----------------------------- query executor ----------------------------- */
+function argValue(v, variables) {
+  if (!v) return undefined;
+  switch (v.kind) {
+    case Kind.INT: return parseInt(v.value, 10);
+    case Kind.FLOAT: return parseFloat(v.value);
+    case Kind.STRING: return v.value;
+    case Kind.BOOLEAN: return v.value === true || v.value === 'true';
+    case Kind.ENUM: return v.value;
+    case Kind.NULL: return null;
+    case Kind.LIST: return (v.values || []).map((x) => argValue(x, variables));
+    case Kind.OBJECT: {
+      const obj = {};
+      for (const f of v.fields) obj[f.name.value] = argValue(f.value, variables);
+      return obj;
+    }
+    case Kind.VARIABLE: return variables?.[v.name.value];
+    default: return undefined;
+  }
+}
+function collectArgs(fieldNode, variables) {
+  const args = {};
+  for (const arg of fieldNode.arguments || []) {
+    const val = argValue(arg.value, variables);
+    if (val !== undefined) args[arg.name.value] = val;
+  }
+  return args;
+}
+
+async function resolvePage(fieldNode, fragments, variables, pageArgs) {
+  const index = await getSearchIndex();
+  const mediaFieldNode = fieldNode.selectionSet?.selections?.find(
+    (s) => s.kind === Kind.FIELD && s.name.value === 'media');
+  const mediaArgs = mediaFieldNode ? collectArgs(mediaFieldNode, variables) : {};
+  const fargs = { ...mediaArgs, ...pageArgs };
+  // AniList allows args on Page or on media — merge both
+  const page = fargs.page || 1;
+  const perPage = Math.min(fargs.perPage || 25, 50);
+
+  const needFull = fargs.sort || fargs.tagCategory_in || fargs.tagCategory_not_in
+    || fargs.minimumTagRank !== undefined;
+  let ids = index.filter((e) => matchMedia(e, null, fargs)).map((e) => e.id);
+
+  let full = [];
+  if (needFull || ids.length <= 2000) {
+    full = await getAnimeBatch(ids);
+    full = full.filter((m) => matchMedia(index.find((e) => e.id === m.id) || {}, m, fargs));
+    sortMediaList(full, fargs.sort);
+  } else {
+    // large un-sorted result: keep index order (popularity DESC) and page by IDs
+    full = null;
+  }
+
+  let total, paged;
+  if (full) {
+    total = full.length;
+    paged = full.slice((page - 1) * perPage, page * perPage);
+  } else {
+    total = ids.length;
+    const pagedIds = ids.slice((page - 1) * perPage, page * perPage);
+    paged = await getAnimeBatch(pagedIds);
+  }
+
+  const out = {};
+  for (const s of fieldNode.selectionSet?.selections || []) {
+    if (s.kind !== Kind.FIELD) continue;
+    const k = s.alias?.value || s.name.value;
+    if (s.name.value === 'media') {
+      out[k] = paged.map((item) => pick(item, collectSelections(s, fragments), fragments));
+    } else if (s.name.value === 'pageInfo') {
+      out[k] = pick(buildPageInfo(total, page, perPage), collectSelections(s, fragments), fragments);
+    } else out[k] = null;
+  }
+  return out;
+}
+
+async function scanNested(kind, args) {
+  // Character/Staff/Studio/AiringSchedule standalone lookup by scanning cached shards.
+  // Anime-only offline: sufficient and exact (same objects as Media nested).
+  const shardStartIds = await getShardStartIds();
+  const match = [];
+  const maxScan = Math.min(shardStartIds.length, 8);
+  for (let i = 0; i < maxScan && match.length < 50; i++) {
+    const shard = await getShard(i).catch(() => []);
+    for (const a of shard) {
+      if (kind === 'characters') {
+        for (const e of a.characters?.edges || []) {
+          const n = e.node;
+          if (!n) continue;
+          if (args.id && n.id !== args.id) continue;
+          if (args.search && !(n.name?.full || '').toLowerCase().includes(String(args.search).toLowerCase())) continue;
+          match.push({ __typename: 'Character', ...n });
+        }
+      } else if (kind === 'staff') {
+        for (const e of a.staff?.edges || []) {
+          const n = e.node;
+          if (!n) continue;
+          if (args.id && n.id !== args.id) continue;
+          if (args.search && !(n.name?.full || '').toLowerCase().includes(String(args.search).toLowerCase())) continue;
+          match.push({ __typename: 'Staff', ...n });
+        }
+      } else if (kind === 'studios') {
+        for (const e of a.studios?.edges || []) {
+          const n = e.node;
+          if (!n) continue;
+          if (args.id && n.id !== args.id) continue;
+          if (args.search && !(n.name || '').toLowerCase().includes(String(args.search).toLowerCase())) continue;
+          match.push({ __typename: 'Studio', ...n });
+        }
+      }
+    }
+  }
+  const seen = new Map();
+  for (const m of match) if (!seen.has(m.id)) seen.set(m.id, m);
+  return [...seen.values()];
+}
 
 async function resolveNode(typeName, fieldNode, fragments, variables) {
   const sels = collectSelections(fieldNode, fragments);
-  const args = {};
-  if (fieldNode.arguments) {
-    for (const arg of fieldNode.arguments) {
-      if (arg.value.kind === Kind.INT) args[arg.name.value] = parseInt(arg.value.value, 10);
-      else if (arg.value.kind === Kind.FLOAT) args[arg.name.value] = parseFloat(arg.value.value);
-      else if (arg.value.kind === Kind.BOOLEAN) args[arg.name.value] = arg.value.value === 'true' || arg.value.value === true;
-      else if (arg.value.kind === Kind.STRING) args[arg.name.value] = arg.value.value;
-      else if (arg.value.kind === Kind.ENUM) args[arg.name.value] = arg.value.value;
-      else if (arg.value.kind === Kind.LIST) args[arg.name.value] = (arg.value.values || []).map((v) => v.value ?? v);
-      else if (arg.value.kind === Kind.OBJECT) {
-        const obj = {};
-        for (const f of arg.value.fields) {
-          if (f.value.kind === Kind.INT) obj[f.name.value] = parseInt(f.value.value, 10);
-          else if (f.value.kind === Kind.STRING) obj[f.name.value] = f.value.value;
-          else obj[f.name.value] = f.value.value;
-        }
-        args[arg.name.value] = obj;
-      }
-      else if (arg.value.kind === Kind.VARIABLE) args[arg.name.value] = variables?.[arg.value.name.value] ?? undefined;
-    }
-  }
+  const args = collectArgs(fieldNode, variables);
 
   if (typeName === 'RootQuery' || typeName === 'Query') {
-    if (fieldNode.name.value === 'Page') {
-      const meta = await getMetadata();
-      const index = await getSearchIndex();
-      const mediaFieldNode = fieldNode.selectionSet?.selections?.find((s) => s.kind === Kind.FIELD && s.name.value === 'media');
-      const mediaArgs = {};
-      if (mediaFieldNode?.arguments) {
-        for (const arg of mediaFieldNode.arguments) {
-          if (arg.value.kind === Kind.INT) mediaArgs[arg.name.value] = parseInt(arg.value.value, 10);
-          else if (arg.value.kind === Kind.FLOAT) mediaArgs[arg.name.value] = parseFloat(arg.value.value);
-          else if (arg.value.kind === Kind.BOOLEAN) mediaArgs[arg.name.value] = arg.value.value === 'true' || arg.value.value === true;
-          else if (arg.value.kind === Kind.STRING) mediaArgs[arg.name.value] = arg.value.value;
-          else if (arg.value.kind === Kind.ENUM) mediaArgs[arg.name.value] = arg.value.value;
-          else if (arg.value.kind === Kind.LIST) mediaArgs[arg.name.value] = (arg.value.values || []).map((v) => v.value ?? v);
-          else if (arg.value.kind === Kind.OBJECT) {
-            const obj = {};
-            for (const f of arg.value.fields) {
-              if (f.value.kind === Kind.INT) obj[f.name.value] = parseInt(f.value.value, 10);
-              else if (f.value.kind === Kind.STRING) obj[f.name.value] = f.value.value;
-              else obj[f.name.value] = f.value.value;
-            }
-            mediaArgs[arg.name.value] = obj;
+    switch (fieldNode.name.value) {
+      case 'Page':
+        return resolvePage(fieldNode, fragments, variables, args);
+      case 'Media': {
+        if (args.id) {
+          const anime = await getAnimeById(args.id);
+          if (!anime || (args.type && args.type !== 'ANIME')) {
+            const e = new Error(`Media not found: ${args.id}`);
+            e.status = 404;
+            throw e;
           }
-          else if (arg.value.kind === Kind.VARIABLE) mediaArgs[arg.name.value] = variables?.[arg.value.name.value] ?? undefined;
+          return pick(anime, sels, fragments);
         }
+        if (args.idMal) {
+          const index = await getSearchIndex();
+          const hit = index.find((e) => e.idMal === args.idMal);
+          if (!hit) throw Object.assign(new Error(`Media not found: idMal ${args.idMal}`), { status: 404 });
+          const anime = await getAnimeById(hit.id);
+          return pick(anime, sels, fragments);
+        }
+        if (args.search) {
+          const index = await getSearchIndex();
+          const q = String(args.search).toLowerCase();
+          const hit = index.find((e) =>
+            (e.romaji || '').toLowerCase().includes(q) ||
+            (e.english || '').toLowerCase().includes(q) ||
+            (e.native || '').toLowerCase().includes(q) ||
+            (e.synonyms || []).some((s) => String(s).toLowerCase().includes(q)));
+          if (!hit) throw Object.assign(new Error('Media not found'), { status: 404 });
+          const anime = await getAnimeById(hit.id);
+          return pick(anime, sels, fragments);
+        }
+        throw Object.assign(new Error('Media query requires id, idMal or search'), { status: 400 });
       }
-      const fargs = { ...mediaArgs, ...args };
-      const page = fargs.page || args.page || 1;
-      const perPage = Math.min(fargs.perPage || args.perPage || 50, 50);
-      for (const k of Object.keys(mediaArgs)) { if (mediaArgs[k] !== undefined) args[k] = mediaArgs[k]; }
-      const sargs = args;
-
-      let candidateIds = null;
-      const hasFilter = sargs.search || sargs.genre || sargs.genre_in || sargs.format || sargs.format_in ||
-        sargs.status || sargs.status_in || sargs.season || sargs.seasonYear ||
-        sargs.id || sargs.id_in || sargs.startDate_greater || sargs.startDate_lesser ||
-        sargs.popularity_greater || sargs.averageScore_greater || sargs.averageScore_lesser;
-
-      if (hasFilter) {
-        candidateIds = index
-          .filter((e) => {
-            if (sargs.search) {
-              const q = sargs.search.toLowerCase();
-              if (!(e.romaji || '').toLowerCase().includes(q) &&
-                !(e.english || '').toLowerCase().includes(q) &&
-                !(e.native || '').toLowerCase().includes(q)) return false;
+      case 'Character':
+      case 'Staff':
+      case 'Studio': {
+        const kind = fieldNode.name.value === 'Character' ? 'characters'
+          : fieldNode.name.value === 'Staff' ? 'staff' : 'studios';
+        const list = await scanNested(kind, args);
+        if (args.id) {
+          const one = list.find((x) => x.id === args.id);
+          if (!one) throw Object.assign(new Error(`${fieldNode.name.value} not found: ${args.id}`), { status: 404 });
+          return pick(one, sels, fragments);
+        }
+        return pick(list[0] || null, sels, fragments);
+      }
+      case 'AiringSchedule': {
+        if (args.id || args.mediaId) {
+          const shardStartIds = await getShardStartIds();
+          for (let i = 0; i < Math.min(shardStartIds.length, 8); i++) {
+            const shard = await getShard(i).catch(() => []);
+            for (const a of shard) {
+              if (args.mediaId && a.id !== args.mediaId) continue;
+              const edges = a.airingSchedule?.edges || [];
+              const hit = args.id
+                ? edges.find((e) => e.node?.id === args.id)?.node
+                : edges[0]?.node;
+              if (hit) return pick({ __typename: 'AiringSchedule', ...hit }, sels, fragments);
+              if (args.mediaId && a.nextAiringEpisode) {
+                return pick({ __typename: 'AiringSchedule', ...a.nextAiringEpisode }, sels, fragments);
+              }
             }
-            if (sargs.genre && !e.genres?.includes(sargs.genre)) return false;
-            if (sargs.genre_in && !sargs.genre_in.some((g) => e.genres?.includes(g))) return false;
-            if (sargs.format && e.format !== sargs.format) return false;
-            if (sargs.format_in && !sargs.format_in.includes(sargs.format)) return false;
-            if (sargs.status && e.status !== sargs.status) return false;
-            if (sargs.status_in && !sargs.status_in.includes(sargs.status)) return false;
-            if (sargs.season && e.season !== sargs.season) return false;
-            if (sargs.seasonYear && e.year !== sargs.seasonYear) return false;
-            if (sargs.id && e.id !== sargs.id) return false;
-            if (sargs.id_in && !sargs.id_in.includes(e.id)) return false;
-            return true;
-          })
-          .map((e) => e.id);
-      }
-
-      if (candidateIds && (sargs.sort || sargs.popularity_greater || sargs.averageScore_greater || sargs.averageScore_lesser)) {
-        const full = await getAnimeBatch(candidateIds);
-        let filtered = full;
-        if (sargs.popularity_greater) filtered = filtered.filter((a) => (a.popularity || 0) > sargs.popularity_greater);
-        if (sargs.averageScore_greater) filtered = filtered.filter((a) => (a.averageScore || 0) > sargs.averageScore_greater);
-        if (sargs.averageScore_lesser) filtered = filtered.filter((a) => (a.averageScore || 0) < sargs.averageScore_lesser);
-        const sorts = sargs.sort ? (Array.isArray(sargs.sort) ? sargs.sort : [sargs.sort]) : ['POPULARITY_DESC'];
-        for (const s of sorts) {
-          const desc = s.endsWith('_DESC');
-          const field = s.replace(/_DESC$/, '').replace(/_ASC$/, '').toLowerCase();
-          filtered.sort((a, b) => {
-            const av = a[field] ?? 0, bv = b[field] ?? 0;
-            return desc ? (bv > av ? 1 : bv < av ? -1 : 0) : (av > bv ? 1 : av < bv ? -1 : 0);
-          });
+          }
         }
-        const total = filtered.length;
-        const start = (page - 1) * perPage;
-        const paged = filtered.slice(start, start + perPage);
-        const mediaNode = fieldNode.selectionSet?.selections?.find((s) => s.name.value === 'media');
-        const media = paged.map((item) => pick(item, collectSelections(mediaNode, fragments), fragments));
-        const pageInfoNode = fieldNode.selectionSet?.selections?.find((s) => s.name.value === 'pageInfo');
-        const pageInfo = pageInfoNode ? pick(buildPageInfo(total, page, perPage), collectSelections(pageInfoNode, fragments), fragments) : buildPageInfo(total, page, perPage);
-        const out = {};
-        for (const s of (fieldNode.selectionSet?.selections || [])) {
-          const k = s.alias?.value || s.name.value;
-          if (s.name.value === 'media') out[k] = media;
-          else if (s.name.value === 'pageInfo') out[k] = pageInfo;
-          else out[k] = null;
+        throw Object.assign(new Error('AiringSchedule not found'), { status: 404 });
+      }
+      case 'GenreCollection':
+        return (await getMetadata().catch(() => null))?.genres || [];
+      case 'MediaTagCollection': {
+        const shard = await getShard(0).catch(() => []);
+        const tags = new Map();
+        for (const a of shard.slice(0, 50)) {
+          for (const t of a.tags || []) if (!tags.has(t.name)) tags.set(t.name, t);
         }
-        return out;
+        const list = [...tags.values()].map((t) => ({ __typename: 'MediaTag', ...t }));
+        if (!sels.length) return list;
+        return list.map((t) => pick(t, sels, fragments));
       }
-
-      if (candidateIds && !sargs.sort && !sargs.popularity_greater && !sargs.averageScore_greater && !sargs.averageScore_lesser) {
-        const total = candidateIds.length;
-        const start = (page - 1) * perPage;
-        const pagedIds = candidateIds.slice(start, start + perPage);
-        const media = await getAnimeBatch(pagedIds);
-        const mediaNode = fieldNode.selectionSet?.selections?.find((s) => s.name.value === 'media');
-        const mediaResolved = media.map((item) => pick(item, collectSelections(mediaNode, fragments), fragments));
-        const pageInfoNode = fieldNode.selectionSet?.selections?.find((s) => s.name.value === 'pageInfo');
-        const pageInfo = pageInfoNode ? pick(buildPageInfo(total, page, perPage), collectSelections(pageInfoNode, fragments), fragments) : buildPageInfo(total, page, perPage);
-        const out = {};
-        for (const s of (fieldNode.selectionSet?.selections || [])) {
-          const k = s.alias?.value || s.name.value;
-          if (s.name.value === 'media') out[k] = mediaResolved;
-          else if (s.name.value === 'pageInfo') out[k] = pageInfo;
-          else out[k] = null;
-        }
-        return out;
-      }
-
-      const total = meta.totalAnime || index.length;
-      const start = (page - 1) * perPage;
-      const paged = index.slice(start, start + perPage);
-      const animeIds = paged.map((e) => e.id);
-      const animeList = await getAnimeBatch(animeIds);
-      const mediaNode = fieldNode.selectionSet?.selections?.find((s) => s.name.value === 'media');
-      const sorts = sargs.sort ? (Array.isArray(sargs.sort) ? sargs.sort : [sargs.sort]) : null;
-      let mediaResolved;
-      if (sorts) {
-        mediaResolved = filterMedia(animeList, sargs, mediaNode, fragments);
-      } else {
-        mediaResolved = animeList.map((item) => pick(item, collectSelections(mediaNode, fragments), fragments));
-      }
-      const pageInfoNode = fieldNode.selectionSet?.selections?.find((s) => s.name.value === 'pageInfo');
-      const pageInfo = pageInfoNode ? pick(buildPageInfo(total, page, perPage), collectSelections(pageInfoNode, fragments), fragments) : buildPageInfo(total, page, perPage);
-      const out = {};
-      for (const s of (fieldNode.selectionSet?.selections || [])) {
-        const k = s.alias?.value || s.name.value;
-        if (s.name.value === 'media') out[k] = mediaResolved;
-        else if (s.name.value === 'pageInfo') out[k] = pageInfo;
-        else out[k] = null;
-      }
-      return out;
+      default:
+        throw Object.assign(new Error(`Unsupported root field in offline anime mirror: ${fieldNode.name.value}`), { status: 400 });
     }
-
-    if (fieldNode.name.value === 'Media') {
-      const id = args.id;
-      if (!id) return { errors: [{ message: 'id argument required' }] };
-      const anime = await getAnimeById(id);
-      if (!anime) return { errors: [{ message: `Media not found: ${id}` }] };
-      return pick(anime, sels, fragments);
-    }
-  }
-
-  if (fieldNode.selectionSet) {
-    const out = {};
-    for (const s of fieldNode.selectionSet.selections) {
-      const k = s.alias?.value || s.name.value;
-      if (s.name.value === '__typename') out[k] = typeName;
-      else out[k] = null;
-    }
-    return out;
   }
   return null;
 }
 
 async function execute(query, variables = {}, operationName = null) {
   let doc;
-  try {
-    doc = parse(query);
-  } catch (e) {
-    return { errors: [{ message: `Syntax Error: ${e.message}` }] };
-  }
+  try { doc = parse(query); }
+  catch (e) { return { errors: [{ message: `Syntax Error: ${e.message}`, status: 400 }] }; }
   const fragments = {};
   for (const def of doc.definitions) {
     if (def.kind === Kind.FRAGMENT_DEFINITION) fragments[def.name.value] = def;
   }
-  let op;
-  if (operationName) {
-    op = doc.definitions.find((d) => d.kind === Kind.OPERATION_DEFINITION && d.name?.value === operationName);
-  }
-  if (!op) op = doc.definitions.find((d) => d.kind === Kind.OPERATION_DEFINITION);
-  if (!op) return { errors: [{ message: 'No operation found' }] };
+  let op = operationName
+    ? doc.definitions.find((d) => d.kind === Kind.OPERATION_DEFINITION && d.name?.value === operationName)
+    : doc.definitions.find((d) => d.kind === Kind.OPERATION_DEFINITION);
+  if (!op) return { errors: [{ message: 'No operation found', status: 400 }] };
 
   const data = {};
   const errors = [];
@@ -512,17 +582,15 @@ async function execute(query, variables = {}, operationName = null) {
     if (field.kind !== Kind.FIELD) continue;
     try {
       const result = await resolveNode('RootQuery', field, fragments, variables);
-      const key = field.alias?.value || field.name.value;
-      data[key] = result;
+      data[field.alias?.value || field.name.value] = result;
     } catch (err) {
-      errors.push({ message: err.message, path: [field.name.value] });
+      errors.push({ message: err.message, status: err.status || 500, path: [field.name.value] });
     }
   }
   return errors.length ? { data, errors } : { data };
 }
 
 /* -------------------------------- handler --------------------------------- */
-
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -534,13 +602,10 @@ function readBody(req) {
     req.on('error', reject);
   });
 }
-
 function nodeJson(res, data, status = 200) {
-  const body = JSON.stringify(data);
   res.writeHead(status, { 'Content-Type': 'application/json', ...CORS });
-  res.end(body);
+  res.end(JSON.stringify(data));
 }
-
 export default async function handler(req, res) {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, CORS);
@@ -552,19 +617,19 @@ export default async function handler(req, res) {
     if (!query) return nodeJson(res, INFO, 200);
     let variables = {};
     try { variables = JSON.parse(parsed.searchParams.get('variables') || '{}'); }
-    catch { return nodeJson(res, { errors: [{ message: 'Invalid variables JSON' }] }, 400); }
+    catch { return nodeJson(res, { errors: [{ message: 'Invalid variables JSON', status: 400 }] }, 400); }
     return nodeJson(res, await execute(query, variables, parsed.searchParams.get('operationName')), 200);
   }
   if (req.method === 'POST') {
     let body;
     try { body = await readBody(req); }
-    catch { return nodeJson(res, { errors: [{ message: 'Invalid JSON body' }] }, 400); }
-    if (!body || !body.query) return nodeJson(res, { errors: [{ message: 'No query provided' }] }, 400);
+    catch { return nodeJson(res, { errors: [{ message: 'Invalid JSON body', status: 400 }] }, 400); }
+    if (!body || !body.query) return nodeJson(res, { errors: [{ message: 'No query provided', status: 400 }] }, 400);
     try {
       return nodeJson(res, await execute(body.query, body.variables || {}, body.operationName || null), 200);
     } catch (e) {
-      return nodeJson(res, { errors: [{ message: e.message || 'Internal error' }] }, 500);
+      return nodeJson(res, { errors: [{ message: e.message || 'Internal error', status: 500 }] }, 500);
     }
   }
-  return nodeJson(res, { errors: [{ message: 'Method not allowed' }] }, 405);
+  return nodeJson(res, { errors: [{ message: 'Method not allowed', status: 405 }] }, 405);
 }

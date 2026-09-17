@@ -2,13 +2,12 @@ name: Update AniList Database
 
 on:
   schedule:
-    - cron: '0 4 * * *'    # Daily at 04:00 UTC
-    - cron: '0 4 * * 0'    # Weekly on Sunday at 04:00 UTC
-    - cron: '0 4 1 * *'    # Monthly on 1st at 04:00 UTC
+    - cron: '0 4 * * *'    # Daily at 04:00 UTC -> airing refresh
+    - cron: '0 4 * * 0'    # Weekly Sunday 04:00 UTC -> full exact re-scrape
   workflow_dispatch:
     inputs:
       fetch_mode:
-        description: 'Fetch mode'
+        description: 'Fetch mode (weekly full + daily airing is automatic)'
         required: false
         default: 'airing'
         type: choice
@@ -30,7 +29,7 @@ concurrency:
 jobs:
   fetch-and-build:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
@@ -52,20 +51,15 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Determine fetch mode
+      - name: Determine fetch mode (weekly full + daily airing)
         id: mode
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "mode=${{ github.event.inputs.fetch_mode }}" >> $GITHUB_OUTPUT
           else
-            HOUR=$(date -u +%-H)
             DOW=$(date -u +%-u)
-            DOM=$(date -u +%-d)
-
-            if [ "$DOM" = "1" ]; then
+            if [ "$DOW" = "7" ]; then
               echo "mode=full" >> $GITHUB_OUTPUT
-            elif [ "$DOW" = "7" ]; then
-              echo "mode=upcoming" >> $GITHUB_OUTPUT
             else
               echo "mode=airing" >> $GITHUB_OUTPUT
             fi
@@ -79,23 +73,30 @@ jobs:
           python scripts/fetch_anilist.py
           echo "Fetch completed at $(date -u)"
 
-      - name: Generate API data
+      - name: Generate API data (EXACT shards)
         run: python scripts/api_generator.py
 
       - name: Show database stats
         run: python -c "import sys; sys.path.insert(0, 'scripts'); from db_utils import connect_db, get_database_stats; import json; conn = connect_db('data/anilist.db'); stats = get_database_stats(conn); print(json.dumps(stats, indent=2)); conn.close()"
 
-      - name: Copy API data to docs
+      - name: Verify EXACT shards (fail if snake_case leaks or FuzzyDate broken)
         run: |
-          mkdir -p docs/api
-          cp -r data/shards docs/api/ 2>/dev/null || true
-          cp data/search_index.json docs/api/ 2>/dev/null || true
-          cp data/metadata.json docs/api/ 2>/dev/null || true
-          cp data/sample.json docs/api/ 2>/dev/null || true
+          python - <<'EOF'
+          import json, glob, sys
+          shards = sorted(glob.glob('docs/api/shards/shard_*.json'))
+          assert shards, 'no shards generated'
+          sample = json.load(open(shards[0]))[0]
+          assert 'title' in sample and isinstance(sample['title'], dict), 'shard not exact: title object missing'
+          assert 'title_romaji' not in sample, 'snake_case leak: title_romaji still present (break-now exact only)'
+          assert isinstance(sample.get('startDate'), dict), 'startDate must be FuzzyDate {year,month,day}'
+          assert isinstance(sample.get('coverImage'), dict), 'coverImage must be object'
+          assert sample.get('type') == 'ANIME', 'anime-only mirror must set type=ANIME'
+          print(f"EXACT check OK: {len(shards)} shards, sample id={sample.get('id')}")
+          EOF
           echo "docs/api/shards contents:"
-          ls -la docs/api/shards/ 2>/dev/null | head -5
-          echo "Total shards in docs/api/shards:"
-          ls docs/api/shards/shard_*.json 2>/dev/null | wc -l
+          ls docs/api/shards/shard_*.json | wc -l
+          gzip -kf docs/api/search_index.json || true
+          ls -lh docs/api/*.json* | head -10
 
       - name: Commit changes
         run: |
