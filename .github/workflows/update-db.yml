@@ -126,12 +126,18 @@ jobs:
           python scripts/fetch_anilist.py
           echo "Fetch completed at $(date -u)"
 
-      - name: Sync deltas to Turso (edge SQL reads; bootstrap on first run)
+      - name: Sync to Turso (whole-file bootstrap once, deltas after)
         env:
           TURSO_URL: ${{ secrets.TURSO_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: |
-          python scripts/turso_sync.py --max-minutes 45
+          if python scripts/turso_upload.py --check; then
+            echo "Remote complete: delta sync of touched rows..."
+            python scripts/turso_sync.py --max-minutes 45
+          else
+            echo "Remote incomplete: whole-file upload (~5-10 min)..."
+            python scripts/turso_upload.py
+          fi
           echo "Turso sync completed at $(date -u)"
 
       - name: Generate API data (EXACT shards)
