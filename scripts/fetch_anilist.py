@@ -415,6 +415,19 @@ class AniListFetcher:
         if media.get("type") and media.get("type") != "ANIME":
             return
         media["type"] = "ANIME"
+        aid = media.get("id")
+        # Dirty tracking: byte-identical payloads skip EVERY write (one cheap
+        # local SELECT, zero Turso cost). Unchanged rail rows never reach
+        # touched_full, so the daily push shrinks to new + truly-changed rows.
+        # Dict comparison is key-order independent; floats/ints round-trip
+        # exactly through json, so identical payloads always match.
+        try:
+            old = conn.execute(
+                "SELECT raw_json FROM anime WHERE id=?", (aid,)).fetchone()
+            if old and old[0] and json.loads(old[0]) == media:
+                return
+        except Exception:
+            pass
         self.touched_full.add(media["id"])
         upsert_anime(conn, media)
         upsert_anime_titles(conn, media["id"], media.get("title", {}) or {})
@@ -1090,13 +1103,21 @@ class AniListFetcher:
 
             # Cross-rail overlap: same anime in 2 rails syncs ONCE (touched
             # is a set). Reported so the manifest explains the counts.
-            all_rail_ids = sorted(self.touched_full)
+            # NOTE: rail membership (what AniList returned) differs from the
+            # push set (dirty rows only — byte-identical rows are skipped by
+            # _process_anime and never touch Turso).
+            all_rail_ids = set()
+            for v in rail_ids.values():
+                all_rail_ids.update(v)
             overlap = sum(len(v) for v in rail_ids.values()) - len(all_rail_ids)
             total_new = sum(rail_new.values())
-            logger.info(f"Rails refresh complete: {len(all_rail_ids)} unique IDs "
-                        f"(+{total_new} NEW anime, {overlap} cross-rail overlap) "
-                        f"in {self.request_count} AniList requests")
-            self._save_rail_manifest(rail_ids, rail_new, overlap)
+            push_ids = sorted(self.touched_full)
+            skipped = len(all_rail_ids) - len(push_ids)
+            logger.info(f"Rails refresh complete: {len(all_rail_ids)} rail IDs, "
+                        f"{len(push_ids)} dirty to push ({skipped} unchanged skipped), "
+                        f"+{total_new} NEW anime, {overlap} cross-rail overlap, "
+                        f"{self.request_count} AniList requests")
+            self._save_rail_manifest(rail_ids, rail_new, overlap, push_ids)
         except KeyboardInterrupt:
             logger.info("Interrupted. Saving progress...")
             conn.commit()
@@ -1105,7 +1126,7 @@ class AniListFetcher:
 
         return total_updated
 
-    def _save_rail_manifest(self, rail_ids, rail_new, overlap):
+    def _save_rail_manifest(self, rail_ids, rail_new, overlap, push_ids):
         """Exactly-which-rows record for the Turso push. Lives in docs/api/
         (committed, git-tracked) so every daily run leaves a visible audit
         of what Turso received — no remote read needed to know."""
@@ -1115,8 +1136,9 @@ class AniListFetcher:
             manifest = {
                 "generatedAt": datetime.now(timezone.utc).isoformat(),
                 "fetch_type": "rails",
-                "uniqueIds": len(self.touched_full),
+                "uniqueIds": len(push_ids),
                 "overlap": overlap,
+                "pushIds": push_ids,
                 "rails": {
                     name: {"count": len(ids), "new": rail_new.get(name, 0),
                            "ids": ids}
@@ -1127,7 +1149,7 @@ class AniListFetcher:
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(manifest, f, ensure_ascii=False)
             logger.info(f"Rail manifest written: {out_path} "
-                        f"({manifest['uniqueIds']} unique IDs)")
+                        f"({manifest['uniqueIds']} push IDs)")
         except Exception as e:
             logger.warning(f"Could not save rail manifest: {e}")
 

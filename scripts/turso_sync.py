@@ -30,7 +30,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 CHUNK = 2000       # ids per scoped pass (small rows: few round trips)
 BATCH = 1000       # rows per executemany for small tables
-ANIME_BATCH = 25   # full raw_json rows (~330KB each): keep HTTP bodies ~8MB
+ANIME_BATCH = 10   # full raw_json rows (~330KB each): ~3MB bodies survive
+# slow links without timeouts (25 was timing out against Turso free tier)
 TIME_BUDGET_DEFAULT = 100  # minutes; stop gracefully, resume next run
 
 PROGRESS_FILE = "turso_sync_progress.json"
@@ -271,7 +272,10 @@ def mark_complete(rconn, total_anime):
     rconn.commit()
 
 
-WORKERS = 6  # parallel chunk lanes; disjoint ID sets, so no write conflicts
+WORKERS = 1  # SEQUENTIAL writes only. Turso (single-writer, free-tier
+# throttled) times out under parallel writers: 6 lanes just contend on the
+# write lock, burn the budget in retries, and finish slower than one lane.
+# Rails deltas are small (<=1000 IDs) — one steady lane wins every time.
 
 _TRANSIENT_HINTS = ("busy", "locked", "timeout", "timed out", "connection",
                     "reset by peer", "unavailable", "try again", "429",
@@ -402,6 +406,10 @@ def sync_anime_ids(db_path, ids, with_related: bool,
         nonlocal stopped
         if not pending or stopped:
             return
+        phase_started = time.monotonic()
+        phase_rows = dict(stats)
+        print(f"Phase {kind}: {len(pending)} chunk(s), {WORKERS} lane(s)...",
+              flush=True)
         worker = partial(_worker_anime_chunk, write_only=write_only) \
             if kind == "anime" else partial(
             _worker_related_chunk, write_only=write_only)
@@ -430,6 +438,13 @@ def sync_anime_ids(db_path, ids, with_related: bool,
                     break
         finally:
             ex.shutdown(wait=False, cancel_futures=True)
+        phase_secs = time.monotonic() - phase_started
+        wrote = (stats["anime"] - phase_rows["anime"]
+                 + stats["related"] - phase_rows["related"])
+        rate = wrote / phase_secs if phase_secs > 0 else 0
+        print(f"Phase {kind} done: {completed}/{len(pending)} chunks, "
+              f"{wrote} rows in {phase_secs:.0f}s ({rate:.1f} rows/s)",
+              flush=True)
 
     # Pass 1 (barrier): ALL anime rows first — relations FK-reference anime
     # that may live in another worker's chunk.
@@ -461,11 +476,14 @@ def read_touched(data_dir, name):
 
 
 def _read_manifest_ids(base_dir):
-    """IDs the fetcher promised to push (rail_manifest.json). None = no
-    manifest (older/manual runs) — cross-check skipped, never fatal."""
+    """IDs the fetcher promised to push (rail_manifest.json pushIds).
+    Falls back to the union of rail membership on older manifests.
+    None = no manifest (older/manual runs) — cross-check skipped."""
     try:
         with open(os.path.join(base_dir, "docs", "api", "rail_manifest.json")) as f:
             m = json.load(f)
+        if m.get("pushIds"):
+            return set(m["pushIds"])
         ids = set()
         for rail in (m.get("rails") or {}).values():
             ids.update(rail.get("ids") or [])
