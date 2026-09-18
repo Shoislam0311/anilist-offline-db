@@ -1,4 +1,11 @@
 {
+  // Turso primary lives in ap-northeast-1 (Tokyo): run the function in nrt1
+  // so every DB round trip costs ~10-30ms instead of ~200ms from US regions.
+  // (Hobby allows one region; this is the single biggest latency lever.)
+  "regions": ["nrt1"],
+  "functions": {
+    "api/index.js": { "maxDuration": 60 }
+  },
   "rewrites": [
     { "source": "/graphql", "destination": "/api/index.js" },
     { "source": "/api/graphql", "destination": "/api/index.js" }

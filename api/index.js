@@ -689,12 +689,23 @@ async function tursoPage(fargs, page, perPage, proj = null) {
   const hit = cacheGet(pageCache, pKey, PAGE_TTL_MS);
   if (hit) return hit;
   const cKey = countCacheKey(clause, filterArgs);
-  let total = cacheGet(countCache, cKey, COUNT_TTL_MS);
-  if (total === undefined) {
-    const countRs = await c.execute({ sql: `SELECT COUNT(*) AS n FROM anime a WHERE ${clause}`, args: filterArgs });
-    total = Number(countRs.rows[0]?.n || 0);
-    cacheSet(countCache, cKey, total);
-  }
+  const cachedTotal = cacheGet(countCache, cKey, COUNT_TTL_MS);
+  const dataSql = proj
+    ? `SELECT ${proj.select.join(', ')} FROM anime a WHERE ${clause} ORDER BY ${order} LIMIT ? OFFSET ?`
+    : `SELECT a.raw_json AS raw_json FROM anime a WHERE ${clause} ORDER BY ${order} LIMIT ? OFFSET ?`;
+  const dataArgs = [...args, perPage, (page - 1) * perPage];
+  // Single flight: COUNT + page SELECT run concurrently (one Tokyo round
+  // trip instead of two sequential). Empty-total discards the page rows.
+  const countP = cachedTotal !== undefined
+    ? Promise.resolve(cachedTotal)
+    : c.execute({ sql: `SELECT COUNT(*) AS n FROM anime a WHERE ${clause}`, args: filterArgs })
+      .then((rs) => {
+        const n = Number(rs.rows[0]?.n || 0);
+        cacheSet(countCache, cKey, n);
+        return n;
+      });
+  const dataP = c.execute({ sql: dataSql, args: dataArgs });
+  const [total, dataRs] = await Promise.all([countP, dataP]);
   if (total === 0) {
     const empty = { total: 0, items: [] };
     cacheSet(pageCache, pKey, empty);
@@ -702,16 +713,8 @@ async function tursoPage(fargs, page, perPage, proj = null) {
   }
   let items;
   if (proj) {
-    const dataRs = await c.execute({
-      sql: `SELECT ${proj.select.join(', ')} FROM anime a WHERE ${clause} ORDER BY ${order} LIMIT ? OFFSET ?`,
-      args: [...args, perPage, (page - 1) * perPage],
-    });
     items = dataRs.rows.map(rowToMedia);
   } else {
-    const dataRs = await c.execute({
-      sql: `SELECT a.raw_json AS raw_json FROM anime a WHERE ${clause} ORDER BY ${order} LIMIT ? OFFSET ?`,
-      args: [...args, perPage, (page - 1) * perPage],
-    });
     items = [];
     for (const row of dataRs.rows) {
       try { if (row.raw_json) items.push(asExactMedia(JSON.parse(row.raw_json))); } catch { /* skip bad row */ }
