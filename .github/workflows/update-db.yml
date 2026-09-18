@@ -121,7 +121,7 @@ jobs:
           TURSO_URL: ${{ secrets.TURSO_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: |
-          python scripts/turso_sync.py --write-only --max-minutes 45 --max-rows 1000
+          python scripts/turso_sync.py --write-only --max-minutes 8
           echo "Turso sync completed at $(date -u)"
 
       - name: Show sync summary (what this run pushed to Turso)
