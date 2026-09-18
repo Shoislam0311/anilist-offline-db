@@ -116,15 +116,16 @@ def replace_rows(rconn, table, cols, rows, batch_size=BATCH):
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
         try:
-            rconn.executemany(sql, batch)
+            _with_retry(lambda: rconn.executemany(sql, batch))
             done += len(batch)
         except Exception as e:
-            # Batch abort (e.g. FK on a dangling ref): fall back to row-by-row,
-            # skipping only the poison rows. Re-inserted rows REPLACE identically.
+            # Deterministic poison (e.g. FK on a dangling ref) after transient
+            # retries: fall back to row-by-row, skipping only poison rows.
+            # Re-inserted rows REPLACE identically — never duplicates.
             skipped = 0
             for row in batch:
                 try:
-                    rconn.execute(sql, _t(list(row)))
+                    _with_retry(lambda: rconn.execute(sql, _t(list(row))), tries=3)
                     done += 1
                 except Exception:
                     skipped += 1
@@ -144,8 +145,8 @@ def delete_scoped(rconn, table, ids):
     for i in range(0, len(ids), CHUNK):
         chunk = ids[i:i + CHUNK]
         q = ", ".join(["?"] * len(chunk))
-        rconn.execute(f'DELETE FROM "{table}" WHERE anime_id IN ({q})', _t(chunk))
-    rconn.commit()
+        _with_retry(lambda: (rconn.execute(
+            f'DELETE FROM "{table}" WHERE anime_id IN ({q})', _t(chunk)), rconn.commit()))
 
 
 def copy_where(lconn, rconn, table, where, params, batch_size=BATCH):
@@ -157,8 +158,9 @@ def copy_where(lconn, rconn, table, where, params, batch_size=BATCH):
     return replace_rows(rconn, table, cols, [tuple(r) for r in rows], batch_size=batch_size)
 
 
-def _chunks(ids, n=CHUNK):
+def _chunks(ids, n=None):
     ids = [i for i in ids if i is not None]
+    n = n or CHUNK
     return [ids[i:i + n] for i in range(0, len(ids), n)]
 
 
@@ -243,8 +245,120 @@ def mark_complete(rconn, total_anime):
     rconn.commit()
 
 
-def sync_anime_ids(lconn, rconn, ids, with_related: bool,
-                   data_dir=None, max_minutes=None, progress=None):
+WORKERS = 6  # parallel chunk lanes; disjoint ID sets, so no write conflicts
+
+_TRANSIENT_HINTS = ("busy", "locked", "timeout", "timed out", "connection",
+                    "reset by peer", "unavailable", "try again", "429",
+                    "500", "502", "503", "504")
+
+
+def _is_transient(e):
+    return any(t in str(e).lower() for t in _TRANSIENT_HINTS)
+
+
+def _with_retry(fn, tries=4):
+    import time as _t
+    last = None
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if not _is_transient(e) or i == tries - 1:
+                raise
+            _t.sleep(min(2 ** i, 8))
+    raise last
+
+
+def _open_remote():
+    import libsql_experimental as libsql
+    url = os.environ.get("TURSO_URL", "")
+    token = os.environ.get("TURSO_AUTH_TOKEN", "")
+    if url.startswith("file:") or url.endswith(".db"):
+        return libsql.connect(database=url)
+    return libsql.connect(database=url, auth_token=token)
+
+
+def _open_local(db_path):
+    from db_utils import connect_db
+    return connect_db(db_path)
+
+
+def _close_quietly(conn):
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _worker_anime_chunk(idx, chunk, db_path):
+    """Sync anime rows for one disjoint chunk. Own connections; returns result tuple."""
+    lconn = _open_local(db_path)
+    rconn = _open_remote()
+    try:
+        q = ", ".join(["?"] * len(chunk))
+        n = copy_where(lconn, rconn, "anime", f"id IN ({q})", chunk,
+                       batch_size=ANIME_BATCH)
+        return ("anime", idx, n, 0, None)
+    except Exception as e:
+        return ("anime", idx, 0, 0, e)
+    finally:
+        _close_quietly(lconn)
+        _close_quietly(rconn)
+
+
+def _worker_related_chunk(idx, chunk, db_path):
+    """Sync shared entities + scoped rows for one disjoint chunk."""
+    lconn = _open_local(db_path)
+    rconn = _open_remote()
+    anime_n = related_n = 0
+    try:
+        q = ", ".join(["?"] * len(chunk))
+        related_n += _sync_shared_for_chunk(lconn, rconn, chunk)
+        for table in SCOPED_TABLES:
+            if not remote_has_table(rconn, table):
+                continue
+            cols = local_columns(lconn, table)
+            if not cols or "anime_id" not in cols:
+                continue
+            _with_retry(lambda: delete_scoped(rconn, table, chunk))
+            colnames = ", ".join([f'"{c}"' for c in cols])
+            rows = lconn.execute(
+                f"SELECT {colnames} FROM {table} WHERE anime_id IN ({q})", _t(chunk)).fetchall()
+            related_n += replace_rows(rconn, table, cols, [tuple(r) for r in rows])
+        return ("related", idx, anime_n, related_n, None)
+    except Exception as e:
+        return ("related", idx, anime_n, related_n, e)
+    finally:
+        _close_quietly(lconn)
+        _close_quietly(rconn)
+
+
+def _namespaced_sets(progress, tag):
+    """Progress bookkeeping per sync call (full/counters/bootstrap share one file).
+    Migrates the legacy bare keys (bootstrap-era: anime_done int, related_done list)."""
+    ns = progress.setdefault("chunks", {}).setdefault(tag, {})
+    if not ns and tag == "bootstrap":
+        legacy_a = progress.get("anime_done", 0)
+        anime = set(range(legacy_a)) if isinstance(legacy_a, int) else set(legacy_a or [])
+        related = set(progress.get("related_done", []) or [])
+        if anime or related:
+            ns["anime"] = sorted(anime)
+            ns["related"] = sorted(related)
+    return set(ns.get("anime", [])), set(ns.get("related", []))
+
+
+def _mark_done(progress, tag, kind, idx):
+    ns = progress.setdefault("chunks", {}).setdefault(tag, {})
+    key = "anime" if kind == "anime" else "related"
+    done = set(ns.get(key, []))
+    done.add(idx)
+    ns[key] = sorted(done)
+
+
+def sync_anime_ids(db_path, ids, with_related: bool,
+                   data_dir=None, max_minutes=None, progress=None, tag="sync"):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     import time
     stats = {"anime": 0, "related": 0}
     chunks = _chunks(ids)
@@ -252,56 +366,53 @@ def sync_anime_ids(lconn, rconn, ids, with_related: bool,
         return stats
     started_at = time.monotonic()
     progress = progress or {}
-    done_chunks = set(progress.get("related_done", []))
-    # Pass 1: anime rows for ALL chunks (relations FK-reference other anime,
-    # which may live in a later chunk — especially on bootstrap).
-    # Tiered batches: full raw_json rows go 25/call (~8MB bodies).
-    anime_done = progress.get("anime_done", 0)
-    for n, chunk in enumerate(chunks):
-        if n < anime_done:
-            continue
-        q = ", ".join(["?"] * len(chunk))
-        stats["anime"] += copy_where(lconn, rconn, "anime", f"id IN ({q})", chunk,
-                                     batch_size=ANIME_BATCH)
-        progress["anime_done"] = n + 1
-        if data_dir and n % 4 == 0:
-            save_progress(data_dir, progress)
-        if max_minutes and not _deadline_ok(started_at, max_minutes):
-            if data_dir:
-                save_progress(data_dir, progress)
-            progress["incomplete"] = True
-            return stats
+    anime_done, related_done = _namespaced_sets(progress, tag)
+    stopped = False
+
+    def run_phase(kind, pending):
+        nonlocal stopped
+        if not pending or stopped:
+            return
+        worker = _worker_anime_chunk if kind == "anime" else _worker_related_chunk
+        ex = ThreadPoolExecutor(max_workers=WORKERS)
+        try:
+            futs = {ex.submit(worker, idx, chunks[idx], db_path): idx for idx in pending}
+            completed = 0
+            for fut in as_completed(futs):
+                try:
+                    _, idx, a_n, r_n, err = fut.result()
+                except Exception as e:
+                    print(f"  chunk worker crashed, will resume: {str(e)[:120]}")
+                    continue
+                if err is None:
+                    stats["anime"] += a_n
+                    stats["related"] += r_n
+                    (anime_done if kind == "anime" else related_done).add(idx)
+                    _mark_done(progress, tag, kind, idx)
+                    completed += 1
+                    if data_dir and completed % 2 == 0:
+                        save_progress(data_dir, progress)
+                else:
+                    print(f"  chunk {idx} ({kind}) failed, will resume: {str(err)[:120]}")
+                if max_minutes and not _deadline_ok(started_at, max_minutes):
+                    stopped = True
+                    break
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+
+    # Pass 1 (barrier): ALL anime rows first — relations FK-reference anime
+    # that may live in another worker's chunk.
+    run_phase("anime", [n for n in range(len(chunks)) if n not in anime_done])
     if data_dir:
         save_progress(data_dir, progress)
-    if not with_related:
-        return stats
-    # Pass 2: shared entities, then scoped detail rows per chunk.
-    for n, chunk in enumerate(chunks):
-        if n in done_chunks:
-            continue
-        q = ", ".join(["?"] * len(chunk))
-        stats["related"] += _sync_shared_for_chunk(lconn, rconn, chunk)
-        for table in SCOPED_TABLES:
-            if not remote_has_table(rconn, table):
-                continue
-            cols = local_columns(lconn, table)
-            if not cols or "anime_id" not in cols:
-                continue
-            delete_scoped(rconn, table, chunk)
-            colnames = ", ".join([f'"{c}"' for c in cols])
-            rows = lconn.execute(
-                f"SELECT {colnames} FROM {table} WHERE anime_id IN ({q})", _t(chunk)).fetchall()
-            stats["related"] += replace_rows(rconn, table, cols, [tuple(r) for r in rows])
-        done_chunks.add(n)
-        progress["related_done"] = sorted(done_chunks)
-        if data_dir:
-            save_progress(data_dir, progress)
-        if max_minutes and not _deadline_ok(started_at, max_minutes):
-            progress["incomplete"] = True
-            if data_dir:
-                save_progress(data_dir, progress)
-            return stats
-    progress.pop("incomplete", None)
+    # Pass 2: shared entities + scoped rows per chunk.
+    if with_related:
+        run_phase("related", [n for n in range(len(chunks)) if n not in related_done])
+    progress["incomplete"] = stopped or any(
+        n not in anime_done for n in range(len(chunks))) or (
+        with_related and any(n not in related_done for n in range(len(chunks))))
+    if not progress["incomplete"]:
+        progress.pop("incomplete", None)
     if data_dir:
         save_progress(data_dir, progress)
     return stats
@@ -344,10 +455,10 @@ def main():
             ids = [r[0] for r in lconn.execute("SELECT id FROM anime ORDER BY id").fetchall()]
             progress = load_progress(data_dir)
             print(f"Bootstrap: pushing {len(ids)} anime + related rows "
-                  f"(budget {max_minutes} min, resume-safe)...")
-            stats = sync_anime_ids(lconn, rconn, ids, with_related=True,
+                  f"({WORKERS} workers, budget {max_minutes} min, resume-safe)...")
+            stats = sync_anime_ids(db_path, ids, with_related=True,
                                    data_dir=data_dir, max_minutes=max_minutes,
-                                   progress=progress)
+                                   progress=progress, tag="bootstrap")
             if progress.get("incomplete"):
                 print(f"Bootstrap INCOMPLETE within budget: {stats} — progress saved, "
                       f"resume continues next run. Remote stays ungated (invisible).")
@@ -365,15 +476,18 @@ def main():
         # counters-only ids ride along as full anime rows (counters live there)
         only_counters = [i for i in counter_ids if i not in set(full_ids)]
         total_stats = {"anime": 0, "related": 0}
+        progress = load_progress(data_dir)
         if full_ids:
             print(f"Delta: {len(full_ids)} full + {len(only_counters)} counters-only...")
-            s = sync_anime_ids(lconn, rconn, full_ids, with_related=True,
-                               data_dir=data_dir, max_minutes=max_minutes)
+            s = sync_anime_ids(db_path, full_ids, with_related=True,
+                               data_dir=data_dir, max_minutes=max_minutes,
+                               progress=progress, tag="delta-full")
             total_stats["anime"] += s["anime"]
             total_stats["related"] += s["related"]
         if only_counters:
-            s = sync_anime_ids(lconn, rconn, only_counters, with_related=False,
-                               data_dir=data_dir, max_minutes=max_minutes)
+            s = sync_anime_ids(db_path, only_counters, with_related=False,
+                               data_dir=data_dir, max_minutes=max_minutes,
+                               progress=progress, tag="delta-counters")
             total_stats["anime"] += s["anime"]
         print(f"Delta done: {total_stats} (monthly write budget: 10M rows)")
     finally:
