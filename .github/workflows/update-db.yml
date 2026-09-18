@@ -126,18 +126,15 @@ jobs:
           python scripts/fetch_anilist.py
           echo "Fetch completed at $(date -u)"
 
-      - name: Sync to Turso (whole-file bootstrap once, deltas after)
+      - name: Sync to Turso (daily deltas only — full never syncs)
         env:
           TURSO_URL: ${{ secrets.TURSO_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: |
-          if python scripts/turso_upload.py --check; then
-            echo "Remote complete: delta sync of touched rows..."
-            python scripts/turso_sync.py --max-minutes 45
-          else
-            echo "Remote incomplete: whole-file upload (~5-10 min)..."
-            python scripts/turso_upload.py
-          fi
+          # Design: full fetch builds local files only. Turso receives ONLY
+          # daily deltas (touched IDs). The one-time full fill comes from a
+          # fresh-DB file import, never from this step.
+          python scripts/turso_sync.py --max-minutes 45
           echo "Turso sync completed at $(date -u)"
 
       - name: Generate API data (EXACT shards)
