@@ -449,6 +449,18 @@ def main():
     rconn = connect_remote()
     created = ensure_schema(rconn)
 
+    # Self-healing gate: if the remote already holds the full dataset
+    # (e.g. manual file upload), stamp the completion flag so serving flips
+    # on automatically. No-op when already flagged or when counts differ.
+    try:
+        local_total = connect_db(db_path).execute("SELECT COUNT(*) FROM anime").fetchone()[0]
+        remote_total = rconn.execute("SELECT COUNT(*) FROM anime").fetchone()[0]
+        if local_total > 10000 and local_total == remote_total:
+            mark_complete(rconn, local_total)
+            print(f"Completeness verified locally ({local_total} rows): flag live.")
+    except Exception as e:
+        print(f"Completeness check skipped: {str(e)[:120]}")
+
     lconn = connect_db(db_path)
     try:
         if bootstrap or created:
