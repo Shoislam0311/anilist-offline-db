@@ -8,15 +8,18 @@ syncs push only touched IDs:
   - data/touched_full.json     -> full anime rows + all scoped related rows
   - data/touched_counters.json -> full anime rows (counters live there too)
 
-Writes per daily run: ~15-30k. Per weekly incremental: similar. Far under budget.
+Writes per daily rails run: ~300-500 anime + scoped rows. Far under budget.
 
-Schema is created remotely on first run (DB_SCHEMA, minus FTS virtual tables
-which are rebuilt locally only; Turso reads use LIKE on indexed columns).
+Write-only mode (--write-only, used by the daily workflow): makes ZERO
+remote SELECTs. No sqlite_master probes, no COUNT(*) gates, no per-chunk
+table checks — blind CREATE IF NOT EXISTS once, then INSERT OR REPLACE /
+DELETE only. Local SELECTs are free (SQLite file, unbilled).
 
 Env required: TURSO_URL, TURSO_AUTH_TOKEN  (exit 2 if missing)
 Usage:
-  python3 scripts/turso_sync.py            # delta (default)
-  python3 scripts/turso_sync.py --bootstrap  # full copy (first run only)
+  python3 scripts/turso_sync.py                  # delta (default)
+  python3 scripts/turso_sync.py --write-only     # daily rails: no remote reads
+  python3 scripts/turso_sync.py --bootstrap      # full copy (first run only)
 """
 
 import os
@@ -69,8 +72,25 @@ def connect_remote():
     return libsql.connect(database=url, auth_token=token)
 
 
-def ensure_schema(rconn):
+def ensure_schema(rconn, blind=False):
     from db_utils import DB_SCHEMA, SCOPED_INDEXES
+    if blind:
+        # Write-only path: zero remote reads. CREATE IF NOT EXISTS is a
+        # write; safe to replay every run without probing sqlite_master.
+        for stmt in DB_SCHEMA.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                rconn.execute(stmt)
+        for idx_sql in SCOPED_INDEXES:
+            try:
+                rconn.execute(idx_sql)
+            except Exception:
+                pass
+        try:
+            rconn.commit()
+        except Exception:
+            pass
+        return False
     existing = {r[0] for r in rconn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     created = False
@@ -149,9 +169,12 @@ def delete_scoped(rconn, table, ids):
             f'DELETE FROM "{table}" WHERE anime_id IN ({q})', _t(chunk)), rconn.commit()))
 
 
-def copy_where(lconn, rconn, table, where, params, batch_size=BATCH):
+def copy_where(lconn, rconn, table, where, params, batch_size=BATCH,
+               skip_remote_check=False):
     cols = local_columns(lconn, table)
-    if not cols or not remote_has_table(rconn, table):
+    if not cols:
+        return 0
+    if not skip_remote_check and not remote_has_table(rconn, table):
         return 0
     colnames = ", ".join([f'"{c}"' for c in cols])
     rows = lconn.execute(f"SELECT {colnames} FROM {table} WHERE {where}", _t(params)).fetchall()
@@ -164,7 +187,7 @@ def _chunks(ids, n=None):
     return [ids[i:i + n] for i in range(0, len(ids), n)]
 
 
-def _sync_shared_for_chunk(lconn, rconn, chunk):
+def _sync_shared_for_chunk(lconn, rconn, chunk, write_only=False):
     """Shared entities first: scoped rows FK-reference these."""
     count = 0
     q = ", ".join(["?"] * len(chunk))
@@ -185,19 +208,22 @@ def _sync_shared_for_chunk(lconn, rconn, chunk):
             continue
         for c2 in _chunks(ref_ids):
             q2 = ", ".join(["?"] * len(c2))
-            count += copy_where(lconn, rconn, table, f"id IN ({q2})", c2)
+            count += copy_where(lconn, rconn, table, f"id IN ({q2})", c2,
+                                skip_remote_check=write_only)
     try:
         tag_names = [r[0] for r in lconn.execute(
             f"SELECT DISTINCT tag_name FROM anime_tags WHERE anime_id IN ({q})", _t(chunk)).fetchall()]
         for c2 in _chunks(tag_names):
             q2 = ", ".join(["?"] * len(c2))
-            count += copy_where(lconn, rconn, "tags", f"name IN ({q2})", c2)
+            count += copy_where(lconn, rconn, "tags", f"name IN ({q2})", c2,
+                                skip_remote_check=write_only)
         va_ids = [r[0] for r in lconn.execute(
             f"""SELECT DISTINCT voice_actor_id FROM character_voice_actors
                 WHERE anime_id IN ({q})""", _t(chunk)).fetchall()]
         for c2 in _chunks(va_ids):
             q2 = ", ".join(["?"] * len(c2))
-            count += copy_where(lconn, rconn, "voice_actors", f"id IN ({q2})", c2)
+            count += copy_where(lconn, rconn, "voice_actors", f"id IN ({q2})", c2,
+                                skip_remote_check=write_only)
     except Exception:
         pass
     return count
@@ -291,14 +317,14 @@ def _close_quietly(conn):
         pass
 
 
-def _worker_anime_chunk(idx, chunk, db_path):
+def _worker_anime_chunk(idx, chunk, db_path, write_only=False):
     """Sync anime rows for one disjoint chunk. Own connections; returns result tuple."""
     lconn = _open_local(db_path)
     rconn = _open_remote()
     try:
         q = ", ".join(["?"] * len(chunk))
         n = copy_where(lconn, rconn, "anime", f"id IN ({q})", chunk,
-                       batch_size=ANIME_BATCH)
+                       batch_size=ANIME_BATCH, skip_remote_check=write_only)
         return ("anime", idx, n, 0, None)
     except Exception as e:
         return ("anime", idx, 0, 0, e)
@@ -307,16 +333,17 @@ def _worker_anime_chunk(idx, chunk, db_path):
         _close_quietly(rconn)
 
 
-def _worker_related_chunk(idx, chunk, db_path):
+def _worker_related_chunk(idx, chunk, db_path, write_only=False):
     """Sync shared entities + scoped rows for one disjoint chunk."""
     lconn = _open_local(db_path)
     rconn = _open_remote()
     anime_n = related_n = 0
     try:
         q = ", ".join(["?"] * len(chunk))
-        related_n += _sync_shared_for_chunk(lconn, rconn, chunk)
+        related_n += _sync_shared_for_chunk(lconn, rconn, chunk,
+                                            write_only=write_only)
         for table in SCOPED_TABLES:
-            if not remote_has_table(rconn, table):
+            if not write_only and not remote_has_table(rconn, table):
                 continue
             cols = local_columns(lconn, table)
             if not cols or "anime_id" not in cols:
@@ -357,9 +384,11 @@ def _mark_done(progress, tag, kind, idx):
 
 
 def sync_anime_ids(db_path, ids, with_related: bool,
-                   data_dir=None, max_minutes=None, progress=None, tag="sync"):
+                   data_dir=None, max_minutes=None, progress=None, tag="sync",
+                   write_only=False):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import time
+    from functools import partial
     stats = {"anime": 0, "related": 0}
     chunks = _chunks(ids)
     if not chunks:
@@ -373,7 +402,9 @@ def sync_anime_ids(db_path, ids, with_related: bool,
         nonlocal stopped
         if not pending or stopped:
             return
-        worker = _worker_anime_chunk if kind == "anime" else _worker_related_chunk
+        worker = partial(_worker_anime_chunk, write_only=write_only) \
+            if kind == "anime" else partial(
+            _worker_related_chunk, write_only=write_only)
         ex = ThreadPoolExecutor(max_workers=WORKERS)
         try:
             futs = {ex.submit(worker, idx, chunks[idx], db_path): idx for idx in pending}
@@ -429,6 +460,47 @@ def read_touched(data_dir, name):
         return []
 
 
+def _read_manifest_ids(base_dir):
+    """IDs the fetcher promised to push (rail_manifest.json). None = no
+    manifest (older/manual runs) — cross-check skipped, never fatal."""
+    try:
+        with open(os.path.join(base_dir, "docs", "api", "rail_manifest.json")) as f:
+            m = json.load(f)
+        ids = set()
+        for rail in (m.get("rails") or {}).values():
+            ids.update(rail.get("ids") or [])
+        return ids
+    except Exception:
+        return None
+
+
+def _save_sync_report(base_dir, write_only, full_ids, only_counters,
+                      total_stats, sync_secs, incomplete):
+    """Machine-readable twin of the SYNC SUMMARY block. Committed under
+    docs/api/ so the repo history shows exactly what every daily run
+    pushed — the answer to 'what rows does Turso have from this run'
+    without ever reading the remote."""
+    try:
+        from datetime import datetime, timezone
+        report = {
+            "completedAt": datetime.now(timezone.utc).isoformat(),
+            "mode": "write-only" if write_only else "delta",
+            "idsPushed": len(full_ids) + len(only_counters),
+            "ids": sorted(set(full_ids) | set(only_counters)),
+            "animeRows": total_stats.get("anime", 0),
+            "relatedRows": total_stats.get("related", 0),
+            "seconds": round(sync_secs, 1),
+            "incomplete": incomplete,
+        }
+        out = os.path.join(base_dir, "docs", "api", "sync_report.json")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, "w") as f:
+            json.dump(report, f)
+        print(f"Sync report written: {out} ({report['idsPushed']} IDs)")
+    except Exception as e:
+        print(f"Sync report skipped: {str(e)[:120]}")
+
+
 def main():
     from db_utils import connect_db, get_db_path
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -439,6 +511,10 @@ def main():
         sys.exit(1)
 
     bootstrap = "--bootstrap" in sys.argv
+    write_only = "--write-only" in sys.argv
+    # Rails-only limitation: refuse to push the whole catalog from a daily
+    # run (that was the budget blowout). Bootstrap is the only full path.
+    RAIL_ROW_CAP = 1000
     max_minutes = TIME_BUDGET_DEFAULT
     for i, a in enumerate(sys.argv[1:]):
         if a.startswith("--max-minutes"):
@@ -446,20 +522,27 @@ def main():
                 max_minutes = int(a.split("=", 1)[1])
             elif i + 2 < len(sys.argv):
                 max_minutes = int(sys.argv[i + 2])
+        if a.startswith("--max-rows"):
+            if "=" in a:
+                RAIL_ROW_CAP = int(a.split("=", 1)[1])
+            elif i + 2 < len(sys.argv):
+                RAIL_ROW_CAP = int(sys.argv[i + 2])
     rconn = connect_remote()
-    created = ensure_schema(rconn)
+    created = ensure_schema(rconn, blind=write_only)
 
-    # Self-healing gate: if the remote already holds the full dataset
-    # (e.g. manual file upload), stamp the completion flag so serving flips
-    # on automatically. No-op when already flagged or when counts differ.
-    try:
-        local_total = connect_db(db_path).execute("SELECT COUNT(*) FROM anime").fetchone()[0]
-        remote_total = rconn.execute("SELECT COUNT(*) FROM anime").fetchone()[0]
-        if local_total > 10000 and local_total == remote_total:
-            mark_complete(rconn, local_total)
-            print(f"Completeness verified locally ({local_total} rows): flag live.")
-    except Exception as e:
-        print(f"Completeness check skipped: {str(e)[:120]}")
+    if not write_only:
+        # Self-healing gate: if the remote already holds the full dataset
+        # (e.g. manual file upload), stamp the completion flag so serving flips
+        # on automatically. No-op when already flagged or when counts differ.
+        # Skipped in --write-only (it is a remote read, banned on daily runs).
+        try:
+            local_total = connect_db(db_path).execute("SELECT COUNT(*) FROM anime").fetchone()[0]
+            remote_total = rconn.execute("SELECT COUNT(*) FROM anime").fetchone()[0]
+            if local_total > 10000 and local_total == remote_total:
+                mark_complete(rconn, local_total)
+                print(f"Completeness verified locally ({local_total} rows): flag live.")
+        except Exception as e:
+            print(f"Completeness check skipped: {str(e)[:120]}")
 
     lconn = connect_db(db_path)
     try:
@@ -485,23 +568,74 @@ def main():
 
         full_ids = read_touched(data_dir, "touched_full.json")
         counter_ids = read_touched(data_dir, "touched_counters.json")
+        # No-double-write verification (local, zero remote reads): touched
+        # files must already be unique; any dupes are collapsed here and
+        # reported, so one anime row is written exactly once per run.
+        # Idempotency itself comes from INSERT OR REPLACE / ON CONFLICT
+        # upserts — re-running the same manifest can never duplicate rows.
+        dupe_full = len(full_ids) - len(set(full_ids))
+        dupe_cnt = len(counter_ids) - len(set(counter_ids))
+        full_ids = sorted(set(full_ids))
+        counter_ids = sorted(set(counter_ids))
+        if dupe_full or dupe_cnt:
+            print(f"Verify: collapsed {dupe_full} full-list + {dupe_cnt} "
+                  f"counters-list duplicate IDs (each row written once)")
+        else:
+            print(f"Verify: touched lists unique "
+                  f"({len(full_ids)} full + {len(counter_ids)} counters)")
+        # Cross-check against the rail manifest the fetcher wrote: the push
+        # set must equal exactly what the rails produced — nothing added,
+        # nothing dropped.
+        manifest_ids = _read_manifest_ids(base_dir)
+        if manifest_ids is not None:
+            if set(full_ids) == manifest_ids:
+                print(f"Verify: push set == rail manifest "
+                      f"({len(full_ids)} IDs, exact match)")
+            else:
+                missing = len(manifest_ids - set(full_ids))
+                extra = len(set(full_ids) - manifest_ids)
+                print(f"Verify WARNING: push set differs from rail manifest "
+                      f"(missing={missing}, extra={extra})")
         # counters-only ids ride along as full anime rows (counters live there)
         only_counters = [i for i in counter_ids if i not in set(full_ids)]
+        if write_only and len(full_ids) + len(only_counters) > RAIL_ROW_CAP:
+            print(f"ERROR: write-only cap exceeded "
+                  f"({len(full_ids) + len(only_counters)} > {RAIL_ROW_CAP}): "
+                  f"refusing run that would rewrite the catalog. "
+                  f"Daily runs must stay rails-only.", file=sys.stderr)
+            sys.exit(1)
+        import time as _time
+        sync_started = _time.monotonic()
         total_stats = {"anime": 0, "related": 0}
         progress = load_progress(data_dir)
         if full_ids:
-            print(f"Delta: {len(full_ids)} full + {len(only_counters)} counters-only...")
+            print(f"Delta: {len(full_ids)} full + {len(only_counters)} counters-only"
+                  f"{' (write-only: zero remote reads)' if write_only else ''}...")
             s = sync_anime_ids(db_path, full_ids, with_related=True,
                                data_dir=data_dir, max_minutes=max_minutes,
-                               progress=progress, tag="delta-full")
+                               progress=progress, tag="delta-full",
+                               write_only=write_only)
             total_stats["anime"] += s["anime"]
             total_stats["related"] += s["related"]
         if only_counters:
             s = sync_anime_ids(db_path, only_counters, with_related=False,
                                data_dir=data_dir, max_minutes=max_minutes,
-                               progress=progress, tag="delta-counters")
+                               progress=progress, tag="delta-counters",
+                               write_only=write_only)
             total_stats["anime"] += s["anime"]
+        sync_secs = _time.monotonic() - sync_started
+        incomplete = bool(progress.get("incomplete"))
         print(f"Delta done: {total_stats} (monthly write budget: 10M rows)")
+        # SYNC SUMMARY block: the workflow prints this verbatim so every run
+        # shows what happened without opening Turso's dashboard.
+        print("=" * 60)
+        print(f"SYNC SUMMARY: mode={'write-only' if write_only else 'delta'} "
+              f"ids={len(full_ids) + len(only_counters)} "
+              f"anime_rows={total_stats['anime']} related_rows={total_stats['related']} "
+              f"secs={sync_secs:.0f} incomplete={incomplete} cap={RAIL_ROW_CAP}")
+        print("=" * 60)
+        _save_sync_report(base_dir, write_only, full_ids, only_counters,
+                          total_stats, sync_secs, incomplete)
     finally:
         lconn.close()
 

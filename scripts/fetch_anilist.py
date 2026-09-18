@@ -267,6 +267,36 @@ query ($page: Int, $perPage: Int, $status: MediaStatus, $season: MediaSeason, $s
 }
 """ % MEDIA_FIELDS
 
+# Rails-only daily refresh: the 6 homepage rails, same filters/sorts as
+# graphql.anilist.co, bounded pages each. Full payloads (scores + schedules
+# included), so no separate counters pass is needed for these IDs.
+RAILS_SORTED_QUERY = """
+query ($page: Int, $perPage: Int, $sort: [MediaSort], $status: MediaStatus, $format: MediaFormat) {
+  Page(page: $page, perPage: $perPage) {
+    media(type: ANIME, sort: $sort, status: $status, format: $format) {
+      %s
+    }
+    pageInfo { total hasNextPage currentPage lastPage }
+  }
+}
+""" % MEDIA_FIELDS
+
+# Rail definitions: (name, sort, status, format, max_pages).
+# perPage=50. Discovery rule: rails that must catch BRAND-NEW entries sort
+# by newest-ID first (new announcements have ~zero popularity, so a
+# popularity sort would bury them past the page cap and they would never
+# sync). Established-title rails sort by popularity/score as AniList does.
+# Hard cap on AniList requests: 13 requests max per daily run.
+RAIL_DEFS = [
+    ("trending", ["TRENDING_DESC"], None, None, 2),
+    ("top_airing", ["POPULARITY_DESC"], "RELEASING", None, 2),
+    ("top_movies", ["SCORE_DESC"], None, "MOVIE", 2),
+    ("upcoming", ["ID_DESC"], "NOT_YET_RELEASED", None, 3),
+    ("just_finished", ["END_DATE_DESC"], "FINISHED", None, 2),
+    ("schedule", ["TRENDING_DESC"], "RELEASING", None, 2),
+]
+RAIL_PER_PAGE = 50
+
 
 class AniListFetcher:
     def __init__(self, data_dir: str):
@@ -984,6 +1014,123 @@ class AniListFetcher:
 
         return total_updated
 
+    def rails_fetch(self):
+        """Daily rails-only refresh: Trending, Top Airing, Top Movies,
+        Upcoming, Just Finished, Schedule — same filters/sorts as
+        graphql.anilist.co. Bounded (~13 AniList requests, ~300-600 IDs
+        scanned, deduped). Full payloads include live counters and airing
+        schedules, so no separate counters pass is needed.
+
+        New-anime path: any ID not already in the local DB is INSERTed
+        (upsert is idempotent — re-runs never duplicate) and counted as
+        NEW. Upcoming sorts newest-ID-first so fresh announcements are
+        caught even at zero popularity. Only these IDs land in
+        touched_full -> Turso writes stay tiny.
+
+        Verification (all local, zero Turso reads): per-rail ID lists are
+        deduped, overlap between rails is reported (same anime in two
+        rails syncs once), and docs/api/rail_manifest.json records exactly
+        which rows the daily run will push to Turso."""
+        logger.info("Daily rails refresh: 6 homepage rails (bounded)...")
+        conn = init_db(self.db_path)
+        set_metadata(conn, "fetch_type", "rails")
+        set_metadata(conn, "fetch_started_at", datetime.now(timezone.utc).isoformat())
+
+        seen_before = set()
+        for row in conn.execute("SELECT id FROM anime"):
+            seen_before.add(row[0])
+
+        rail_ids = {}
+        rail_new = {}
+        total_updated = 0
+        try:
+            for name, sort, status, fmt, max_pages in RAIL_DEFS:
+                ids_this_rail = []
+                new_this_rail = 0
+                for page in range(1, max_pages + 1):
+                    variables = {"page": page, "perPage": RAIL_PER_PAGE,
+                                 "sort": sort}
+                    if status:
+                        variables["status"] = status
+                    if fmt:
+                        variables["format"] = fmt
+                    data = self._request(RAILS_SORTED_QUERY, variables)
+                    if not data or "data" not in data:
+                        time.sleep(3)
+                        data = self._request(RAILS_SORTED_QUERY, variables)
+                        if not data or "data" not in data:
+                            logger.error(f"Rail {name} page {page} failed twice, skipping")
+                            break
+                    media_list = data["data"]["Page"].get("media", [])
+                    page_info = data["data"]["Page"].get("pageInfo", {})
+                    if not media_list:
+                        break
+                    for media in media_list:
+                        aid = media.get("id")
+                        if aid is None:
+                            continue
+                        if aid not in seen_before and aid not in self.touched_full:
+                            new_this_rail += 1
+                        self._process_anime(conn, media)
+                        ids_this_rail.append(aid)
+                        total_updated += 1
+                    conn.commit()
+                    if not page_info.get("hasNextPage"):
+                        break
+                # Dedupe within rail (AniList can repeat an entry across pages)
+                rail_ids[name] = sorted(set(ids_this_rail))
+                rail_new[name] = new_this_rail
+                dupes = len(ids_this_rail) - len(rail_ids[name])
+                logger.info(f"Rail {name}: {len(rail_ids[name])} unique "
+                            f"(+{new_this_rail} NEW, {dupes} page-dupes dropped)")
+            conn.commit()
+            set_metadata(conn, "last_rails_refresh_at",
+                         datetime.now(timezone.utc).isoformat())
+            conn.commit()
+
+            # Cross-rail overlap: same anime in 2 rails syncs ONCE (touched
+            # is a set). Reported so the manifest explains the counts.
+            all_rail_ids = sorted(self.touched_full)
+            overlap = sum(len(v) for v in rail_ids.values()) - len(all_rail_ids)
+            total_new = sum(rail_new.values())
+            logger.info(f"Rails refresh complete: {len(all_rail_ids)} unique IDs "
+                        f"(+{total_new} NEW anime, {overlap} cross-rail overlap) "
+                        f"in {self.request_count} AniList requests")
+            self._save_rail_manifest(rail_ids, rail_new, overlap)
+        except KeyboardInterrupt:
+            logger.info("Interrupted. Saving progress...")
+            conn.commit()
+        finally:
+            conn.close()
+
+        return total_updated
+
+    def _save_rail_manifest(self, rail_ids, rail_new, overlap):
+        """Exactly-which-rows record for the Turso push. Lives in docs/api/
+        (committed, git-tracked) so every daily run leaves a visible audit
+        of what Turso received — no remote read needed to know."""
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        out_path = os.path.join(base_dir, "docs", "api", "rail_manifest.json")
+        try:
+            manifest = {
+                "generatedAt": datetime.now(timezone.utc).isoformat(),
+                "fetch_type": "rails",
+                "uniqueIds": len(self.touched_full),
+                "overlap": overlap,
+                "rails": {
+                    name: {"count": len(ids), "new": rail_new.get(name, 0),
+                           "ids": ids}
+                    for name, ids in rail_ids.items()
+                },
+            }
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, ensure_ascii=False)
+            logger.info(f"Rail manifest written: {out_path} "
+                        f"({manifest['uniqueIds']} unique IDs)")
+        except Exception as e:
+            logger.warning(f"Could not save rail manifest: {e}")
+
     def upcoming_fetch(self):
         logger.info("Weekly upcoming sweep: fetching NOT_YET_RELEASED anime...")
         conn = init_db(self.db_path)
@@ -1083,12 +1230,13 @@ def main():
         fetcher.incremental_fetch()
         fetcher.upcoming_fetch()
         fetcher.counters_refresh()
-    elif mode == "daily":
-        # Daily schedule: airing titles fully refreshed + live counters
-        # (trending/popularity/scores) merged across the whole catalog.
-        # Covers Airing rail + 7-day Schedule + Trending rail.
-        fetcher.airing_fetch()
-        fetcher.counters_refresh()
+    elif mode == "daily" or mode == "rails":
+        # Daily schedule: rails-only (Trending, Just Finished, Schedule,
+        # Top Airing, Top Movies, Upcoming) with full payloads. Bounded to
+        # ~12 AniList requests; only these IDs sync to Turso (writes-only).
+        # No airing full-walk, no catalog-wide counters — those are what
+        # blew the Turso read/write budgets.
+        fetcher.rails_fetch()
     elif mode == "airing":
         fetcher.airing_fetch()
     elif mode == "counters":

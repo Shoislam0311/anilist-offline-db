@@ -5,28 +5,29 @@ name: Update AniList Database
 #   (git cannot hold 4GB: 2GB push cap, 100MB/file block, 1GB repo guideline).
 # - Git tracks only small files: metadata, search_index, sample, manifest, site.
 # - The SQLite DB persists between ephemeral runners via actions/cache.
-# - Full and scheduled runs use SEPARATE concurrency groups so the daily
-#   refresh can never cancel a multi-hour full re-scrape.
-# - Daily `daily` mode = airing titles fully refreshed + lightweight
-#   trending/popularity/scores merged across the whole catalog.
+# - DAILY-ONLY rails design (Turso free-tier safe):
+#   - fetcher runs `rails` mode: 6 homepage rails only (Trending,
+#     Just Finished, Schedule, Top Airing, Top Movies, Upcoming),
+#     ~13 AniList requests, ~300-600 IDs. No airing full-walk, no
+#     catalog-wide counters.
+#   - turso_sync runs `--write-only`: ZERO remote SELECTs (blind
+#     CREATE IF NOT EXISTS + INSERT OR REPLACE / DELETE only) with a
+#     --max-rows 1000 cap that refuses catalog rewrites.
+# - GraphQL (api/index.js) is fully Turso-dependent for reads; the workflow
+#   never reads Turso, it only writes rail rows.
 
 on:
   schedule:
-    - cron: '0 4 * * *'    # Daily 04:00 UTC -> daily refresh (incremental on Sundays)
+    - cron: '0 4 * * *'    # Daily 04:00 UTC -> rails refresh only
   workflow_dispatch:
     inputs:
       fetch_mode:
-        description: 'Fetch mode (full retired after bootstrap — weekly/daily cover rails)'
+        description: 'Fetch mode (daily rails only)'
         required: false
         default: 'daily'
         type: choice
         options:
           - daily
-          - weekly
-          - airing
-          - counters
-          - upcoming
-          - incremental
 
 permissions:
   contents: write
@@ -34,7 +35,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: "anilist-update-${{ github.event.inputs.fetch_mode || 'scheduled' }}"
+  group: "anilist-update-daily"
   cancel-in-progress: true
 
 jobs:
@@ -62,23 +63,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Determine fetch mode (weekly rails refresh + daily airing+counters)
+      - name: Determine fetch mode (daily rails only)
         id: mode
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "mode=${{ github.event.inputs.fetch_mode }}" >> $GITHUB_OUTPUT
-          else
-            DOW=$(date -u +%-u)
-            if [ "$DOW" = "7" ]; then
-              # Weekly rails refresh: incremental (Just Finished flips + new
-              # Upcoming, full payloads) + upcoming sweep (announcements) +
-              # counters (Trending). `full` is bootstrap/repair only (manual
-              # dispatch) — never scheduled.
-              echo "mode=weekly" >> $GITHUB_OUTPUT
-            else
-              echo "mode=daily" >> $GITHUB_OUTPUT
-            fi
-          fi
+          echo "mode=daily" >> $GITHUB_OUTPUT
 
       - name: Restore database cache (runners are ephemeral)
         uses: actions/cache/restore@v4
@@ -126,19 +114,20 @@ jobs:
           python scripts/fetch_anilist.py
           echo "Fetch completed at $(date -u)"
 
-      - name: Sync to Turso (daily deltas only — never counters, never full)
-        # Counters mode refreshes numbers + cuts a release but never touches
-        # Turso. Only merged daily (airing) and weekly runs sync deltas.
-        if: steps.mode.outputs.mode != 'counters'
+      - name: Sync to Turso (rails-only, write-only — zero remote reads)
+        # Daily rails: blind writes of touched rail IDs only. --write-only
+        # bans every remote SELECT; --max-rows refuses catalog rewrites.
         env:
           TURSO_URL: ${{ secrets.TURSO_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: |
-          # Design: full fetch builds local files only. Turso receives ONLY
-          # daily deltas (touched IDs). The one-time full fill comes from a
-          # fresh-DB file import, never from this step.
-          python scripts/turso_sync.py --max-minutes 45
+          python scripts/turso_sync.py --write-only --max-minutes 45 --max-rows 1000
           echo "Turso sync completed at $(date -u)"
+
+      - name: Show sync summary (what this run pushed to Turso)
+        run: |
+          python -c "import json; r=json.load(open('docs/api/sync_report.json')); print('SYNC REPORT:', json.dumps({k:v for k,v in r.items() if k!='ids'}, indent=2)); print('IDS PUSHED:', len(r.get('ids',[])))" || echo "no sync report (sync step skipped or failed)"
+          python -c "import json; m=json.load(open('docs/api/rail_manifest.json')); print('RAILS:', {k:{'count':v['count'],'new':v['new']} for k,v in m['rails'].items()}, 'unique:', m['uniqueIds'])" || echo "no rail manifest"
 
       - name: Generate API data (EXACT shards)
         run: python scripts/api_generator.py
@@ -208,15 +197,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload shard assets (full = all, others = changed only)
+      - name: Upload shard assets
         run: |
           cd docs/api/shards
-          if [ "${{ steps.mode.outputs.mode }}" = "full" ]; then
-            ls shard_*.json.gz | xargs -P 8 -n 20 gh release upload "${{ steps.rel.outputs.tag }}" --clobber
-          else
-            echo "changed-shard diff not yet implemented; uploading all shards"
-            ls shard_*.json.gz | xargs -P 8 -n 20 gh release upload "${{ steps.rel.outputs.tag }}" --clobber
-          fi
+          ls shard_*.json.gz | xargs -P 8 -n 20 gh release upload "${{ steps.rel.outputs.tag }}" --clobber
           cd ../../..
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -251,6 +235,9 @@ jobs:
           git add docs/api/metadata.json docs/api/search_index.json docs/api/search_index.json.gz \
             docs/api/sample.json docs/api/shard_manifest.json docs/index.html docs/api.js \
             .github/workflows/update-db.yml
+          # rail manifest + sync report exist after rails runs — never fail the add on them
+          test -f docs/api/rail_manifest.json && git add docs/api/rail_manifest.json || true
+          test -f docs/api/sync_report.json && git add docs/api/sync_report.json || true
           # changelog.md only exists after incremental runs — never fail the add on it
           test -f data/changelog.md && git add data/changelog.md || true
           echo "Refusing to push any staged file over 90MB (fail fast, not after a 2-min push):"

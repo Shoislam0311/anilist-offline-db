@@ -508,6 +508,50 @@ function tursoClient() {
   return turso;
 }
 
+/* Turso is the primary DB. When TURSO_REQUIRED=1, GraphQL never falls back
+ * to downloading shards — Turso errors surface as 503 instead of silently
+ * serving slow shard scans. The workflow never reads Turso; only this
+ * read path does, so every read below is user-serving and budgeted.
+ */
+function tursoRequired() {
+  try {
+    return ((typeof process !== 'undefined' && process.env?.TURSO_REQUIRED) || '').trim() === '1';
+  } catch { return false; }
+}
+function tursoUnavailable(msg = 'Turso unavailable') {
+  return Object.assign(new Error(msg), { status: 503 });
+}
+
+/* Read-budget caches: the COUNT(*) scan is the most expensive query per
+ * Page request (full index scan). Rail/homepage queries repeat identical
+ * filters, so cache counts 5 min and full Page payloads 60s. POST rail
+ * queries then cost ZERO Turso reads on hits.
+ */
+const COUNT_TTL_MS = 5 * 60 * 1000;
+const PAGE_TTL_MS = 60 * 1000;
+const MAX_CACHE_ENTRIES = 200;
+const countCache = new Map();
+const pageCache = new Map();
+function cacheGet(map, key, ttl) {
+  const e = map.get(key);
+  if (!e) return undefined;
+  if (Date.now() - e.time > ttl) { map.delete(key); return undefined; }
+  return e.data;
+}
+function cacheSet(map, key, data) {
+  map.set(key, { data, time: Date.now() });
+  if (map.size > MAX_CACHE_ENTRIES) {
+    const oldest = map.keys().next().value;
+    map.delete(oldest);
+  }
+}
+function countCacheKey(clause, args) {
+  return `c:${clause}|${JSON.stringify(args)}`;
+}
+function pageCacheKey(clause, args, order, page, perPage, projKey) {
+  return `p:${clause}|${JSON.stringify(args)}|${order}|${page}|${perPage}|${projKey}`;
+}
+
 const HAY = `lower(coalesce(a.title_romaji,'') || ' ' || coalesce(a.title_english,'') || ' ' || coalesce(a.title_native,'') || ' ' || coalesce(a.synonyms,''))`;
 function escLike(s) { return String(s).replace(/[\\%_]/g, (c) => '\\' + c).toLowerCase(); }
 function searchTokensSql(q) {
@@ -517,7 +561,9 @@ function searchTokensSql(q) {
 function tursoSearchWhere(search, where, args) {
   const q = String(search || '').toLowerCase().trim();
   if (!q) return;
-  const tokens = searchTokensSql(q);
+  if (q.length < 2) { where.push('1 = 0'); return; } // 1-char: full scan, no signal
+  // Cap tokens: each token is another full LIKE scan over 14k rows.
+  const tokens = searchTokensSql(q).slice(0, 5);
   if (!tokens.length) { where.push(`${HAY} LIKE ? ESCAPE '\\'`); args.push(`%${escLike(q)}%`); return; }
   for (const t of tokens) { where.push(`${HAY} LIKE ? ESCAPE '\\'`); args.push(`%${escLike(t)}%`); }
 }
@@ -623,34 +669,57 @@ function tursoWhere(fargs) {
   dateObj('end', a.endDate);
   return { where, args };
 }
-async function tursoPage(fargs, page, perPage) {
+async function tursoPage(fargs, page, perPage, proj = null) {
   const c = tursoClient();
   if (!c) return null;
   const { where, args } = tursoWhere(fargs);
   const clause = where.join(' AND ');
-  const countRs = await c.execute({ sql: `SELECT COUNT(*) AS n FROM anime a WHERE ${clause}`, args });
-  const total = Number(countRs.rows[0]?.n || 0);
-  if (total === 0) {
-    // Empty result: legit (impossible filter) OR remote not bootstrapped yet.
-    // Only fall back to shards when the remote DB itself is empty.
-    const allRs = await c.execute({ sql: `SELECT COUNT(*) AS n FROM anime`, args: [] });
-    if (Number(allRs.rows[0]?.n || 0) === 0) return null;
-  }
+  const filterArgs = [...args]; // WHERE-only args for the COUNT probe below
   let order = tursoOrderClause(fargs.sort);
   if (fargs.search && !fargs.sort) {
     const q = String(fargs.search).toLowerCase().trim();
     order = `CASE WHEN lower(coalesce(a.title_romaji,'')) = ? OR lower(coalesce(a.title_english,'')) = ? OR lower(coalesce(a.title_native,'')) = ? THEN 0 ELSE 1 END, ${order}`;
-    args.push(q, q, q);
+    args.push(q, q, q); // ORDER-only args: must NOT leak into the COUNT query
   }
-  const dataRs = await c.execute({
-    sql: `SELECT a.raw_json AS raw_json FROM anime a WHERE ${clause} ORDER BY ${order} LIMIT ? OFFSET ?`,
-    args: [...args, perPage, (page - 1) * perPage],
-  });
-  const items = [];
-  for (const row of dataRs.rows) {
-    try { if (row.raw_json) items.push(asExactMedia(JSON.parse(row.raw_json))); } catch { /* skip bad row */ }
+  // Column projection: card queries (~10 small scalars, ~200B/row) skip the
+  // 330KB raw_json blob. tursoReady() guarantees the remote is fully
+  // bootstrapped, so total 0 is authoritative — no second COUNT probe.
+  const projKey = proj ? proj.select.join(',') : 'raw';
+  const pKey = pageCacheKey(clause, args, order, page, perPage, projKey);
+  const hit = cacheGet(pageCache, pKey, PAGE_TTL_MS);
+  if (hit) return hit;
+  const cKey = countCacheKey(clause, filterArgs);
+  let total = cacheGet(countCache, cKey, COUNT_TTL_MS);
+  if (total === undefined) {
+    const countRs = await c.execute({ sql: `SELECT COUNT(*) AS n FROM anime a WHERE ${clause}`, args: filterArgs });
+    total = Number(countRs.rows[0]?.n || 0);
+    cacheSet(countCache, cKey, total);
   }
-  return { total, items };
+  if (total === 0) {
+    const empty = { total: 0, items: [] };
+    cacheSet(pageCache, pKey, empty);
+    return empty;
+  }
+  let items;
+  if (proj) {
+    const dataRs = await c.execute({
+      sql: `SELECT ${proj.select.join(', ')} FROM anime a WHERE ${clause} ORDER BY ${order} LIMIT ? OFFSET ?`,
+      args: [...args, perPage, (page - 1) * perPage],
+    });
+    items = dataRs.rows.map(rowToMedia);
+  } else {
+    const dataRs = await c.execute({
+      sql: `SELECT a.raw_json AS raw_json FROM anime a WHERE ${clause} ORDER BY ${order} LIMIT ? OFFSET ?`,
+      args: [...args, perPage, (page - 1) * perPage],
+    });
+    items = [];
+    for (const row of dataRs.rows) {
+      try { if (row.raw_json) items.push(asExactMedia(JSON.parse(row.raw_json))); } catch { /* skip bad row */ }
+    }
+  }
+  const out = { total, items };
+  cacheSet(pageCache, pKey, out);
+  return out;
 }
 async function tursoMediaByArgs(args) {
   const c = tursoClient();
@@ -688,6 +757,126 @@ function pageOut(fieldNode, fragments, paged, total, page, perPage) {
   return out;
 }
 
+/* ------------- column projection (kill multi-MB transfers) -------------
+ * Card queries ask for ~10 small scalars. Selecting those columns (~200B/row)
+ * instead of raw_json (~330KB/row) turns seconds into milliseconds on a
+ * throughput-thin edge link. Anything else falls back to raw_json.
+ */
+const COL_FIELDS = {
+  'id': 'a.id AS id',
+  'idMal': 'a.id_mal AS idMal',
+  'type': "COALESCE(a.type,'ANIME') AS type",
+  'format': 'a.format AS format',
+  'status': 'a.status AS status',
+  'episodes': 'a.episodes AS episodes',
+  'duration': 'a.duration AS duration',
+  'chapters': 'a.chapters AS chapters',
+  'volumes': 'a.volumes AS volumes',
+  'averageScore': 'a.average_score AS averageScore',
+  'meanScore': 'a.mean_score AS meanScore',
+  'popularity': 'a.popularity AS popularity',
+  'favourites': 'a.favourites AS favourites',
+  'trending': 'a.trending AS trending',
+  'season': 'a.season AS season',
+  'seasonYear': 'a.season_year AS seasonYear',
+  'seasonInt': 'a.season_int AS seasonInt',
+  'countryOfOrigin': 'a.country_of_origin AS countryOfOrigin',
+  'isLicensed': 'a.is_licensed AS isLicensed',
+  'source': 'a.source AS source',
+  'hashtag': 'a.hashtag AS hashtag',
+  'bannerImage': 'a.banner_image AS bannerImage',
+  'isAdult': 'a.is_adult AS isAdult',
+  'updatedAt': 'a.updated_at AS updatedAt',
+  'siteUrl': 'a.site_url AS siteUrl',
+  'title.romaji': 'a.title_romaji AS title_romaji',
+  'title.english': 'a.title_english AS title_english',
+  'title.native': 'a.title_native AS title_native',
+  'title.userPreferred': 'a.title_user_preferred AS title_user_preferred',
+  'coverImage.extraLarge': 'a.cover_extra_large AS cover_extra_large',
+  'coverImage.large': 'a.cover_large AS cover_large',
+  'coverImage.medium': 'a.cover_medium AS cover_medium',
+  'coverImage.color': 'a.cover_color AS cover_color',
+  'startDate.year': 'a.start_year AS start_year',
+  'startDate.month': 'a.start_month AS start_month',
+  'startDate.day': 'a.start_day AS start_day',
+  'endDate.year': 'a.end_year AS end_year',
+  'endDate.month': 'a.end_month AS end_month',
+  'endDate.day': 'a.end_day AS end_day',
+  'trailer.id': 'a.trailer_id AS trailer_id',
+  'trailer.site': 'a.trailer_site AS trailer_site',
+  'trailer.thumbnail': 'a.trailer_thumbnail AS trailer_thumbnail',
+  'synonyms': 'a.synonyms AS synonyms',
+};
+const PROJ_OBJECTS = new Set(['title', 'coverImage', 'startDate', 'endDate', 'trailer']);
+function planProjection(mediaNode, fragments) {
+  const sels = mediaNode ? collectSelections(mediaNode, fragments) : [];
+  if (!sels.length) return null;
+  const cols = new Set();
+  const walk = (nodes, prefix) => {
+    for (const s of nodes) {
+      if (s.name.value === '__typename') continue;
+      const path = prefix ? prefix + '.' + s.name.value : s.name.value;
+      const sub = s.selectionSet ? collectSelections(s, fragments) : null;
+      if (sub && sub.length) {
+        if (!PROJ_OBJECTS.has(s.name.value)) return null;
+        if (walk(sub, path) === null) return null;
+      } else {
+        if (!(path in COL_FIELDS)) return null;
+        cols.add(path);
+      }
+    }
+    return true;
+  };
+  if (walk(sels, '') === null) return null;
+  if (!cols.size) return { select: ['a.id AS id'] }; // __typename-only etc.
+  return { select: [...cols].map((p) => COL_FIELDS[p]) };
+}
+function rowToMedia(row) {
+  const m = { __typename: 'Media', type: 'ANIME', isFavourite: false };
+  const simple = ['id', 'idMal', 'format', 'status', 'episodes', 'duration', 'chapters', 'volumes',
+    'averageScore', 'meanScore', 'popularity', 'favourites', 'trending', 'season', 'seasonYear',
+    'seasonInt', 'countryOfOrigin', 'isLicensed', 'source', 'hashtag', 'bannerImage', 'isAdult',
+    'updatedAt'];
+  for (const k of simple) if (k in row) m[k] = row[k];
+  if ('type' in row && row.type) m.type = row.type;
+  if ('isAdult' in row && row.isAdult !== null && row.isAdult !== undefined) m.isAdult = !!row.isAdult;
+  if ('isLicensed' in row && row.isLicensed !== null && row.isLicensed !== undefined) m.isLicensed = !!row.isLicensed;
+  if ('title_romaji' in row || 'title_english' in row || 'title_native' in row || 'title_user_preferred' in row) {
+    m.title = {
+      __typename: 'MediaTitle',
+      romaji: row.title_romaji ?? null, english: row.title_english ?? null,
+      native: row.title_native ?? null, userPreferred: row.title_user_preferred ?? row.title_romaji ?? row.title_english ?? null,
+    };
+  }
+  if ('cover_large' in row || 'cover_medium' in row || 'cover_extra_large' in row || 'cover_color' in row) {
+    m.coverImage = {
+      __typename: 'CoverImage',
+      extraLarge: row.cover_extra_large ?? null, large: row.cover_large ?? null,
+      medium: row.cover_medium ?? null, color: row.cover_color ?? null,
+    };
+  }
+  const fuzzy = (p) => {
+    const y = `${p}_year`, mo = `${p}_month`, d = `${p}_day`;
+    if (!(y in row) && !(mo in row) && !(d in row)) return undefined;
+    return { __typename: 'FuzzyDate', year: row[y] ?? null, month: row[mo] ?? null, day: row[d] ?? null };
+  };
+  const sd = fuzzy('start'), ed = fuzzy('end');
+  if (sd) m.startDate = sd;
+  if (ed) m.endDate = ed;
+  if ('trailer_id' in row || 'trailer_site' in row || 'trailer_thumbnail' in row) {
+    if (row.trailer_site || row.trailer_id) {
+      m.trailer = { __typename: 'MediaTrailer', id: row.trailer_id ?? null, site: row.trailer_site ?? null, thumbnail: row.trailer_thumbnail ?? null };
+    } else m.trailer = null;
+  }
+  if ('synonyms' in row) {
+    try { m.synonyms = JSON.parse(row.synonyms || '[]'); }
+    catch { m.synonyms = []; }
+    if (!Array.isArray(m.synonyms)) m.synonyms = [];
+  }
+  if (!m.siteUrl && m.id) m.siteUrl = `https://anilist.co/anime/${m.id}`;
+  return m;
+}
+
 async function resolvePage(fieldNode, fragments, variables, pageArgs) {
   const index = await getSearchIndex();
   const mediaFieldNode = fieldNode.selectionSet?.selections?.find(
@@ -698,13 +887,22 @@ async function resolvePage(fieldNode, fragments, variables, pageArgs) {
   const page = fargs.page || 1;
   const perPage = Math.min(fargs.perPage || 25, 50);
 
-  // Fast path: indexed edge SQL (milliseconds) — only when the remote is
-  // fully bootstrapped (tursoReady), else shards. Partial data never serves.
+  // Fast path: Turso is the primary DB (milliseconds). Only when the remote
+  // is fully bootstrapped (tursoReady) do we serve from it; partial data
+  // never serves. With TURSO_REQUIRED=1 there is no shard fallback.
+  const required = tursoRequired();
   if (await tursoReady().catch(() => false)) {
     try {
-      const t = await tursoPage(fargs, page, perPage);
+      let proj = null;
+      try { proj = planProjection(mediaFieldNode, fragments); } catch { proj = null; }
+      const t = await tursoPage(fargs, page, perPage, proj);
       if (t) return pageOut(fieldNode, fragments, t.items, t.total, page, perPage);
-    } catch { /* shard fallback below */ }
+    } catch (e) {
+      if (required) throw tursoUnavailable(`Turso Page query failed: ${e.message || e}`);
+      /* shard fallback below */
+    }
+  } else if (required) {
+    throw tursoUnavailable('Turso not ready (bootstrap flag missing) and TURSO_REQUIRED=1');
   }
 
   // NOTE: Turso path above already handled everything when remote has data;
@@ -795,6 +993,32 @@ async function tursoStudio(args) {
   const r = rs.rows[0];
   if (!r) return null;
   return { __typename: 'Studio', id: r.id, name: r.name, isAnimationStudio: !!r.is_animation_studio, siteUrl: r.site_url, favourites: r.favourites, isFavourite: false };
+}
+async function tursoHealth() {
+  // Public health signal: which DB host is configured (never the token),
+  // whether it answers, whether the completion flag is set.
+  const out = { configured: false, host: null, reachable: false, flagged: false, remoteAnime: null };
+  try {
+    const raw = (typeof process !== 'undefined' && process.env?.TURSO_URL) || '';
+    if (!raw) return out;
+    out.configured = true;
+    let host = String(raw).trim();
+    for (const p of ['libsql://', 'https://', 'http://', 'wss://', 'ws://']) {
+      if (host.startsWith(p)) { host = host.slice(p.length); break; }
+    }
+    out.host = host.split('?')[0].split('/')[0] || null;
+    const c = tursoClient();
+    if (!c) return out;
+    const withTimeout = (p, ms) => Promise.race([
+      p, new Promise((_, rej) => setTimeout(() => rej(new Error('health timeout')), ms))]);
+    const rs = await withTimeout(
+      c.execute({ sql: `SELECT (SELECT COUNT(*) FROM anime) AS n, (SELECT value FROM sync_state WHERE key='bootstrap_complete') AS f`, args: [] }), 8000);
+    out.reachable = true;
+    out.remoteAnime = Number(rs.rows[0]?.n ?? -1);
+    out.flagged = rs.rows[0]?.f === '1';
+  } catch { /* stays unreachable */
+  }
+  return out;
 }
 async function tursoHasRows(table) {
   try {
@@ -902,7 +1126,12 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
           try {
             const t = await tursoMediaByArgs(args);
             if (t) return pick(t, sels, fragments);
-          } catch { /* shard fallback below */ }
+          } catch (e) {
+            if (tursoRequired()) throw tursoUnavailable(`Turso Media query failed: ${e.message || e}`);
+            /* shard fallback below */
+          }
+        } else if (tursoRequired()) {
+          throw tursoUnavailable('Turso not ready (bootstrap flag missing) and TURSO_REQUIRED=1');
         }
         if (args.id) {
           const anime = await getAnimeById(args.id);
@@ -948,8 +1177,11 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
             }
           } catch (e) {
             if (e?.status === 404) throw e;
+            if (tursoRequired()) throw tursoUnavailable(`Turso ${fname} query failed: ${e.message || e}`);
             // fall through to shard scan below
           }
+        } else if (tursoRequired()) {
+          throw tursoUnavailable('Turso not ready (bootstrap flag missing) and TURSO_REQUIRED=1');
         }
         const kind = table === 'characters' ? 'characters'
           : table === 'staff' ? 'staff' : 'studios';
@@ -966,7 +1198,12 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
           try {
             const t = await tursoAiring(args);
             if (t) return pick(t, sels, fragments);
-          } catch { /* shard fallback below */ }
+          } catch (e) {
+            if (tursoRequired()) throw tursoUnavailable(`Turso AiringSchedule query failed: ${e.message || e}`);
+            /* shard fallback below */
+          }
+        } else if (tursoRequired()) {
+          throw tursoUnavailable('Turso not ready (bootstrap flag missing) and TURSO_REQUIRED=1');
         }
         if (args.id || args.mediaId) {
           const shardStartIds = await getShardStartIds();
@@ -1002,7 +1239,12 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
               if (!sels.length) return t;
               return t.map((x) => pick(x, sels, fragments));
             }
-          } catch { /* shard fallback below */ }
+          } catch (e) {
+            if (tursoRequired()) throw tursoUnavailable(`Turso tags query failed: ${e.message || e}`);
+            /* shard fallback below */
+          }
+        } else if (tursoRequired()) {
+          throw tursoUnavailable('Turso not ready (bootstrap flag missing) and TURSO_REQUIRED=1');
         }
         const shard = await getShard(0).catch(() => []);
         const tags = new Map();
@@ -1076,6 +1318,18 @@ export default async function handler(req, res) {
   }
   if (req.method === 'GET') {
     const parsed = new URL(req.url, `https://${req.headers.host || 'localhost'}`);
+    // Ops probe: ?health=1 reports Turso reachability + row counts (one
+    // cheap indexed read). Never exposes the auth token.
+    if (parsed.searchParams.get('health') === '1') {
+      const h = await tursoHealth().catch(() => ({
+        configured: false, host: null, reachable: false, flagged: false, remoteAnime: null,
+      }));
+      return nodeJson(res, {
+        ok: h.configured && h.reachable && h.flagged,
+        tursoRequired: tursoRequired(),
+        ...h,
+      }, 200);
+    }
     const query = parsed.searchParams.get('query');
     if (!query) return nodeJson(res, INFO, 200);
     let variables = {};
