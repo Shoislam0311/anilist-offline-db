@@ -95,7 +95,11 @@ jobs:
         if: hashFiles('data/anilist.db') == ''
         run: |
           mkdir -p data
-          TAG=$(gh release view --json tagName -q .tagName)
+          TAG=$(gh release view --json tagName -q .tagName 2>/dev/null || echo "")
+          if [ -z "$TAG" ]; then
+            echo "No cache and no release: starting from empty DB (bootstrap will fill it)."
+            exit 0
+          fi
           echo "Cache missed: downloading anilist.db.gz from $TAG (~380MB)..."
           gh release download "$TAG" -p "anilist.db.gz" -O data/anilist.db.gz
           gunzip -f data/anilist.db.gz
@@ -165,11 +169,13 @@ jobs:
           else
             TAG=$(gh release view --json tagName -q .tagName 2>/dev/null || echo "")
             if [ -z "$TAG" ]; then
-              echo "::error::No release exists yet — run a full fetch first."
-              exit 1
+              # No release at all (true first run): this run becomes the bootstrap release.
+              TAG="db-$DATE"
+              echo "create=true" >> $GITHUB_OUTPUT
+            else
+              echo "create=false" >> $GITHUB_OUTPUT
             fi
             echo "tag=$TAG" >> $GITHUB_OUTPUT
-            echo "create=false" >> $GITHUB_OUTPUT
           fi
           ANIME_COUNT=$(python -c "import sys; sys.path.insert(0, 'scripts'); from db_utils import connect_db; conn = connect_db('data/anilist.db'); print(conn.execute('SELECT COUNT(*) FROM anime').fetchone()[0]); conn.close()")
           echo "anime_count=$ANIME_COUNT" >> $GITHUB_OUTPUT
