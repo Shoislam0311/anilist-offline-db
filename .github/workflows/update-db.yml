@@ -91,6 +91,19 @@ jobs:
           restore-keys: |
             anilist-db-
 
+      - name: Restore DB from release if cache missed (self-healing)
+        if: hashFiles('data/anilist.db') == ''
+        run: |
+          mkdir -p data
+          TAG=$(gh release view --json tagName -q .tagName)
+          echo "Cache missed: downloading anilist.db.gz from $TAG (~380MB)..."
+          gh release download "$TAG" -p "anilist.db.gz" -O data/anilist.db.gz
+          gunzip -f data/anilist.db.gz
+          ls -lh data/anilist.db
+          python -c "import sys; sys.path.insert(0,'scripts'); from db_utils import connect_db; print('rows:', connect_db('data/anilist.db').execute('SELECT COUNT(*) FROM anime').fetchone()[0])"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Fail-safe (never rebuild shards from a partial DB)
         run: |
           MODE="${{ steps.mode.outputs.mode }}"
@@ -114,7 +127,7 @@ jobs:
           TURSO_URL: ${{ secrets.TURSO_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: |
-          python scripts/turso_sync.py
+          python scripts/turso_sync.py --max-minutes 45
           echo "Turso sync completed at $(date -u)"
 
       - name: Generate API data (EXACT shards)

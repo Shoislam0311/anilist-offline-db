@@ -299,7 +299,14 @@ def main():
         print(f"ERROR: local DB not found at {db_path}", file=sys.stderr)
         sys.exit(1)
 
-    bootstrap = len(sys.argv) > 1 and sys.argv[1] == "--bootstrap"
+    bootstrap = "--bootstrap" in sys.argv
+    max_minutes = TIME_BUDGET_DEFAULT
+    for i, a in enumerate(sys.argv[1:]):
+        if a.startswith("--max-minutes"):
+            if "=" in a:
+                max_minutes = int(a.split("=", 1)[1])
+            elif i + 2 < len(sys.argv):
+                max_minutes = int(sys.argv[i + 2])
     rconn = connect_remote()
     created = ensure_schema(rconn)
 
@@ -307,9 +314,22 @@ def main():
     try:
         if bootstrap or created:
             ids = [r[0] for r in lconn.execute("SELECT id FROM anime ORDER BY id").fetchall()]
-            print(f"Bootstrap: pushing {len(ids)} anime + related rows...")
-            stats = sync_anime_ids(lconn, rconn, ids, with_related=True)
-            print(f"Bootstrap done: {stats}")
+            progress = load_progress(data_dir)
+            print(f"Bootstrap: pushing {len(ids)} anime + related rows "
+                  f"(budget {max_minutes} min, resume-safe)...")
+            stats = sync_anime_ids(lconn, rconn, ids, with_related=True,
+                                   data_dir=data_dir, max_minutes=max_minutes,
+                                   progress=progress)
+            if progress.get("incomplete"):
+                print(f"Bootstrap INCOMPLETE within budget: {stats} — progress saved, "
+                      f"resume continues next run. Remote stays ungated (invisible).")
+                return
+            mark_complete(rconn, len(ids))
+            try:
+                os.remove(os.path.join(data_dir, PROGRESS_FILE))
+            except OSError:
+                pass
+            print(f"Bootstrap done: {stats} — remote gated LIVE.")
             return
 
         full_ids = read_touched(data_dir, "touched_full.json")
@@ -319,11 +339,13 @@ def main():
         total_stats = {"anime": 0, "related": 0}
         if full_ids:
             print(f"Delta: {len(full_ids)} full + {len(only_counters)} counters-only...")
-            s = sync_anime_ids(lconn, rconn, full_ids, with_related=True)
+            s = sync_anime_ids(lconn, rconn, full_ids, with_related=True,
+                               data_dir=data_dir, max_minutes=max_minutes)
             total_stats["anime"] += s["anime"]
             total_stats["related"] += s["related"]
         if only_counters:
-            s = sync_anime_ids(lconn, rconn, only_counters, with_related=False)
+            s = sync_anime_ids(lconn, rconn, only_counters, with_related=False,
+                               data_dir=data_dir, max_minutes=max_minutes)
             total_stats["anime"] += s["anime"]
         print(f"Delta done: {total_stats} (monthly write budget: 10M rows)")
     finally:
