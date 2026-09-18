@@ -25,8 +25,12 @@ import json
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-CHUNK = 500
-BATCH = 200
+CHUNK = 2000       # ids per scoped pass (small rows: few round trips)
+BATCH = 1000       # rows per executemany for small tables
+ANIME_BATCH = 25   # full raw_json rows (~330KB each): keep HTTP bodies ~8MB
+TIME_BUDGET_DEFAULT = 100  # minutes; stop gracefully, resume next run
+
+PROGRESS_FILE = "turso_sync_progress.json"
 
 # association/detail tables keyed by anime_id (delete scoped rows, re-insert)
 SCOPED_TABLES = [
@@ -90,14 +94,14 @@ def remote_has_table(rconn, table):
         (table,)).fetchall())
 
 
-def replace_rows(rconn, table, cols, rows):
+def replace_rows(rconn, table, cols, rows, batch_size=BATCH):
     if not rows:
         return 0
     placeholders = ", ".join(["?"] * len(cols))
     colnames = ", ".join([f'"{c}"' for c in cols])
     sql = f'INSERT OR REPLACE INTO "{table}" ({colnames}) VALUES ({placeholders})'
-    for i in range(0, len(rows), BATCH):
-        rconn.executemany(sql, rows[i:i + BATCH])
+    for i in range(0, len(rows), batch_size):
+        rconn.executemany(sql, rows[i:i + batch_size])
     rconn.commit()
     return len(rows)
 
@@ -116,13 +120,13 @@ def delete_scoped(rconn, table, ids):
     rconn.commit()
 
 
-def copy_where(lconn, rconn, table, where, params):
+def copy_where(lconn, rconn, table, where, params, batch_size=BATCH):
     cols = local_columns(lconn, table)
     if not cols or not remote_has_table(rconn, table):
         return 0
     colnames = ", ".join([f'"{c}"' for c in cols])
     rows = lconn.execute(f"SELECT {colnames} FROM {table} WHERE {where}", _t(params)).fetchall()
-    return replace_rows(rconn, table, cols, [tuple(r) for r in rows])
+    return replace_rows(rconn, table, cols, [tuple(r) for r in rows], batch_size=batch_size)
 
 
 def _chunks(ids, n=CHUNK):
@@ -169,20 +173,84 @@ def _sync_shared_for_chunk(lconn, rconn, chunk):
     return count
 
 
-def sync_anime_ids(lconn, rconn, ids, with_related: bool):
+def _deadline_ok(started_at, max_minutes):
+    import time
+    return (time.monotonic() - started_at) < max_minutes * 60
+
+
+def load_progress(data_dir):
+    import json as _json
+    path = os.path.join(data_dir, PROGRESS_FILE)
+    try:
+        with open(path) as f:
+            return _json.load(f)
+    except Exception:
+        return {}
+
+
+def save_progress(data_dir, progress):
+    import json as _json
+    try:
+        with open(os.path.join(data_dir, PROGRESS_FILE), "w") as f:
+            _json.dump(progress, f)
+    except Exception:
+        pass
+
+
+def mark_complete(rconn, total_anime):
+    rconn.execute(
+        "CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    rconn.execute(
+        "INSERT OR REPLACE INTO sync_state (key, value) VALUES ('bootstrap_complete', '1')")
+    rconn.execute(
+        "INSERT OR REPLACE INTO sync_state (key, value) VALUES ('total_anime', ?)",
+        (str(total_anime),))
+    try:
+        from datetime import datetime, timezone
+        rconn.execute(
+            "INSERT OR REPLACE INTO sync_state (key, value) VALUES ('completed_at', ?)",
+            (datetime.now(timezone.utc).isoformat(),))
+    except Exception:
+        pass
+    rconn.commit()
+
+
+def sync_anime_ids(lconn, rconn, ids, with_related: bool,
+                   data_dir=None, max_minutes=None, progress=None):
+    import time
     stats = {"anime": 0, "related": 0}
     chunks = _chunks(ids)
     if not chunks:
         return stats
+    started_at = time.monotonic()
+    progress = progress or {}
+    done_chunks = set(progress.get("related_done", []))
     # Pass 1: anime rows for ALL chunks (relations FK-reference other anime,
     # which may live in a later chunk — especially on bootstrap).
-    for chunk in chunks:
+    # Tiered batches: full raw_json rows go 25/call (~8MB bodies).
+    anime_done = progress.get("anime_done", 0)
+    for n, chunk in enumerate(chunks):
+        if n < anime_done:
+            continue
         q = ", ".join(["?"] * len(chunk))
-        stats["anime"] += copy_where(lconn, rconn, "anime", f"id IN ({q})", chunk)
+        stats["anime"] += copy_where(lconn, rconn, "anime", f"id IN ({q})", chunk,
+                                     batch_size=ANIME_BATCH)
+        progress["anime_done"] = n + 1
+        if data_dir and n % 4 == 0:
+            save_progress(data_dir, progress)
+        if max_minutes and not _deadline_ok(started_at, max_minutes):
+            if data_dir:
+                save_progress(data_dir, progress)
+            progress["incomplete"] = True
+            return stats
+    if data_dir:
+        save_progress(data_dir, progress)
     if not with_related:
         return stats
     # Pass 2: shared entities, then scoped detail rows per chunk.
-    for chunk in chunks:
+    for n, chunk in enumerate(chunks):
+        if n in done_chunks:
+            continue
         q = ", ".join(["?"] * len(chunk))
         stats["related"] += _sync_shared_for_chunk(lconn, rconn, chunk)
         for table in SCOPED_TABLES:
@@ -196,6 +264,18 @@ def sync_anime_ids(lconn, rconn, ids, with_related: bool):
             rows = lconn.execute(
                 f"SELECT {colnames} FROM {table} WHERE anime_id IN ({q})", _t(chunk)).fetchall()
             stats["related"] += replace_rows(rconn, table, cols, [tuple(r) for r in rows])
+        done_chunks.add(n)
+        progress["related_done"] = sorted(done_chunks)
+        if data_dir:
+            save_progress(data_dir, progress)
+        if max_minutes and not _deadline_ok(started_at, max_minutes):
+            progress["incomplete"] = True
+            if data_dir:
+                save_progress(data_dir, progress)
+            return stats
+    progress.pop("incomplete", None)
+    if data_dir:
+        save_progress(data_dir, progress)
     return stats
 
 

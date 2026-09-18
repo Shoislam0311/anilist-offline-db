@@ -87,6 +87,7 @@ jobs:
           path: |
             data/anilist.db
             data/.checkpoint.json
+            data/turso_sync_progress.json
           key: anilist-db-${{ steps.mode.outputs.mode }}-${{ github.run_id }}
           restore-keys: |
             anilist-db-
@@ -257,6 +258,7 @@ jobs:
           path: |
             data/anilist.db
             data/.checkpoint.json
+            data/turso_sync_progress.json
           key: anilist-db-${{ steps.mode.outputs.mode }}-${{ github.run_id }}
 
   deploy-pages:

@@ -341,6 +341,8 @@ function matchMedia(e, full, a) {
   if (a.id_not_in && a.id_not_in.includes(e.id)) return false;
   if (a.idMal !== undefined && e.idMal !== a.idMal) return false;
   if (a.idMal_in && !a.idMal_in.includes(e.idMal)) return false;
+  if (a.idMal_not !== undefined && e.idMal === a.idMal_not) return false;
+  if (a.idMal_not_in && a.idMal_not_in.includes(e.idMal)) return false;
   if (a.search && searchScore(e, a.search) < 0) return false;
   if (a.genre && !(e.genres || []).includes(a.genre)) return false;
   if (a.genre_in && !a.genre_in.some((x) => (e.genres || []).includes(x))) return false;
@@ -360,6 +362,8 @@ function matchMedia(e, full, a) {
   if (a.seasonYear !== undefined && e.year !== a.seasonYear) return false;
   if (a.source_in && !a.source_in.includes(e.source)) return false;
   if (a.countryOfOrigin && e.country !== a.countryOfOrigin) return false;
+  if (a.countryOfOrigin_in && !a.countryOfOrigin_in.includes(e.country)) return false;
+  if (a.countryOfOrigin_not_in && a.countryOfOrigin_not_in.includes(e.country)) return false;
   if (a.isAdult !== undefined && e.adult !== a.isAdult) return false;
   if (a.episodes_greater !== undefined && !((e.episodes ?? -1) > a.episodes_greater)) return false;
   if (a.episodes_lesser !== undefined && !((e.episodes ?? 1e9) < a.episodes_lesser)) return false;
@@ -383,13 +387,28 @@ function matchMedia(e, full, a) {
   if (a.endDate_greater !== undefined && !((e.endDate ?? -1) > a.endDate_greater)) return false;
   if (a.endDate_lesser !== undefined && !((e.endDate ?? 1e9) < a.endDate_lesser)) return false;
   if (a.endDate_like !== undefined && String(e.endDate ?? '') !== String(a.endDate_like)) return false;
-  // tag category / minimumTagRank need full object (post-filter below)
-  if (full && (a.tagCategory_in || a.tagCategory_not_in || a.minimumTagRank !== undefined)) {
+  // tag category / minimumTagRank / licensed / exact-date need full object (post-filter below)
+  if (full && (a.tagCategory || a.tagCategory_in || a.tagCategory_not_in || a.minimumTagRank !== undefined)) {
     const tags = full.tags || [];
+    if (a.tagCategory && !tags.some((t) => t.category === a.tagCategory)) return false;
     if (a.tagCategory_in && !tags.some((t) => a.tagCategory_in.includes(t.category))) return false;
     if (a.tagCategory_not_in && tags.some((t) => a.tagCategory_not_in.includes(t.category))) return false;
     if (a.minimumTagRank !== undefined && !tags.some((t) => (t.rank ?? 0) >= a.minimumTagRank)) return false;
   }
+  if (full && a.isLicensed !== undefined && a.isLicensed !== null) {
+    const lic = !!full.isLicensed;
+    if (lic !== !!a.isLicensed) return false;
+  }
+  const dateObjMatch = (fuzzyInt, obj) => {
+    if (fuzzyInt == null) return false;
+    const y = Math.floor(fuzzyInt / 10000), m = Math.floor((fuzzyInt % 10000) / 100), d = fuzzyInt % 100;
+    if (obj.year !== undefined && obj.year !== null && y !== obj.year) return false;
+    if (obj.month !== undefined && obj.month !== null && m !== obj.month) return false;
+    if (obj.day !== undefined && obj.day !== null && d !== obj.day) return false;
+    return true;
+  };
+  if (a.startDate && !dateObjMatch(e.startDate, a.startDate)) return false;
+  if (a.endDate && !dateObjMatch(e.endDate, a.endDate)) return false;
   void g;
   return true;
 }
@@ -541,6 +560,8 @@ function tursoWhere(fargs) {
   if (a.id_not_in) { where.push(`a.id NOT IN (${a.id_not_in.map(() => '?').join(',')})`); args.push(...a.id_not_in); }
   if (a.idMal !== undefined) { where.push('a.id_mal = ?'); args.push(a.idMal); }
   if (a.idMal_in) { where.push(`a.id_mal IN (${a.idMal_in.map(() => '?').join(',')})`); args.push(...a.idMal_in); }
+  if (a.idMal_not !== undefined) { where.push('(a.id_mal IS NULL OR a.id_mal != ?)'); args.push(a.idMal_not); }
+  if (a.idMal_not_in) { where.push(`(a.id_mal IS NULL OR a.id_mal NOT IN (${a.idMal_not_in.map(() => '?').join(',')}))`); args.push(...a.idMal_not_in); }
   if (a.search) tursoSearchWhere(a.search, where, args);
   if (a.genre) { where.push(`EXISTS (SELECT 1 FROM anime_genres ag JOIN genres g ON g.id = ag.genre_id WHERE ag.anime_id = a.id AND g.name = ?)`); args.push(a.genre); }
   if (a.genre_in) { where.push(`EXISTS (SELECT 1 FROM anime_genres ag JOIN genres g ON g.id = ag.genre_id WHERE ag.anime_id = a.id AND g.name IN (${a.genre_in.map(() => '?').join(',')}))`); args.push(...a.genre_in); }
@@ -549,6 +570,7 @@ function tursoWhere(fargs) {
   if (a.tag_in) { where.push(`EXISTS (SELECT 1 FROM anime_tags at WHERE at.anime_id = a.id AND at.tag_name IN (${a.tag_in.map(() => '?').join(',')}))`); args.push(...a.tag_in); }
   if (a.tag_not_in) { where.push(`NOT EXISTS (SELECT 1 FROM anime_tags at WHERE at.anime_id = a.id AND at.tag_name IN (${a.tag_not_in.map(() => '?').join(',')}))`); args.push(...a.tag_not_in); }
   if (a.tagCategory_in) { where.push(`EXISTS (SELECT 1 FROM anime_tags at JOIN tags t ON t.name = at.tag_name WHERE at.anime_id = a.id AND t.category IN (${a.tagCategory_in.map(() => '?').join(',')}))`); args.push(...a.tagCategory_in); }
+  if (a.tagCategory) { where.push(`EXISTS (SELECT 1 FROM anime_tags at JOIN tags t ON t.name = at.tag_name WHERE at.anime_id = a.id AND t.category = ?)`); args.push(a.tagCategory); }
   if (a.tagCategory_not_in) { where.push(`NOT EXISTS (SELECT 1 FROM anime_tags at JOIN tags t ON t.name = at.tag_name WHERE at.anime_id = a.id AND t.category IN (${a.tagCategory_not_in.map(() => '?').join(',')}))`); args.push(...a.tagCategory_not_in); }
   if (a.minimumTagRank !== undefined) { where.push(`EXISTS (SELECT 1 FROM anime_tags at WHERE at.anime_id = a.id AND at.tag_rank >= ?)`); args.push(a.minimumTagRank); }
   if (a.format) { where.push('a.format = ?'); args.push(a.format); }
@@ -563,6 +585,9 @@ function tursoWhere(fargs) {
   if (a.seasonYear !== undefined) { where.push('a.season_year = ?'); args.push(a.seasonYear); }
   if (a.source_in) { where.push(`a.source IN (${a.source_in.map(() => '?').join(',')})`); args.push(...a.source_in); }
   if (a.countryOfOrigin) { where.push('a.country_of_origin = ?'); args.push(a.countryOfOrigin); }
+  if (a.countryOfOrigin_in) { where.push(`a.country_of_origin IN (${a.countryOfOrigin_in.map(() => '?').join(',')})`); args.push(...a.countryOfOrigin_in); }
+  if (a.countryOfOrigin_not_in) { where.push(`(a.country_of_origin IS NULL OR a.country_of_origin NOT IN (${a.countryOfOrigin_not_in.map(() => '?').join(',')}))`); args.push(...a.countryOfOrigin_not_in); }
+  if (a.isLicensed !== undefined && a.isLicensed !== null) { where.push('a.is_licensed = ?'); args.push(a.isLicensed ? 1 : 0); }
   if (a.isAdult !== undefined) { where.push('a.is_adult = ?'); args.push(a.isAdult ? 1 : 0); }
   numFilter('a.episodes', a.episodes_greater, '>', where, args);
   numFilter('a.episodes', a.episodes_lesser, '<', where, args);
@@ -588,6 +613,14 @@ function tursoWhere(fargs) {
   };
   fuzzy('start', 'startDate');
   fuzzy('end', 'endDate');
+  const dateObj = (prefix, obj) => {
+    if (!obj || typeof obj !== 'object') return;
+    if (obj.year !== undefined && obj.year !== null) { where.push(`a.${prefix}_year = ?`); args.push(obj.year); }
+    if (obj.month !== undefined && obj.month !== null) { where.push(`a.${prefix}_month = ?`); args.push(obj.month); }
+    if (obj.day !== undefined && obj.day !== null) { where.push(`a.${prefix}_day = ?`); args.push(obj.day); }
+  };
+  dateObj('start', a.startDate);
+  dateObj('end', a.endDate);
   return { where, args };
 }
 async function tursoPage(fargs, page, perPage) {
@@ -665,14 +698,20 @@ async function resolvePage(fieldNode, fragments, variables, pageArgs) {
   const page = fargs.page || 1;
   const perPage = Math.min(fargs.perPage || 25, 50);
 
-  // Fast path: indexed edge SQL (milliseconds). Falls back to shards on any error.
-  try {
-    const t = await tursoPage(fargs, page, perPage);
-    if (t) return pageOut(fieldNode, fragments, t.items, t.total, page, perPage);
-  } catch { /* shard fallback below */ }
+  // Fast path: indexed edge SQL (milliseconds) — only when the remote is
+  // fully bootstrapped (tursoReady), else shards. Partial data never serves.
+  if (await tursoReady().catch(() => false)) {
+    try {
+      const t = await tursoPage(fargs, page, perPage);
+      if (t) return pageOut(fieldNode, fragments, t.items, t.total, page, perPage);
+    } catch { /* shard fallback below */ }
+  }
 
-  const needFull = fargs.sort || fargs.tagCategory_in || fargs.tagCategory_not_in
-    || fargs.minimumTagRank !== undefined;
+  // NOTE: Turso path above already handled everything when remote has data;
+  // this shard fallback only runs pre-bootstrap or on Turso errors.
+  const needFull = fargs.sort || fargs.tagCategory || fargs.tagCategory_in || fargs.tagCategory_not_in
+    || fargs.minimumTagRank !== undefined || fargs.isLicensed !== undefined
+    || fargs.startDate || fargs.endDate;
   let ids = index.filter((e) => matchMedia(e, null, fargs)).map((e) => e.id);
 
   let full = [];
@@ -777,6 +816,28 @@ async function tursoAiring(args) {
   const now = Math.floor(Date.now() / 1000);
   return { __typename: 'AiringSchedule', id: r.id, episode: r.episode, airingAt: r.airing_at, timeUntilAiring: Math.max(0, (r.airing_at || 0) - now), mediaId: r.media_id || r.anime_id };
 }
+let tursoReadyCache = null;
+async function tursoReady() {
+  // Partial remote must NEVER serve as complete: the sync writes
+  // sync_state.bootstrap_complete only at the very end.
+  if (tursoReadyCache && Date.now() - tursoReadyCache.time < CACHE_TTL_MS) return tursoReadyCache.ok;
+  let ok = false;
+  try {
+    const c = tursoClient();
+    if (c) {
+      const rs = await c.execute({ sql: `SELECT value FROM sync_state WHERE key = 'bootstrap_complete'`, args: [] });
+      ok = rs.rows[0]?.value === '1';
+    }
+  } catch { ok = false; }
+  tursoReadyCache = { ok, time: Date.now() };
+  return ok;
+}
+async function tursoTry(fn) {
+  try {
+    if (!(await tursoReady())) return null;
+    return await fn();
+  } catch { return null; }
+}
 async function tursoTags() {
   const c = tursoClient();
   if (!c) return null;
@@ -837,10 +898,12 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
       case 'Page':
         return resolvePage(fieldNode, fragments, variables, args);
       case 'Media': {
-        try {
-          const t = await tursoMediaByArgs(args);
-          if (t) return pick(t, sels, fragments);
-        } catch { /* shard fallback below */ }
+        if (await tursoReady().catch(() => false)) {
+          try {
+            const t = await tursoMediaByArgs(args);
+            if (t) return pick(t, sels, fragments);
+          } catch { /* shard fallback below */ }
+        }
         if (args.id) {
           const anime = await getAnimeById(args.id);
           if (!anime || (args.type && args.type !== 'ANIME')) {
@@ -874,18 +937,19 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
       case 'Studio': {
         const fname = fieldNode.name.value;
         const table = fname === 'Character' ? 'characters' : fname === 'Staff' ? 'staff' : 'studios';
-        try {
-          const t = table === 'characters' ? await tursoCharacter(args)
-            : table === 'staff' ? await tursoStaff(args) : await tursoStudio(args);
-          if (t) return pick(t, sels, fragments);
-          // Turso miss: 404 only when the remote table actually holds data;
-          // otherwise (not bootstrapped yet) fall through to shard scan.
-          if ((args.id || args.search) && await tursoHasRows(table)) {
-            throw Object.assign(new Error(`${fname} not found`), { status: 404 });
+        if (await tursoReady().catch(() => false)) {
+          try {
+            const t = table === 'characters' ? await tursoCharacter(args)
+              : table === 'staff' ? await tursoStaff(args) : await tursoStudio(args);
+            if (t) return pick(t, sels, fragments);
+            // Authoritative miss only when the remote table holds data.
+            if ((args.id || args.search) && await tursoHasRows(table)) {
+              throw Object.assign(new Error(`${fname} not found`), { status: 404 });
+            }
+          } catch (e) {
+            if (e?.status === 404) throw e;
+            // fall through to shard scan below
           }
-        } catch (e) {
-          if (e?.status === 404) throw e;
-          // fall through to shard scan below
         }
         const kind = table === 'characters' ? 'characters'
           : table === 'staff' ? 'staff' : 'studios';
@@ -898,10 +962,12 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
         return pick(list[0] || null, sels, fragments);
       }
       case 'AiringSchedule': {
-        try {
-          const t = await tursoAiring(args);
-          if (t) return pick(t, sels, fragments);
-        } catch { /* shard fallback below */ }
+        if (await tursoReady().catch(() => false)) {
+          try {
+            const t = await tursoAiring(args);
+            if (t) return pick(t, sels, fragments);
+          } catch { /* shard fallback below */ }
+        }
         if (args.id || args.mediaId) {
           const shardStartIds = await getShardStartIds();
           for (let i = 0; i < Math.min(shardStartIds.length, 8); i++) {
@@ -929,13 +995,15 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
         return (await getMetadata().catch(() => null))?.genres || [];
       }
       case 'MediaTagCollection': {
-        try {
-          const t = await tursoTags();
-          if (t?.length) {
-            if (!sels.length) return t;
-            return t.map((x) => pick(x, sels, fragments));
-          }
-        } catch { /* shard fallback below */ }
+        if (await tursoReady().catch(() => false)) {
+          try {
+            const t = await tursoTags();
+            if (t?.length) {
+              if (!sels.length) return t;
+              return t.map((x) => pick(x, sels, fragments));
+            }
+          } catch { /* shard fallback below */ }
+        }
         const shard = await getShard(0).catch(() => []);
         const tags = new Map();
         for (const a of shard.slice(0, 50)) {

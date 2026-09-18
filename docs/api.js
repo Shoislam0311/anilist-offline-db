@@ -341,6 +341,8 @@ function matchExact(e, full, a) {
   if (a.id_not !== undefined && e.id === a.id_not) return false;
   if (a.id_not_in && a.id_not_in.includes(e.id)) return false;
   if (a.idMal !== undefined && e.idMal !== a.idMal) return false;
+  if (a.idMal_not !== undefined && e.idMal === a.idMal_not) return false;
+  if (a.idMal_not_in && a.idMal_not_in.includes(e.idMal)) return false;
   if (a.search && searchScore(e, a.search) < 0) return false;
   if (a.genre && !(e.genres || []).includes(a.genre)) return false;
   if (a.genre_in && !a.genre_in.some((x) => (e.genres || []).includes(x))) return false;
@@ -356,16 +358,32 @@ function matchExact(e, full, a) {
   if (a.seasonYear !== undefined && e.year !== a.seasonYear) return false;
   if (a.source_in && !a.source_in.includes(e.source)) return false;
   if (a.countryOfOrigin && e.country !== a.countryOfOrigin) return false;
+  if (a.countryOfOrigin_in && !a.countryOfOrigin_in.includes(e.country)) return false;
+  if (a.countryOfOrigin_not_in && a.countryOfOrigin_not_in.includes(e.country)) return false;
   if (a.isAdult !== undefined && e.adult !== a.isAdult) return false;
   if (a.averageScore_greater !== undefined && !((e.score ?? -1) > a.averageScore_greater)) return false;
   if (a.averageScore_lesser !== undefined && !((e.score ?? 1e9) < a.averageScore_lesser)) return false;
   if (a.popularity_greater !== undefined && !((e.popularity ?? -1) > a.popularity_greater)) return false;
   if (a.popularity_lesser !== undefined && !((e.popularity ?? 1e9) < a.popularity_lesser)) return false;
-  if (full && (a.tagCategory_in || a.minimumTagRank !== undefined)) {
+  if (full && (a.tagCategory || a.tagCategory_in || a.minimumTagRank !== undefined)) {
     const tags = full.tags || [];
+    if (a.tagCategory && !tags.some((t) => t.category === a.tagCategory)) return false;
     if (a.tagCategory_in && !tags.some((t) => a.tagCategory_in.includes(t.category))) return false;
     if (a.minimumTagRank !== undefined && !tags.some((t) => (t.rank ?? 0) >= a.minimumTagRank)) return false;
   }
+  if (full && a.isLicensed !== undefined && a.isLicensed !== null) {
+    if (!!full.isLicensed !== !!a.isLicensed) return false;
+  }
+  const dateObjMatch = (fuzzyInt, obj) => {
+    if (fuzzyInt == null) return false;
+    const y = Math.floor(fuzzyInt / 10000), m = Math.floor((fuzzyInt % 10000) / 100), d = fuzzyInt % 100;
+    if (obj.year !== undefined && obj.year !== null && y !== obj.year) return false;
+    if (obj.month !== undefined && obj.month !== null && m !== obj.month) return false;
+    if (obj.day !== undefined && obj.day !== null && d !== obj.day) return false;
+    return true;
+  };
+  if (a.startDate && !dateObjMatch(e.startDate, a.startDate)) return false;
+  if (a.endDate && !dateObjMatch(e.endDate, a.endDate)) return false;
   return true;
 }
 function sortVal(m, f) {
