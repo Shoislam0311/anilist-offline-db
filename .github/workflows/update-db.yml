@@ -166,19 +166,13 @@ jobs:
         run: |
           MODE="${{ steps.mode.outputs.mode }}"
           DATE=$(date -u +'%Y-%m-%d')
-          if [ "$MODE" = "full" ]; then
-            echo "tag=db-$DATE" >> $GITHUB_OUTPUT
-            echo "create=true" >> $GITHUB_OUTPUT
+          # Every date gets its own checkpoint release: first run of the day
+          # creates db-<date>, later runs that day clobber-update it.
+          echo "tag=db-$DATE" >> $GITHUB_OUTPUT
+          if gh release view "db-$DATE" --json tagName -q .tagName >/dev/null 2>&1; then
+            echo "create=false" >> $GITHUB_OUTPUT
           else
-            TAG=$(gh release view --json tagName -q .tagName 2>/dev/null || echo "")
-            if [ -z "$TAG" ]; then
-              # No release at all (true first run): this run becomes the bootstrap release.
-              TAG="db-$DATE"
-              echo "create=true" >> $GITHUB_OUTPUT
-            else
-              echo "create=false" >> $GITHUB_OUTPUT
-            fi
-            echo "tag=$TAG" >> $GITHUB_OUTPUT
+            echo "create=true" >> $GITHUB_OUTPUT
           fi
           ANIME_COUNT=$(python -c "import sys; sys.path.insert(0, 'scripts'); from db_utils import connect_db; conn = connect_db('data/anilist.db'); print(conn.execute('SELECT COUNT(*) FROM anime').fetchone()[0]); conn.close()")
           echo "anime_count=$ANIME_COUNT" >> $GITHUB_OUTPUT
