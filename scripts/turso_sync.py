@@ -70,18 +70,30 @@ def connect_remote():
 
 
 def ensure_schema(rconn):
-    from db_utils import DB_SCHEMA
+    from db_utils import DB_SCHEMA, SCOPED_INDEXES
     existing = {r[0] for r in rconn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    if "anime" in existing:
-        return False
-    print("Remote empty: creating schema...")
-    for stmt in DB_SCHEMA.split(";"):
-        stmt = stmt.strip()
-        if stmt:
-            rconn.execute(stmt)
-    rconn.commit()
-    return True
+    created = False
+    if "anime" not in existing:
+        print("Remote empty: creating schema...")
+        for stmt in DB_SCHEMA.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                rconn.execute(stmt)
+        rconn.commit()
+        created = True
+    # Always: scoped DELETE/SELECT by anime_id must be indexed, or each one
+    # full-scans hundred-thousand-row tables (slow sync + phantom row reads).
+    for idx_sql in SCOPED_INDEXES:
+        try:
+            rconn.execute(idx_sql)
+        except Exception:
+            pass
+    try:
+        rconn.commit()
+    except Exception:
+        pass
+    return created
 
 
 def local_columns(lconn, table):

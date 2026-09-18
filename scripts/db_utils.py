@@ -380,7 +380,24 @@ CREATE INDEX IF NOT EXISTS idx_relations_related ON relations(related_anime_id);
 CREATE INDEX IF NOT EXISTS idx_recommendations_anime ON recommendations(anime_id);
 CREATE INDEX IF NOT EXISTS idx_airing_schedule_anime ON airing_schedule(anime_id);
 CREATE INDEX IF NOT EXISTS idx_airing_schedule_airing ON airing_schedule(airing_at);
+CREATE INDEX IF NOT EXISTS idx_cva_anime ON character_voice_actors(anime_id);
+CREATE INDEX IF NOT EXISTS idx_external_links_anime ON external_links(anime_id);
+CREATE INDEX IF NOT EXISTS idx_streaming_anime ON streaming_episodes(anime_id);
+CREATE INDEX IF NOT EXISTS idx_rankings_anime ON rankings(anime_id);
+CREATE INDEX IF NOT EXISTS idx_trends_anime ON trends(anime_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_anime ON reviews(anime_id);
 """
+
+# Indexes the Turso sync (and any existing DB) must have for scoped
+# DELETE/SELECT by anime_id. Shared with _migrate and turso_sync.
+SCOPED_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_cva_anime ON character_voice_actors(anime_id)",
+    "CREATE INDEX IF NOT EXISTS idx_external_links_anime ON external_links(anime_id)",
+    "CREATE INDEX IF NOT EXISTS idx_streaming_anime ON streaming_episodes(anime_id)",
+    "CREATE INDEX IF NOT EXISTS idx_rankings_anime ON rankings(anime_id)",
+    "CREATE INDEX IF NOT EXISTS idx_trends_anime ON trends(anime_id)",
+    "CREATE INDEX IF NOT EXISTS idx_reviews_anime ON reviews(anime_id)",
+]
 
 FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS anime_fts USING fts5(
@@ -523,6 +540,14 @@ CREATE TABLE IF NOT EXISTS reviews (
         ("tags", "is_adult", "INTEGER DEFAULT 0"),
     ]:
         add_col(t, c, ddl)
+    # Scoped-sync indexes: every DELETE/SELECT keyed by anime_id must hit an
+    # index, or each one full-scans hundred-thousand-row tables (slow sync +
+    # phantom row reads on metered remotes).
+    for idx_sql in SCOPED_INDEXES:
+        try:
+            conn.execute(idx_sql)
+        except Exception:
+            pass
     try:
         conn.commit()
     except Exception:
