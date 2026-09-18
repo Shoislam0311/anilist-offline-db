@@ -6,7 +6,7 @@ A complete offline database of AniList's anime catalog, built from their public 
 
 | Endpoint | URL |
 |----------|-----|
-| **GraphQL API (Vercel)** | `https://graphql.aniraku.tech/ |
+| **GraphQL API (Vercel)** | `https://graphql.aniraku.tech/` |
 | **Web UI + Playground (Pages)** | `https://shoislam0311.github.io/anilist-offline-db/` |
 | **Raw JSON data** | `https://shoislam0311.github.io/anilist-offline-db/api/` |
 | **Repository** | `https://github.com/Shoislam0311/anilist-offline-db` |
@@ -269,7 +269,9 @@ export                   Export filtered data to JSON
 
 ```
 anilist-offline-db/
-├── .github/workflows/update-db.yml    # Daily/weekly/monthly GitHub Action
+├── .github/workflows/
+├── update-db.yml                       #Daily Workflow Run for Daily Upgrades
+├── pages.yaml                          #For Github pages you know!
 ├── api/
 │   └── index.js                        # Vercel serverless GraphQL handler
 ├── vercel.json                         # Vercel rewrites + CORS headers
@@ -286,16 +288,12 @@ anilist-offline-db/
 │       ├── metadata.json
 │       ├── search_index.json
 │       ├── sample.json
-│       └── shards/
-│           ├── shard_0000.json
-│           ├── shard_0001.json
-│           └── ...
-├── data/
-│   ├── anilist.db                      # SQLite database
-│   ├── anilist.json                    # JSON export
-│   └── changelog.md                    # Update changelog
+|       ├── .nojekyll
 ├── requirements.txt
 ├── .gitignore
+├── package-lock.json
+├── package.json
+├── vercel.json                         # Vercel Configuration
 ├── LICENSE                             # Apache-2.0
 └── README.md
 ```
@@ -306,7 +304,7 @@ anilist-offline-db/
 3. Make your changes
 4. Submit a pull request
 
-## License
+## [License](./LICENSE)
 
 Apache-2.0 - See [LICENSE](LICENSE)
 
