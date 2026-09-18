@@ -112,10 +112,26 @@ def replace_rows(rconn, table, cols, rows, batch_size=BATCH):
     placeholders = ", ".join(["?"] * len(cols))
     colnames = ", ".join([f'"{c}"' for c in cols])
     sql = f'INSERT OR REPLACE INTO "{table}" ({colnames}) VALUES ({placeholders})'
+    done = 0
     for i in range(0, len(rows), batch_size):
-        rconn.executemany(sql, rows[i:i + batch_size])
+        batch = rows[i:i + batch_size]
+        try:
+            rconn.executemany(sql, batch)
+            done += len(batch)
+        except Exception as e:
+            # Batch abort (e.g. FK on a dangling ref): fall back to row-by-row,
+            # skipping only the poison rows. Re-inserted rows REPLACE identically.
+            skipped = 0
+            for row in batch:
+                try:
+                    rconn.execute(sql, _t(list(row)))
+                    done += 1
+                except Exception:
+                    skipped += 1
+            print(f"  {table}: batch aborted ({str(e)[:100]}); "
+                  f"row-level fallback saved {done} total, skipped {skipped}")
     rconn.commit()
-    return len(rows)
+    return done
 
 
 def _t(params):
