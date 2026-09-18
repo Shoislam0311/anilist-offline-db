@@ -501,8 +501,8 @@ let turso;
 function tursoClient() {
   if (turso !== undefined) return turso;
   try {
-    const url = (typeof process !== 'undefined' && process.env?.TURSO_URL) || '';
-    const token = (typeof process !== 'undefined' && process.env?.TURSO_AUTH_TOKEN) || '';
+    const url = ((typeof process !== 'undefined' && process.env?.TURSO_URL) || '').trim();
+    const token = ((typeof process !== 'undefined' && process.env?.TURSO_AUTH_TOKEN) || '').trim();
     turso = (url && token) ? createClient({ url, authToken: token }) : null;
   } catch { turso = null; }
   return turso;

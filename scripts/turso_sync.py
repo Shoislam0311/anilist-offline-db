@@ -45,8 +45,8 @@ SKIP_TABLES = {"anime_fts", "characters_fts", "sqlite_sequence"}
 
 
 def connect_remote():
-    url = os.environ.get("TURSO_URL", "")
-    token = os.environ.get("TURSO_AUTH_TOKEN", "")
+    url = (os.environ.get("TURSO_URL", "") or "").strip()
+    token = (os.environ.get("TURSO_AUTH_TOKEN", "") or "").strip()
     # file: URLs run token-free (local tests, no remote touched)
     if url.startswith("file:") or url.endswith(".db"):
         if not url:
@@ -272,8 +272,8 @@ def _with_retry(fn, tries=4):
 
 def _open_remote():
     import libsql_experimental as libsql
-    url = os.environ.get("TURSO_URL", "")
-    token = os.environ.get("TURSO_AUTH_TOKEN", "")
+    url = (os.environ.get("TURSO_URL", "") or "").strip()
+    token = (os.environ.get("TURSO_AUTH_TOKEN", "") or "").strip()
     if url.startswith("file:") or url.endswith(".db"):
         return libsql.connect(database=url)
     return libsql.connect(database=url, auth_token=token)

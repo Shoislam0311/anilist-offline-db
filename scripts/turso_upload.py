@@ -31,8 +31,10 @@ MIN_ANIME_ROWS = 10000
 
 
 def _env():
-    url = os.environ.get("TURSO_URL", "")
-    token = os.environ.get("TURSO_AUTH_TOKEN", "")
+    url = (os.environ.get("TURSO_URL", "") or "").strip()
+    # Pasted secrets often carry a trailing newline/space, which requests
+    # rejects with InvalidHeader. The token itself is unaffected by stripping.
+    token = (os.environ.get("TURSO_AUTH_TOKEN", "") or "").strip()
     if not url or not token:
         print("ERROR: TURSO_URL / TURSO_AUTH_TOKEN not set", file=sys.stderr)
         sys.exit(2)
