@@ -79,7 +79,6 @@ jobs:
               echo "mode=daily" >> $GITHUB_OUTPUT
             fi
           fi
-          fi
 
       - name: Restore database cache (runners are ephemeral)
         uses: actions/cache/restore@v4
