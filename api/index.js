@@ -1,12 +1,30 @@
 import { parse, Kind } from 'graphql';
 import { gunzipSync } from 'node:zlib';
 import { createClient } from '@libsql/client';
-// Deploy-time snapshot of the small files (search_index ~4MB, metadata tiny).
-// Bundled into the function -> hot path needs ZERO network for index/metadata,
-// and can never serve a stale CDN copy. Refreshed on every data deploy.
-// If the bundler ever drops them, the fetch fallback below takes over.
-import bundledIndex from '../docs/api/search_index.json' with { type: 'json' };
-import bundledMeta from '../docs/api/metadata.json' with { type: 'json' };
+// Deploy-time snapshot of the small files (search_index ~12MB, metadata tiny).
+// LAZY-loaded: the Turso hot path never touches them, so cold starts must NOT
+// pay a 12MB JSON parse. Only the shard fallback (Turso down / not required)
+// triggers the first load, then caches in memory.
+let _bundledIndex = null, _bundledIndexTried = false;
+let _bundledMeta = null, _bundledMetaTried = false;
+async function loadBundled(kind) {
+  try {
+    if (kind === 'index') {
+      if (!_bundledIndexTried) {
+        _bundledIndexTried = true;
+        const m = await import('../docs/api/search_index.json', { with: { type: 'json' } });
+        _bundledIndex = m?.default ?? null;
+      }
+      return _bundledIndex;
+    }
+    if (!_bundledMetaTried) {
+      _bundledMetaTried = true;
+      const m = await import('../docs/api/metadata.json', { with: { type: 'json' } });
+      _bundledMeta = m?.default ?? null;
+    }
+    return _bundledMeta;
+  } catch { return null; }
+}
 
 /* AniList Offline GraphQL API — EXACT anime-only mirror.
  * Shards already contain AniList-exact Media objects (camelCase, FuzzyDate).
@@ -96,25 +114,26 @@ async function fetchJSON(url) {
 }
 function fresh(entry) { return entry && Date.now() - entry.time < CACHE_TTL_MS; }
 
-function bundledFirst(kind) {
+async function bundledFirst(kind) {
   // Bundled snapshot wins when it looks complete; otherwise fall back to fetch.
   try {
-    if (kind === 'meta' && bundledMeta?.totalAnime > 1000) return bundledMeta;
-    if (kind === 'index' && Array.isArray(bundledIndex) && bundledIndex.length > 1000) return bundledIndex;
+    const local = await loadBundled(kind);
+    if (kind === 'meta' && local?.totalAnime > 1000) return local;
+    if (kind === 'index' && Array.isArray(local) && local.length > 1000) return local;
   } catch { /* bundler dropped the files; fetch instead */ }
   return null;
 }
 
 async function getMetadata() {
   if (!fresh(metaEntry)) {
-    const local = bundledFirst('meta');
+    const local = await bundledFirst('meta');
     metaEntry = { data: local || await fetchJSON(`${DATA_BASE}/metadata.json`), time: Date.now() };
   }
   return metaEntry.data;
 }
 async function getSearchIndex() {
   if (!fresh(indexEntry)) {
-    const local = bundledFirst('index');
+    const local = await bundledFirst('index');
     indexEntry = { data: local || await fetchJSON(`${DATA_BASE}/search_index.json`), time: Date.now() };
   }
   return indexEntry.data;
@@ -881,7 +900,6 @@ function rowToMedia(row) {
 }
 
 async function resolvePage(fieldNode, fragments, variables, pageArgs) {
-  const index = await getSearchIndex();
   const mediaFieldNode = fieldNode.selectionSet?.selections?.find(
     (s) => s.kind === Kind.FIELD && s.name.value === 'media');
   const mediaArgs = mediaFieldNode ? collectArgs(mediaFieldNode, variables) : {};
@@ -910,6 +928,8 @@ async function resolvePage(fieldNode, fragments, variables, pageArgs) {
 
   // NOTE: Turso path above already handled everything when remote has data;
   // this shard fallback only runs pre-bootstrap or on Turso errors.
+  // The 12MB search index loads here for the first time — never on hot path.
+  const index = await getSearchIndex();
   const needFull = fargs.sort || fargs.tagCategory || fargs.tagCategory_in || fargs.tagCategory_not_in
     || fargs.minimumTagRank !== undefined || fargs.isLicensed !== undefined
     || fargs.startDate || fargs.endDate;
@@ -1228,9 +1248,11 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
         throw Object.assign(new Error('AiringSchedule not found'), { status: 404 });
       }
       case 'GenreCollection': {
-        // Zero-read path: bundled at deploy time. Falls back to fetched metadata.
+        // Zero-read path: bundled at deploy time (lazy: first fallback use
+        // only — never parsed on the Turso hot path). Falls back to fetched.
         try {
-          if (bundledMeta?.genres?.length) return bundledMeta.genres;
+          const bundledGenres = (await loadBundled('meta'))?.genres;
+          if (bundledGenres?.length) return bundledGenres;
         } catch { /* fetched fallback below */ }
         return (await getMetadata().catch(() => null))?.genres || [];
       }
