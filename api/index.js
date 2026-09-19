@@ -27,19 +27,12 @@ async function loadBundled(kind) {
 }
 
 /* AniList Offline GraphQL API — EXACT anime-only mirror.
- * Shards already contain AniList-exact Media objects (camelCase, FuzzyDate).
- * This layer only filters/sorts/paginates + field-selects. No snake_case leaks.
- * Data: GitHub Pages static JSON (zero rate limit, downloadable).
- * Better hosting (recommended): Cloudflare R2 + Workers (see README Hosting section).
- * Env override: DATA_BASE_URL
+ * Primary read path: Turso (libSQL) — FTS5 search + indexed column projection +
+ * batched single-round-trip page assembly. Shard/CDN layer is the fallback.
+ * Env: TURSO_URL, TURSO_AUTH_TOKEN, TURSO_REQUIRED=1 (no shard fallback), DATA_BASE_URL.
  */
 const DATA_BASE = (typeof process !== 'undefined' && process.env?.DATA_BASE_URL)
   || 'https://cdn.jsdelivr.net/gh/Shoislam0311/anilist-offline-db@main/docs/api';
-// Credential-free fallback chain (tried in order by the client; Vercel uses DATA_BASE first):
-// 1. jsDelivr  2. Statically  3. raw.githack  4. GitHub Pages origin
-// Statically: https://cdn.statically.io/gh/Shoislam0311/anilist-offline-db/main/docs/api
-// githack:    https://raw.githack.com/Shoislam0311/anilist-offline-db/main/docs/api
-// Pages:      https://shoislam0311.github.io/anilist-offline-db/api
 const CACHE_TTL_MS = 10 * 60 * 1000;
 const MAX_SHARD_CACHE = 12; // decompressed shards are ~15MB each; cap RAM (~180MB)
 
@@ -312,7 +305,6 @@ function pick(obj, sels, fragments) {
     if (Array.isArray(val)) {
       out[key] = val.map((item) => (item && typeof item === 'object' ? pick(item, sub, fragments) : item));
     } else if (val && typeof val === 'object') {
-      // connection { edges { node } } stays generic — no special-casing needed (exact shape)
       out[key] = pick(val, sub, fragments);
     } else {
       out[key] = val ?? null;
@@ -382,7 +374,7 @@ function matchMedia(e, full, a) {
   if (a.source_in && !a.source_in.includes(e.source)) return false;
   if (a.countryOfOrigin && e.country !== a.countryOfOrigin) return false;
   if (a.countryOfOrigin_in && !a.countryOfOrigin_in.includes(e.country)) return false;
-  if (a.countryOfOrigin_not_in && a.countryOfOrigin_not_in.includes(e.country)) return false;
+  if (a.countryOfOrigin_not_in && !a.countryOfOrigin_not_in.includes(e.country)) return false;
   if (a.isAdult !== undefined && e.adult !== a.isAdult) return false;
   if (a.episodes_greater !== undefined && !((e.episodes ?? -1) > a.episodes_greater)) return false;
   if (a.episodes_lesser !== undefined && !((e.episodes ?? 1e9) < a.episodes_lesser)) return false;
@@ -512,10 +504,19 @@ function collectArgs(fieldNode, variables) {
   return args;
 }
 
-/* ------------------------- Turso edge-SQL read path -------------------------
- * Indexed SQL (~50-200ms) instead of downloading 2.5MB shards per request.
- * Any failure or missing env falls back to the shard logic below untouched.
+/* ------------------------------ Turso layer -------------------------------
+ * Design (free-budget, 1M+ req/week):
+ *  - FTS5 MATCH for latin search (rows-read O(matches), NOT O(table)) — the
+ *    LIKE scans read all 14.6k/91k rows per token and would burn Turso's free
+ *    read budget at scale. LIKE stays only for CJK queries (unicode61 cannot
+ *    segment CJK).
+ *  - Column projection: card fields resolve from indexed columns (~200B/row),
+ *    never the 350KB raw_json blob.
+ *  - Nested connections (genres/tags/relations/characters/recommendations/…)
+ *    assemble from child tables via client.batch() — ONE round trip.
+ *  - TTL caches: page 5min, count 30min, entities 2min, raw_json LRU 30min.
  */
+
 let turso;
 function tursoClient() {
   if (turso !== undefined) return turso;
@@ -529,8 +530,7 @@ function tursoClient() {
 
 /* Turso is the primary DB. When TURSO_REQUIRED=1, GraphQL never falls back
  * to downloading shards — Turso errors surface as 503 instead of silently
- * serving slow shard scans. The workflow never reads Turso; only this
- * read path does, so every read below is user-serving and budgeted.
+ * serving slow shard scans.
  */
 function tursoRequired() {
   try {
@@ -540,17 +540,21 @@ function tursoRequired() {
 function tursoUnavailable(msg = 'Turso unavailable') {
   return Object.assign(new Error(msg), { status: 503 });
 }
+const DEBUG_API = (typeof process !== 'undefined' && process.env?.DEBUG_API) === '1';
+function dbg(where, e) {
+  if (DEBUG_API) console.error(`[api:${where}]`, e?.message || e);
+}
 
-/* Read-budget caches: the COUNT(*) scan is the most expensive query per
- * Page request (full index scan). Rail/homepage queries repeat identical
- * filters, so cache counts 5 min and full Page payloads 60s. POST rail
- * queries then cost ZERO Turso reads on hits.
- */
-const COUNT_TTL_MS = 5 * 60 * 1000;
-const PAGE_TTL_MS = 60 * 1000;
-const MAX_CACHE_ENTRIES = 200;
+/* ------------------------------- caches ----------------------------------- */
+const COUNT_TTL_MS = 30 * 60 * 1000;  // totals move only on the daily sync
+const PAGE_TTL_MS = 5 * 60 * 1000;    // repeat rail/home queries = zero reads
+const ENTITY_TTL_MS = 2 * 60 * 1000;  // Character/Staff/Studio/Airing lookups
+const RAW_TTL_MS = 30 * 60 * 1000;    // parsed raw_json LRU (heavy 350KB blobs)
+const MAX_CACHE_ENTRIES = 120;        // per cache; bounded RAM on the lambda
 const countCache = new Map();
 const pageCache = new Map();
+const entityCache = new Map();
+const rawCache = new Map(); // id -> { raw, time }
 function cacheGet(map, key, ttl) {
   const e = map.get(key);
   if (!e) return undefined;
@@ -567,21 +571,46 @@ function cacheSet(map, key, data) {
 function countCacheKey(clause, args) {
   return `c:${clause}|${JSON.stringify(args)}`;
 }
-function pageCacheKey(clause, args, order, page, perPage, projKey) {
-  return `p:${clause}|${JSON.stringify(args)}|${order}|${page}|${perPage}|${projKey}`;
+function pageCacheKey(clause, args, order, page, perPage, projKey, childrenKey) {
+  return `p:${clause}|${JSON.stringify(args)}|${order}|${page}|${perPage}|${projKey}|${childrenKey}`;
 }
+function entityKey(kind, args) { return `${kind}:${JSON.stringify(args)}`; }
+function entityGet(kind, args) { return cacheGet(entityCache, entityKey(kind, args), ENTITY_TTL_MS); }
+function entitySet(kind, args, data) { cacheSet(entityCache, entityKey(kind, args), data); }
 
+/* ------------------------------ FTS search -------------------------------- */
+const CJK_RE = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/;
+function ftsExpr(q) {
+  const tokens = String(q || '').toLowerCase().trim()
+    .split(/[\s_.,;:!?()[\]{}'"\/\\|-]+/).map((t) => t.trim())
+    .filter((t) => t.length > 1).slice(0, 6);
+  if (!tokens.length) return null;
+  // phrase-prefix per token, ANDed: "cow"* AND "beb"*
+  return tokens.map((t) => `"${t.replace(/"/g, '""')}"*`).join(' AND ');
+}
+function hasCJK(q) { return CJK_RE.test(String(q || '')); }
+
+/* --------------------------- WHERE construction --------------------------- */
 const HAY = `lower(coalesce(a.title_romaji,'') || ' ' || coalesce(a.title_english,'') || ' ' || coalesce(a.title_native,'') || ' ' || coalesce(a.synonyms,''))`;
 function escLike(s) { return String(s).replace(/[\\%_]/g, (c) => '\\' + c).toLowerCase(); }
 function searchTokensSql(q) {
   return String(q || '').toLowerCase().trim()
     .split(/[\s_.,;:!?()[\]{}'"\/\\|-]+/).map((t) => t.trim()).filter((t) => t.length > 1);
 }
-function tursoSearchWhere(search, where, args) {
+function searchWhere(search, where, args) {
   const q = String(search || '').toLowerCase().trim();
   if (!q) return;
   if (q.length < 2) { where.push('1 = 0'); return; } // 1-char: full scan, no signal
-  // Cap tokens: each token is another full LIKE scan over 14k rows.
+  if (!hasCJK(q)) {
+    const expr = ftsExpr(q);
+    if (expr) {
+      // FTS5: rows-read proportional to matches. Fallback to LIKE happens at
+      // execution time if the fts table is missing (older DBs).
+      where.push(`a.id IN (SELECT rowid FROM anime_fts WHERE anime_fts MATCH ?)`);
+      args.push(expr);
+      return;
+    }
+  }
   const tokens = searchTokensSql(q).slice(0, 5);
   if (!tokens.length) { where.push(`${HAY} LIKE ? ESCAPE '\\'`); args.push(`%${escLike(q)}%`); return; }
   for (const t of tokens) { where.push(`${HAY} LIKE ? ESCAPE '\\'`); args.push(`%${escLike(t)}%`); }
@@ -627,13 +656,13 @@ function tursoWhere(fargs) {
   if (a.idMal_in) { where.push(`a.id_mal IN (${a.idMal_in.map(() => '?').join(',')})`); args.push(...a.idMal_in); }
   if (a.idMal_not !== undefined) { where.push('(a.id_mal IS NULL OR a.id_mal != ?)'); args.push(a.idMal_not); }
   if (a.idMal_not_in) { where.push(`(a.id_mal IS NULL OR a.id_mal NOT IN (${a.idMal_not_in.map(() => '?').join(',')}))`); args.push(...a.idMal_not_in); }
-  if (a.search) tursoSearchWhere(a.search, where, args);
+  if (a.search) searchWhere(a.search, where, args);
   if (a.genre) { where.push(`EXISTS (SELECT 1 FROM anime_genres ag JOIN genres g ON g.id = ag.genre_id WHERE ag.anime_id = a.id AND g.name = ?)`); args.push(a.genre); }
   if (a.genre_in) { where.push(`EXISTS (SELECT 1 FROM anime_genres ag JOIN genres g ON g.id = ag.genre_id WHERE ag.anime_id = a.id AND g.name IN (${a.genre_in.map(() => '?').join(',')}))`); args.push(...a.genre_in); }
   if (a.genre_not_in) { where.push(`NOT EXISTS (SELECT 1 FROM anime_genres ag JOIN genres g ON g.id = ag.genre_id WHERE ag.anime_id = a.id AND g.name IN (${a.genre_not_in.map(() => '?').join(',')}))`); args.push(...a.genre_not_in); }
   if (a.tag) { where.push(`EXISTS (SELECT 1 FROM anime_tags at WHERE at.anime_id = a.id AND at.tag_name = ?)`); args.push(a.tag); }
   if (a.tag_in) { where.push(`EXISTS (SELECT 1 FROM anime_tags at WHERE at.anime_id = a.id AND at.tag_name IN (${a.tag_in.map(() => '?').join(',')}))`); args.push(...a.tag_in); }
-  if (a.tag_not_in) { where.push(`NOT EXISTS (SELECT 1 FROM anime_tags at WHERE at.anime_id = a.id AND at.tag_name IN (${a.tag_not_in.map(() => '?').join(',')}))`); args.push(...a.tag_not_in); }
+  if (a.tag_not_in) { where.push(`NOT EXISTS (SELECT 1 FROM anime_tags at WHERE at.anime_id = a.id AND at.tag_name IN (${a.tag_in.map(() => '?').join(',')}))`); args.push(...a.tag_not_in); }
   if (a.tagCategory_in) { where.push(`EXISTS (SELECT 1 FROM anime_tags at JOIN tags t ON t.name = at.tag_name WHERE at.anime_id = a.id AND t.category IN (${a.tagCategory_in.map(() => '?').join(',')}))`); args.push(...a.tagCategory_in); }
   if (a.tagCategory) { where.push(`EXISTS (SELECT 1 FROM anime_tags at JOIN tags t ON t.name = at.tag_name WHERE at.anime_id = a.id AND t.category = ?)`); args.push(a.tagCategory); }
   if (a.tagCategory_not_in) { where.push(`NOT EXISTS (SELECT 1 FROM anime_tags at JOIN tags t ON t.name = at.tag_name WHERE at.anime_id = a.id AND t.category IN (${a.tagCategory_not_in.map(() => '?').join(',')}))`); args.push(...a.tagCategory_not_in); }
@@ -688,108 +717,15 @@ function tursoWhere(fargs) {
   dateObj('end', a.endDate);
   return { where, args };
 }
-async function tursoPage(fargs, page, perPage, proj = null) {
-  const c = tursoClient();
-  if (!c) return null;
-  const { where, args } = tursoWhere(fargs);
-  const clause = where.join(' AND ');
-  const filterArgs = [...args]; // WHERE-only args for the COUNT probe below
-  let order = tursoOrderClause(fargs.sort);
-  if (fargs.search && !fargs.sort) {
-    const q = String(fargs.search).toLowerCase().trim();
-    order = `CASE WHEN lower(coalesce(a.title_romaji,'')) = ? OR lower(coalesce(a.title_english,'')) = ? OR lower(coalesce(a.title_native,'')) = ? THEN 0 ELSE 1 END, ${order}`;
-    args.push(q, q, q); // ORDER-only args: must NOT leak into the COUNT query
-  }
-  // Column projection: card queries (~10 small scalars, ~200B/row) skip the
-  // 330KB raw_json blob. tursoReady() guarantees the remote is fully
-  // bootstrapped, so total 0 is authoritative — no second COUNT probe.
-  const projKey = proj ? proj.select.join(',') : 'raw';
-  const pKey = pageCacheKey(clause, args, order, page, perPage, projKey);
-  const hit = cacheGet(pageCache, pKey, PAGE_TTL_MS);
-  if (hit) return hit;
-  const cKey = countCacheKey(clause, filterArgs);
-  const cachedTotal = cacheGet(countCache, cKey, COUNT_TTL_MS);
-  const dataSql = proj
-    ? `SELECT ${proj.select.join(', ')} FROM anime a WHERE ${clause} ORDER BY ${order} LIMIT ? OFFSET ?`
-    : `SELECT a.raw_json AS raw_json FROM anime a WHERE ${clause} ORDER BY ${order} LIMIT ? OFFSET ?`;
-  const dataArgs = [...args, perPage, (page - 1) * perPage];
-  // Single flight: COUNT + page SELECT run concurrently (one Tokyo round
-  // trip instead of two sequential). Empty-total discards the page rows.
-  const countP = cachedTotal !== undefined
-    ? Promise.resolve(cachedTotal)
-    : c.execute({ sql: `SELECT COUNT(*) AS n FROM anime a WHERE ${clause}`, args: filterArgs })
-      .then((rs) => {
-        const n = Number(rs.rows[0]?.n || 0);
-        cacheSet(countCache, cKey, n);
-        return n;
-      });
-  const dataP = c.execute({ sql: dataSql, args: dataArgs });
-  const [total, dataRs] = await Promise.all([countP, dataP]);
-  if (total === 0) {
-    const empty = { total: 0, items: [] };
-    cacheSet(pageCache, pKey, empty);
-    return empty;
-  }
-  let items;
-  if (proj) {
-    items = dataRs.rows.map(rowToMedia);
-  } else {
-    items = [];
-    for (const row of dataRs.rows) {
-      try { if (row.raw_json) items.push(asExactMedia(JSON.parse(row.raw_json))); } catch { /* skip bad row */ }
-    }
-  }
-  const out = { total, items };
-  cacheSet(pageCache, pKey, out);
-  return out;
-}
-async function tursoMediaByArgs(args) {
-  const c = tursoClient();
-  if (!c) return null;
-  let sql, sqlArgs;
-  if (args.id) { sql = `SELECT raw_json FROM anime WHERE id = ?`; sqlArgs = [args.id]; }
-  else if (args.idMal) { sql = `SELECT raw_json FROM anime WHERE id_mal = ?`; sqlArgs = [args.idMal]; }
-  else if (args.search) {
-    const where = [`COALESCE(type,'ANIME') = 'ANIME'`];
-    const wargs = [];
-    tursoSearchWhere(args.search, where, wargs);
-    const q = String(args.search).toLowerCase().trim();
-    sql = `SELECT raw_json FROM anime a WHERE ${where.join(' AND ')} ORDER BY CASE WHEN lower(coalesce(title_romaji,'')) = ? OR lower(coalesce(title_english,'')) = ? OR lower(coalesce(title_native,'')) = ? THEN 0 ELSE 1 END, popularity DESC NULLS LAST LIMIT 1`;
-    sqlArgs = [...wargs, q, q, q];
-  } else return null;
-  const rs = await c.execute({ sql, args: sqlArgs });
-  const raw = rs.rows[0]?.raw_json;
-  if (!raw) return null;
-  const anime = asExactMedia(JSON.parse(raw));
-  if (args.type && args.type !== 'ANIME') return null;
-  return anime;
-}
 
-function pageOut(fieldNode, fragments, paged, total, page, perPage) {
-  const out = {};
-  for (const s of fieldNode.selectionSet?.selections || []) {
-    if (s.kind !== Kind.FIELD) continue;
-    const k = s.alias?.value || s.name.value;
-    if (s.name.value === 'media') {
-      out[k] = paged.map((item) => pick(item, collectSelections(s, fragments), fragments));
-    } else if (s.name.value === 'pageInfo') {
-      out[k] = pick(buildPageInfo(total, page, perPage), collectSelections(s, fragments), fragments);
-    } else out[k] = null;
-  }
-  return out;
-}
-
-/* ------------- column projection (kill multi-MB transfers) -------------
- * Card queries ask for ~10 small scalars. Selecting those columns (~200B/row)
- * instead of raw_json (~330KB/row) turns seconds into milliseconds on a
- * throughput-thin edge link. Anything else falls back to raw_json.
- */
+/* --------------------- column projection (no raw_json) -------------------- */
 const COL_FIELDS = {
   'id': 'a.id AS id',
   'idMal': 'a.id_mal AS idMal',
   'type': "COALESCE(a.type,'ANIME') AS type",
   'format': 'a.format AS format',
   'status': 'a.status AS status',
+  'description': 'a.description AS description',
   'episodes': 'a.episodes AS episodes',
   'duration': 'a.duration AS duration',
   'chapters': 'a.chapters AS chapters',
@@ -808,6 +744,11 @@ const COL_FIELDS = {
   'hashtag': 'a.hashtag AS hashtag',
   'bannerImage': 'a.banner_image AS bannerImage',
   'isAdult': 'a.is_adult AS isAdult',
+  'isLocked': 'a.is_locked AS isLocked',
+  'modNotes': 'a.mod_notes AS modNotes',
+  'autoCreateForumThread': 'a.auto_create_forum_thread AS autoCreateForumThread',
+  'isRecommendationBlocked': 'a.is_recommendation_blocked AS isRecommendationBlocked',
+  'isReviewBlocked': 'a.is_review_blocked AS isReviewBlocked',
   'updatedAt': 'a.updated_at AS updatedAt',
   'siteUrl': 'a.site_url AS siteUrl',
   'title.romaji': 'a.title_romaji AS title_romaji',
@@ -830,39 +771,63 @@ const COL_FIELDS = {
   'synonyms': 'a.synonyms AS synonyms',
 };
 const PROJ_OBJECTS = new Set(['title', 'coverImage', 'startDate', 'endDate', 'trailer']);
+/* Nested connections assembled from child tables (one batched round trip),
+ * so card queries with genres/tags/description/etc never touch raw_json. */
+const ASSEMBLER_FIELDS = new Set([
+  'genres', 'tags', 'studios', 'relations', 'characters', 'characterPreview',
+  'staff', 'staffPreview', 'recommendations', 'rankings', 'externalLinks',
+  'streamingEpisodes', 'stats', 'airingSchedule', 'reviews', 'trends',
+  'nextAiringEpisode',
+]);
 function planProjection(mediaNode, fragments) {
   const sels = mediaNode ? collectSelections(mediaNode, fragments) : [];
-  if (!sels.length) return null;
+  if (!sels.length) return { cols: ['a.id AS id'], children: [] };
   const cols = new Set();
+  const children = new Set();
+  let needNextAiringCols = false;
   const walk = (nodes, prefix) => {
     for (const s of nodes) {
       if (s.name.value === '__typename') continue;
       const path = prefix ? prefix + '.' + s.name.value : s.name.value;
       const sub = s.selectionSet ? collectSelections(s, fragments) : null;
       if (sub && sub.length) {
-        if (!PROJ_OBJECTS.has(s.name.value)) return null;
-        if (walk(sub, path) === null) return null;
+        if (PROJ_OBJECTS.has(s.name.value)) {
+          if (walk(sub, path) === null) return null;
+        } else if (s.name.value === 'nextAiringEpisode') {
+          children.add('nextAiringEpisode'); needNextAiringCols = true;
+        } else if (ASSEMBLER_FIELDS.has(s.name.value)) {
+          children.add(s.name.value);
+        } else return null;
       } else {
+        // scalar-list fields (genres, tags) come from the assembler, not columns
+        if (!prefix && ASSEMBLER_FIELDS.has(s.name.value)) { children.add(s.name.value); continue; }
         if (!(path in COL_FIELDS)) return null;
-        cols.add(path);
+        cols.add(COL_FIELDS[path]);
       }
     }
     return true;
   };
   if (walk(sels, '') === null) return null;
-  if (!cols.size) return { select: ['a.id AS id'] }; // __typename-only etc.
-  return { select: [...cols].map((p) => COL_FIELDS[p]) };
+  if (needNextAiringCols) {
+    cols.add('a.next_airing_episode AS next_airing_episode');
+    cols.add('a.next_airing_at AS next_airing_at');
+  }
+  // queries that select ONLY nested connections still need a base row
+  if (!cols.size) cols.add('a.id AS id');
+  return { cols: [...cols], children: [...children] };
 }
 function rowToMedia(row) {
   const m = { __typename: 'Media', type: 'ANIME', isFavourite: false };
-  const simple = ['id', 'idMal', 'format', 'status', 'episodes', 'duration', 'chapters', 'volumes',
-    'averageScore', 'meanScore', 'popularity', 'favourites', 'trending', 'season', 'seasonYear',
-    'seasonInt', 'countryOfOrigin', 'isLicensed', 'source', 'hashtag', 'bannerImage', 'isAdult',
-    'updatedAt'];
+  const simple = ['id', 'idMal', 'format', 'status', 'description', 'episodes', 'duration', 'chapters',
+    'volumes', 'averageScore', 'meanScore', 'popularity', 'favourites', 'trending', 'season',
+    'seasonYear', 'seasonInt', 'countryOfOrigin', 'isLicensed', 'source', 'hashtag', 'bannerImage',
+    'isAdult', 'isLocked', 'modNotes', 'autoCreateForumThread', 'isRecommendationBlocked',
+    'isReviewBlocked', 'updatedAt'];
   for (const k of simple) if (k in row) m[k] = row[k];
   if ('type' in row && row.type) m.type = row.type;
   if ('isAdult' in row && row.isAdult !== null && row.isAdult !== undefined) m.isAdult = !!row.isAdult;
   if ('isLicensed' in row && row.isLicensed !== null && row.isLicensed !== undefined) m.isLicensed = !!row.isLicensed;
+  if ('isLocked' in row && row.isLocked !== null && row.isLocked !== undefined) m.isLocked = !!row.isLocked;
   if ('title_romaji' in row || 'title_english' in row || 'title_native' in row || 'title_user_preferred' in row) {
     m.title = {
       __typename: 'MediaTitle',
@@ -895,8 +860,681 @@ function rowToMedia(row) {
     catch { m.synonyms = []; }
     if (!Array.isArray(m.synonyms)) m.synonyms = [];
   }
+  if ('next_airing_episode' in row && (row.next_airing_episode != null || row.next_airing_at != null)) {
+    const airingAt = row.next_airing_at ?? null;
+    m.nextAiringEpisode = {
+      __typename: 'MediaAiringEpisode',
+      id: null,
+      episode: row.next_airing_episode ?? null,
+      airingAt,
+      timeUntilAiring: airingAt ? Math.max(0, airingAt - Math.floor(Date.now() / 1000)) : 0,
+      mediaId: row.id ?? null,
+    };
+  }
   if (!m.siteUrl && m.id) m.siteUrl = `https://anilist.co/anime/${m.id}`;
   return m;
+}
+
+/* ------------------------- child-table assembler --------------------------
+ * Builds nested AniList connection objects from indexed child tables.
+ * Statements run inside the SAME client.batch() as the page query = one
+ * round trip per level. perPage/sort args on nested fields are honored.
+ */
+function splitYMD(s) {
+  const m = String(s || '').match(/^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$/);
+  if (!m) return { year: null, month: null, day: null };
+  return { year: parseInt(m[1], 10), month: m[2] ? parseInt(m[2], 10) : null, day: m[3] ? parseInt(m[3], 10) : null };
+}
+function jarr(s, fb = []) {
+  try { const v = JSON.parse(s || ''); return Array.isArray(v) ? v : fb; } catch { return fb; }
+}
+function charFromRow(r) {
+  return {
+    __typename: 'Character', id: r.id,
+    name: { __typename: 'CharacterName', first: r.name_first, middle: r.name_middle, last: r.name_last, full: r.name_full, native: r.name_native, alternative: jarr(r.name_alternative), alternativeSpoiler: jarr(r.name_alternative_spoiler), userPreferred: r.name_user_preferred || r.name_full },
+    image: { __typename: 'CharacterImage', large: r.image_large, medium: r.image_medium },
+    description: r.description, gender: r.gender, dateOfBirth: { __typename: 'FuzzyDate', ...splitYMD(r.date_of_birth) },
+    age: r.age, bloodType: r.blood_type, favourites: r.favourites, siteUrl: r.site_url,
+    isFavourite: false, isFavouriteBlocked: !!r.is_favourite_blocked,
+  };
+}
+function staffFromRow(r) {
+  return {
+    __typename: 'Staff', id: r.id, language: r.language,
+    name: { __typename: 'StaffName', first: r.name_first, middle: r.name_middle, last: r.name_last, full: r.name_full, native: r.name_native, alternative: jarr(r.name_alternative), userPreferred: r.name_user_preferred || r.name_full },
+    image: { __typename: 'StaffImage', large: r.image_large, medium: r.image_medium },
+    description: r.description, primaryOccupations: jarr(r.primary_occupations), gender: r.gender,
+    dateOfBirth: { __typename: 'FuzzyDate', ...splitYMD(r.date_of_birth) },
+    dateOfDeath: { __typename: 'FuzzyDate', ...splitYMD(r.date_of_death) },
+    age: r.age, yearsActive: jarr(r.years_active), homeTown: r.home_town, bloodType: r.blood_type,
+    favourites: r.favourites, siteUrl: r.site_url,
+    isFavourite: false, isFavouriteBlocked: !!r.is_favourite_blocked,
+  };
+}
+function charSortFn(sort) {
+  const s = Array.isArray(sort) ? sort[0] : sort;
+  switch (s) {
+    case 'ID': return (a, b) => a.id - b.id;
+    case 'ID_DESC': return (a, b) => b.id - a.id;
+    case 'FAVOURITES': return (a, b) => (a.favourites ?? 0) - (b.favourites ?? 0);
+    case 'FAVOURITES_DESC': return (a, b) => (b.favourites ?? 0) - (a.favourites ?? 0);
+    case 'ROLE_REVERSED': return (a, b) => (a.role === 'MAIN' ? 1 : 0) - (b.role === 'MAIN' ? 1 : 0);
+    default: return (a, b) => (b.role === 'MAIN' ? 1 : 0) - (a.role === 'MAIN' ? 1 : 0); // ROLE
+  }
+}
+function chunkIds(ids, n = 90) {
+  const out = [];
+  for (let i = 0; i < ids.length; i += n) out.push(ids.slice(i, i + n));
+  return out;
+}
+function inPlaceholders(n) { return Array.from({ length: n }, () => '?').join(','); }
+
+async function batchExecute(stmts) {
+  // One round trip for N statements; falls back to parallel executes.
+  const c = tursoClient();
+  if (!c) throw new Error('no turso client');
+  if (stmts.length === 1) return [await c.execute(stmts[0])];
+  try {
+    return await c.batch(stmts, 'read');
+  } catch {
+    return Promise.all(stmts.map((s) => c.execute(s).catch(() => ({ rows: [], columns: [] }))));
+  }
+}
+
+// Fetch nested Media nodes (relations.node, mediaRecommendation) honoring the
+// client's sub-selection: projected columns when possible, raw_json otherwise.
+async function fetchNestedMedia(ids, mediaSelNode, fragments) {
+  const uniq = [...new Set(ids)].filter((x) => x != null).sort((a, b) => a - b);
+  if (!uniq.length) return new Map();
+  const out = new Map();
+  const proj = planProjection(mediaSelNode, fragments);
+  const hasChildren = proj && proj.children.length > 0;
+  if (proj && !hasChildren) {
+    for (const chunk of chunkIds(uniq)) {
+      const rs = await batchExecute([{ sql: `SELECT ${proj.cols.join(', ')} FROM anime a WHERE a.id IN (${inPlaceholders(chunk.length)})`, args: chunk }]);
+      for (const row of rs[0].rows) out.set(row.id, rowToMedia(row));
+    }
+    return out;
+  }
+  // raw path (with LRU) — raw_json carries its own fetch-time nested children
+  for (const chunk of chunkIds(uniq)) {
+    const rs = await batchExecute([{ sql: `SELECT id, raw_json FROM anime WHERE id IN (${inPlaceholders(chunk.length)})`, args: chunk }]);
+    for (const r of rs[0].rows) {
+      const cached = rawCache.get(r.id);
+      if (cached && Date.now() - cached.time < RAW_TTL_MS) { out.set(r.id, cached.data); continue; }
+      try {
+        const media = asExactMedia(JSON.parse(r.raw_json));
+        rawCache.set(r.id, { data: media, time: Date.now() });
+        if (rawCache.size > MAX_CACHE_ENTRIES) rawCache.delete(rawCache.keys().next().value);
+        out.set(r.id, media);
+      } catch { /* skip bad row */ }
+    }
+  }
+  return out;
+}
+
+/* Assemble requested children onto page rows. Runs child statements in ONE
+ * batch; stitches per-anime groups; honors per-field page/perPage/sort args. */
+async function assembleChildren(items, children, mediaFieldNode, fragments, variables) {
+  if (!items.length || !children.length) return;
+  const ids = items.map((m) => m.id);
+  const idSet = new Set(ids);
+  const byAnime = new Map(ids.map((id) => [id, []]));
+  const put = (animeId, v) => { const l = byAnime.get(animeId); if (l) l.push(v); };
+  const mediaSels = collectSelections(mediaFieldNode, fragments);
+  const childArgs = {};
+  for (const name of children) {
+    const node = mediaSels.find((s) => s.name.value === name);
+    childArgs[name] = node ? collectArgs(node, variables) : {};
+  }
+  const stmts = [];
+  const stmtKeys = [];
+  const add = (key, sql, args) => { stmts.push({ sql, args }); stmtKeys.push(key); };
+
+  const q = inPlaceholders(ids.length);
+  if (children.includes('genres')) {
+    add('genres', `SELECT ag.anime_id, g.name FROM anime_genres ag JOIN genres g ON g.id = ag.genre_id WHERE ag.anime_id IN (${q}) ORDER BY ag.rowid`, ids);
+  }
+  if (children.includes('tags')) {
+    add('tags', `SELECT at.anime_id, at.tag_name, at.tag_rank, t.id AS t_id, t.description AS t_desc, t.category AS t_cat, t.is_general_spoiler AS t_gs, t.is_media_spoiler AS t_ms, t.is_adult AS t_ad FROM anime_tags at LEFT JOIN tags t ON t.name = at.tag_name WHERE at.anime_id IN (${q}) ORDER BY at.tag_rank DESC, at.rowid`, ids);
+  }
+  if (children.includes('studios')) {
+    add('studios', `SELECT ast.anime_id, ast.edge_id, ast.is_main, s.id, s.name, s.is_animation_studio, s.site_url, s.favourites FROM anime_studios ast JOIN studios s ON s.id = ast.studio_id WHERE ast.anime_id IN (${q}) ORDER BY ast.favourite_order, ast.rowid`, ids);
+  }
+  if (children.includes('relations')) {
+    add('relations', `SELECT anime_id, related_anime_id, relation_type FROM relations WHERE anime_id IN (${q}) ORDER BY rowid`, ids);
+  }
+  if (children.includes('characters') || children.includes('characterPreview')) {
+    add('characters', `SELECT ac.anime_id, ac.character_id, ac.edge_id, ac.role, ac.sort_order, ac.favourite_order, c.* FROM anime_characters ac JOIN characters c ON c.id = ac.character_id WHERE ac.anime_id IN (${q}) ORDER BY ac.anime_id, CASE ac.role WHEN 'MAIN' THEN 0 ELSE 1 END, ac.sort_order, ac.rowid`, ids);
+  }
+  if (children.includes('staff') || children.includes('staffPreview')) {
+    add('staff', `SELECT ast.anime_id, ast.staff_id, ast.edge_id, ast.role, ast.sort_order, s.* FROM anime_staff ast JOIN staff s ON s.id = ast.staff_id WHERE ast.anime_id IN (${q}) ORDER BY ast.anime_id, ast.sort_order, ast.rowid`, ids);
+  }
+  if (children.includes('recommendations')) {
+    add('recommendations', `SELECT id, anime_id, recommended_anime_id, rating, user_rating FROM recommendations WHERE anime_id IN (${q}) ORDER BY rating DESC, rowid`, ids);
+  }
+  if (children.includes('rankings')) {
+    add('rankings', `SELECT anime_id, rank_id, rank, type, format, year, season, all_time, context FROM rankings WHERE anime_id IN (${q}) ORDER BY rank, rowid`, ids);
+  }
+  if (children.includes('externalLinks')) {
+    add('externalLinks', `SELECT anime_id, id, site, url, type, language, color, icon FROM external_links WHERE anime_id IN (${q}) AND COALESCE(is_disabled,0)=0 ORDER BY rowid`, ids);
+  }
+  if (children.includes('streamingEpisodes')) {
+    add('streamingEpisodes', `SELECT anime_id, title, thumbnail, url, site FROM streaming_episodes WHERE anime_id IN (${q}) ORDER BY id`, ids);
+  }
+  if (children.includes('stats')) {
+    add('stats', `SELECT anime_id, score_distribution, rankings FROM statistics WHERE anime_id IN (${q})`, ids);
+  }
+  if (children.includes('airingSchedule')) {
+    add('airingSchedule', `SELECT anime_id, id, episode, airing_at FROM airing_schedule WHERE anime_id IN (${q}) ORDER BY anime_id, episode`, ids);
+  }
+  if (children.includes('reviews')) {
+    add('reviews', `SELECT id, anime_id, user_id, user_name, summary, rating, user_rating, score, body, created_at, site_url FROM reviews WHERE anime_id IN (${q}) ORDER BY rating DESC, rowid`, ids);
+  }
+  if (children.includes('trends')) {
+    add('trends', `SELECT anime_id, date, trending, average_score, popularity, episode, releasing FROM trends WHERE anime_id IN (${q}) ORDER BY date`, ids);
+  }
+
+  const results = new Map();
+  if (stmts.length) {
+    const rss = await batchExecute(stmts);
+    for (let i = 0; i < stmtKeys.length; i++) results.set(stmtKeys[i], rss[i]?.rows || []);
+  }
+
+  // voice actors join runs as its own batch level (depends on character ids)
+  let vaByChar = null;
+  if (children.includes('characters') || children.includes('characterPreview')) {
+    const rows = results.get('characters') || [];
+    const charIds = [...new Set(rows.map((r) => r.character_id))];
+    vaByChar = new Map();
+    if (charIds.length) {
+      const vaRows = [];
+      for (const chunk of chunkIds(charIds)) {
+        const rs = await batchExecute([{
+          sql: `SELECT cva.character_id, cva.anime_id, cva.language, va.id, va.name_first, va.name_middle, va.name_last, va.name_full, va.name_native, va.image_large, va.image_medium, va.language AS va_language FROM character_voice_actors cva JOIN voice_actors va ON va.id = cva.voice_actor_id WHERE cva.character_id IN (${inPlaceholders(chunk.length)})`,
+          args: chunk,
+        }]);
+        vaRows.push(...rs[0].rows);
+      }
+      for (const r of vaRows) {
+        const key = `${r.anime_id}:${r.character_id}`;
+        if (!vaByChar.has(key)) vaByChar.set(key, []);
+        vaByChar.get(key).push({
+          __typename: 'Staff', id: r.id, language: r.va_language || r.language,
+          name: { __typename: 'StaffName', first: r.name_first, middle: r.name_middle, last: r.name_last, full: r.name_full, native: r.name_native, userPreferred: r.name_full },
+          image: { __typename: 'StaffImage', large: r.image_large, medium: r.image_medium },
+          isFavourite: false,
+        });
+      }
+    }
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const sliceConn = (list, args, defPage = 1, defPer = 25) => {
+    const page = Math.max(1, args.page || defPage);
+    const perPage = Math.min(Math.max(1, args.perPage || defPer), 50);
+    const total = list.length;
+    const sliced = list.slice((page - 1) * perPage, page * perPage);
+    return { list: sliced, pageInfo: buildPageInfo(total, page, perPage) };
+  };
+
+  for (const name of children) {
+    const args = childArgs[name] || {};
+    if (name === 'genres') {
+      for (const r of results.get('genres') || []) put(r.anime_id, r.name);
+      for (const m of items) m.genres = byAnime.get(m.id) || [];
+    } else if (name === 'tags') {
+      const tmp = new Map(ids.map((id) => [id, []]));
+      for (const r of results.get('tags') || []) {
+        if (!tmp.has(r.anime_id)) continue;
+        tmp.get(r.anime_id).push({
+          __typename: 'MediaTag', id: r.t_id ?? null, name: r.tag_name, rank: r.tag_rank,
+          description: r.t_desc ?? null, category: r.t_cat ?? null,
+          isGeneralSpoiler: !!r.t_gs, isMediaSpoiler: !!r.t_ms, isAdult: !!r.t_ad,
+        });
+      }
+      for (const m of items) m.tags = tmp.get(m.id) || [];
+    } else if (name === 'studios') {
+      const tmp = new Map(ids.map((id) => [id, []]));
+      for (const r of results.get('studios') || []) {
+        if (!tmp.has(r.anime_id)) continue;
+        tmp.get(r.anime_id).push({
+          __typename: 'StudioEdge', id: r.edge_id ?? null, isMain: !!r.is_main,
+          node: { __typename: 'Studio', id: r.id, name: r.name, isAnimationStudio: !!r.is_animation_studio, siteUrl: r.site_url, favourites: r.favourites, isFavourite: false },
+        });
+      }
+      for (const m of items) {
+        const edges = tmp.get(m.id) || [];
+        m.studios = { __typename: 'StudioConnection', edges, nodes: edges.map((e) => e.node) };
+      }
+    } else if (name === 'relations') {
+      const relRows = results.get('relations') || [];
+      const relIds = relRows.map((r) => r.related_anime_id);
+      // node sub-selection from edges{node{...}} or nodes{...}
+      const relSel = mediaSels.find((s) => s.name.value === 'relations');
+      let relNodeSel = null;
+      if (relSel?.selectionSet) {
+        const rs = collectSelections(relSel, fragments);
+        const edgeField = rs.find((s) => s.name.value === 'edges');
+        const nodeField = edgeField ? collectSelections(edgeField, fragments).find((s) => s.name.value === 'node') : null;
+        const direct = rs.find((s) => s.name.value === 'nodes');
+        const src = nodeField || direct;
+        if (src) relNodeSel = { selectionSet: src.selectionSet };
+      }
+      const mediaMap = relIds.length
+        ? await fetchNestedMedia(relIds, relNodeSel, fragments)
+        : new Map();
+      const tmp = new Map(ids.map((id) => [id, []]));
+      for (const r of relRows) {
+        if (!tmp.has(r.anime_id)) continue;
+        tmp.get(r.anime_id).push({
+          __typename: 'MediaEdge', relationType: r.relation_type, isMainStudio: false,
+          node: mediaMap.get(r.related_anime_id) || null,
+        });
+      }
+      for (const m of items) m.relations = { __typename: 'MediaConnection', edges: tmp.get(m.id) || [] };
+    } else if (name === 'characters' || name === 'characterPreview') {
+      const rows = results.get('characters') || [];
+      const perChar = new Map();
+      for (const r of rows) {
+        const key = `${r.anime_id}:${r.character_id}`;
+        if (!perChar.has(key)) {
+          perChar.set(key, { anime_id: r.anime_id, role: r.role, sort_order: r.sort_order ?? 0, fav: r.favourites ?? 0, edge_id: r.edge_id, node: charFromRow(r) });
+        }
+      }
+      if (vaByChar) {
+        // honor voiceActors(language:) args from the client's edge selection
+        const charSel = mediaSels.find((s) => s.name.value === name);
+        let vaArgs = {};
+        if (charSel?.selectionSet) {
+          const cs = collectSelections(charSel, fragments);
+          const edgeField = cs.find((s) => s.name.value === 'edges');
+          const vaField = edgeField ? collectSelections(edgeField, fragments).find((s) => s.name.value === 'voiceActors') : null;
+          if (vaField) vaArgs = collectArgs(vaField, variables);
+        }
+        for (const [, e] of perChar) {
+          let vas = vaByChar.get(`${e.anime_id}:${e.node.id}`) || [];
+          if (vaArgs.language) vas = vas.filter((v) => v.language === vaArgs.language);
+          e.vas = vas;
+          e.node.media = { __typename: 'Media', id: e.anime_id };
+        }
+      }
+      const grouped = new Map(ids.map((id) => [id, []]));
+      for (const e of perChar.values()) if (grouped.has(e.anime_id)) grouped.get(e.anime_id).push(e);
+      for (const m of items) {
+        let list = grouped.get(m.id) || [];
+        const cmp = charSortFn(args.sort || 'ROLE');
+        list = [...list].sort((a, b) => cmp(a.node, b.node));
+        const connArgs = name === 'characterPreview' ? { ...args, perPage: 8, page: 1 } : args;
+        const { list: sliced, pageInfo } = sliceConn(list, connArgs);
+        m[name] = {
+          __typename: 'CharacterConnection',
+          edges: sliced.map((e) => ({ __typename: 'CharacterEdge', id: e.edge_id, role: e.role, node: e.node, voiceActors: e.vas || [], voiceActorRoles: [] })),
+          nodes: sliced.map((e) => e.node),
+          pageInfo,
+        };
+      }
+    } else if (name === 'staff' || name === 'staffPreview') {
+      const grouped = new Map(ids.map((id) => [id, []]));
+      for (const r of results.get('staff') || []) {
+        if (!grouped.has(r.anime_id)) continue;
+        grouped.get(r.anime_id).push({ edge_id: r.edge_id, role: r.role, sort_order: r.sort_order ?? 0, node: staffFromRow(r) });
+      }
+      for (const m of items) {
+        let list = (grouped.get(m.id) || []).sort((a, b) => a.sort_order - b.sort_order);
+        if ((args.sort || '').startsWith('FAVOURITES')) list = [...list].sort((a, b) => (b.node.favourites ?? 0) - (a.node.favourites ?? 0));
+        const connArgs = name === 'staffPreview' ? { ...args, perPage: 8, page: 1 } : args;
+        const { list: sliced, pageInfo } = sliceConn(list, connArgs);
+        m[name] = {
+          __typename: 'StaffConnection',
+          edges: sliced.map((e) => ({ __typename: 'StaffEdge', id: e.edge_id, role: e.role, favouriteOrder: null, node: e.node })),
+          nodes: sliced.map((e) => e.node),
+          pageInfo,
+        };
+      }
+    } else if (name === 'recommendations') {
+      const recRows = results.get('recommendations') || [];
+      const sort = args.sort || 'RATING_DESC';
+      for (const m of items) {
+        let rows = recRows.filter((r) => r.anime_id === m.id);
+        if (sort === 'RATING') rows = [...rows].reverse();
+        else if (sort === 'ID') rows = [...rows].sort((a, b) => a.id - b.id);
+        else if (sort === 'ID_DESC') rows = [...rows].sort((a, b) => b.id - a.id);
+        const { list: sliced, pageInfo } = sliceConn(rows, { perPage: 25, ...args });
+        m.recommendations = {
+          __typename: 'RecommendationConnection',
+          edges: sliced.map((r) => ({
+            __typename: 'RecommendationEdge', id: r.id, rating: r.rating, userRating: r.user_rating || null,
+            node: {
+              __typename: 'Recommendation', id: r.id, rating: r.rating, userRating: r.user_rating || null,
+              media: { __typename: 'Media', id: r.anime_id },
+              mediaRecommendation: null, // patched after nested fetch
+            },
+          })),
+          nodes: [],
+          pageInfo,
+        };
+        m._recIds = sliced.map((r) => ({ recId: r.id, target: r.recommended_anime_id }));
+      }
+      // fetch recommended media with the client's mediaRecommendation selection
+      const recSel = mediaSels.find((s) => s.name.value === 'recommendations');
+      let recNodeSel = null;
+      if (recSel?.selectionSet) {
+        const nodeEdge = collectSelections(recSel, fragments).find((s) => s.name.value === 'edges');
+        const nodeField = nodeEdge ? collectSelections(nodeEdge, fragments).find((s) => s.name.value === 'node') : null;
+        const direct = collectSelections(recSel, fragments).find((s) => s.name.value === 'nodes');
+        const src = nodeField || direct;
+        if (src) {
+          const mRec = collectSelections(src, fragments).find((s) => s.name.value === 'mediaRecommendation');
+          recNodeSel = mRec || src; // fall back to whole-node projection
+        }
+      }
+      const targets = items.flatMap((m) => (m._recIds || []).map((x) => x.target));
+      const mediaMap = targets.length ? await fetchNestedMedia(targets, recNodeSel, fragments) : new Map();
+      for (const m of items) {
+        if (!m.recommendations) continue;
+        const byId = new Map((m._recIds || []).map((x) => [x.recId, x.target]));
+        for (const edge of m.recommendations.edges) {
+          edge.node.mediaRecommendation = mediaMap.get(byId.get(edge.id)) || null;
+        }
+        m.recommendations.nodes = m.recommendations.edges.map((e) => e.node);
+        delete m._recIds;
+      }
+    } else if (name === 'rankings') {
+      const tmp = new Map(ids.map((id) => [id, []]));
+      for (const r of results.get('rankings') || []) {
+        if (!tmp.has(r.anime_id)) continue;
+        tmp.get(r.anime_id).push({
+          __typename: 'MediaRank', id: r.rank_id, rank: r.rank, type: r.type, format: r.format,
+          year: r.year, season: r.season, allTime: !!r.all_time, context: r.context,
+        });
+      }
+      for (const m of items) m.rankings = tmp.get(m.id) || [];
+    } else if (name === 'externalLinks') {
+      const tmp = new Map(ids.map((id) => [id, []]));
+      for (const r of results.get('externalLinks') || []) {
+        if (!tmp.has(r.anime_id)) continue;
+        tmp.get(r.anime_id).push({
+          __typename: 'MediaExternalLink', id: r.id, url: r.url, site: r.site, type: r.type,
+          language: r.language, color: r.color, icon: r.icon, notes: null, isDisabled: false,
+        });
+      }
+      for (const m of items) m.externalLinks = tmp.get(m.id) || [];
+    } else if (name === 'streamingEpisodes') {
+      const tmp = new Map(ids.map((id) => [id, []]));
+      for (const r of results.get('streamingEpisodes') || []) {
+        if (!tmp.has(r.anime_id)) continue;
+        tmp.get(r.anime_id).push({ __typename: 'MediaStreamingEpisode', title: r.title, thumbnail: r.thumbnail, url: r.url, site: r.site });
+      }
+      for (const m of items) m.streamingEpisodes = tmp.get(m.id) || [];
+    } else if (name === 'stats') {
+      const tmp = new Map(ids.map((id) => [id, null]));
+      for (const r of results.get('stats') || []) {
+        if (!tmp.has(r.anime_id)) continue;
+        let scoreDistribution = [], statusDistribution = [];
+        try { scoreDistribution = JSON.parse(r.score_distribution || '[]') || []; } catch { /* keep [] */ }
+        try { statusDistribution = JSON.parse(r.rankings || '[]') || []; } catch { /* keep [] */ }
+        tmp.set(r.anime_id, {
+          __typename: 'MediaStats',
+          scoreDistribution: scoreDistribution.map((s) => ({ __typename: 'ScoreDistribution', score: s.score, amount: s.amount })),
+          statusDistribution: statusDistribution.map((s) => ({ __typename: 'StatusDistribution', status: s.status, amount: s.amount })),
+        });
+      }
+      for (const m of items) m.stats = tmp.get(m.id) || null;
+    } else if (name === 'airingSchedule') {
+      const grouped = new Map(ids.map((id) => [id, []]));
+      for (const r of results.get('airingSchedule') || []) {
+        if (!grouped.has(r.anime_id)) continue;
+        grouped.get(r.anime_id).push({
+          __typename: 'AiringSchedule', id: r.id, episode: r.episode, airingAt: r.airing_at,
+          timeUntilAiring: Math.max(0, (r.airing_at || 0) - now), mediaId: r.anime_id,
+        });
+      }
+      for (const m of items) {
+        let list = grouped.get(m.id) || [];
+        if ((args.sort || '').includes('TIME_UNTIL')) list = [...list].sort((a, b) => a.airingAt - b.airingAt);
+        const { list: sliced, pageInfo } = sliceConn(list, { perPage: 50, ...args });
+        m.airingSchedule = {
+          __typename: 'AiringScheduleConnection',
+          edges: sliced.map((n) => ({ __typename: 'AiringScheduleEdge', node: n, media: { __typename: 'Media', id: m.id } })),
+          nodes: sliced,
+          pageInfo,
+        };
+      }
+    } else if (name === 'reviews') {
+      const grouped = new Map(ids.map((id) => [id, []]));
+      for (const r of results.get('reviews') || []) {
+        if (!grouped.has(r.anime_id)) continue;
+        grouped.get(r.anime_id).push({
+          __typename: 'Review', id: r.id, userId: r.user_id, mediaId: r.anime_id,
+          summary: r.summary, body: r.body, rating: r.rating, ratingAmount: r.rating,
+          userRating: r.user_rating || null, score: r.score, private: false, siteUrl: r.site_url,
+          createdAt: r.created_at ? Math.floor(new Date(r.created_at).getTime() / 1000) : null,
+          user: { __typename: 'User', id: r.user_id, name: r.user_name },
+        });
+      }
+      for (const m of items) {
+        const list = grouped.get(m.id) || [];
+        const { list: sliced, pageInfo } = sliceConn(list, { perPage: 10, ...args });
+        m.reviews = { __typename: 'ReviewConnection', edges: sliced.map((n) => ({ __typename: 'ReviewEdge', node: n })), nodes: sliced, pageInfo };
+      }
+    } else if (name === 'trends') {
+      const grouped = new Map(ids.map((id) => [id, []]));
+      for (const r of results.get('trends') || []) {
+        if (!grouped.has(r.anime_id)) continue;
+        grouped.get(r.anime_id).push({
+          __typename: 'MediaTrend', date: r.date, trending: r.trending, averageScore: r.average_score,
+          popularity: r.popularity, episode: r.episode, releasing: !!r.releasing, mediaId: r.anime_id,
+        });
+      }
+      for (const m of items) {
+        const list = grouped.get(m.id) || [];
+        const { list: sliced, pageInfo } = sliceConn(list, { perPage: 10, ...args });
+        m.trends = { __typename: 'MediaTrendConnection', edges: sliced.map((n) => ({ __typename: 'MediaTrendEdge', node: n })), nodes: sliced, pageInfo };
+      }
+    }
+  }
+}
+
+/* ----------------------------- page execution ----------------------------- */
+async function runPageQuery(fargs, page, perPage, proj, mediaFieldNode, fragments, variables) {
+  const c = tursoClient();
+  if (!c) return null;
+  const { where, args } = tursoWhere(fargs);
+  const clause = where.join(' AND ');
+  const filterArgs = [...args]; // WHERE-only args for the COUNT probe
+  let order = tursoOrderClause(fargs.sort);
+  if (fargs.search && !fargs.sort) {
+    const q = String(fargs.search).toLowerCase().trim();
+    order = `CASE WHEN lower(coalesce(a.title_romaji,'')) = ? OR lower(coalesce(a.title_english,'')) = ? OR lower(coalesce(a.title_native,'')) = ? THEN 0 ELSE 1 END, ${order}`;
+    args.push(q, q, q); // ORDER-only args: must NOT leak into the COUNT query
+  }
+  const projKey = proj ? `cols:${proj.cols.length}` : 'raw';
+  const childrenKey = proj ? [...proj.children].sort().join(',') : '';
+  const pKey = pageCacheKey(clause, args, order, page, perPage, projKey, childrenKey);
+  const hit = cacheGet(pageCache, pKey, PAGE_TTL_MS);
+  if (hit) return hit;
+  const cKey = countCacheKey(clause, filterArgs);
+  const cachedTotal = cacheGet(countCache, cKey, COUNT_TTL_MS);
+  const dataSql = proj
+    ? `SELECT ${proj.cols.join(', ')} FROM anime a WHERE ${clause} ORDER BY ${order} LIMIT ? OFFSET ?`
+    : `SELECT a.raw_json AS raw_json FROM anime a WHERE ${clause} ORDER BY ${order} LIMIT ? OFFSET ?`;
+  const dataArgs = [...args, perPage, (page - 1) * perPage];
+  // Round trip 1: COUNT + page rows together.
+  const stmts = [];
+  const stmtKeys = [];
+  if (cachedTotal === undefined) { stmts.push({ sql: `SELECT COUNT(*) AS n FROM anime a WHERE ${clause}`, args: filterArgs }); stmtKeys.push('count'); }
+  stmts.push({ sql: dataSql, args: dataArgs }); stmtKeys.push('data');
+  let rss;
+  try {
+    rss = await batchExecute(stmts);
+  } catch (e) {
+    // FTS table missing on old DBs → retry once with LIKE instead of MATCH
+    if (fargs.search && !hasCJK(fargs.search) && clause.includes('anime_fts')) {
+      const fb = tursoWhere({ ...fargs, search: undefined });
+      searchWhereLikeOnly(fargs.search, fb.where, fb.args);
+      return runPageQueryLike({ ...fargs }, page, perPage, proj, mediaFieldNode, fragments, variables, fb);
+    }
+    throw e;
+  }
+  let total = cachedTotal;
+  const rowsets = {};
+  for (let i = 0; i < stmtKeys.length; i++) {
+    if (stmtKeys[i] === 'count') total = Number(rss[i].rows[0]?.n || 0);
+    else rowsets.data = rss[i].rows;
+  }
+  if (total === 0) {
+    const empty = { total: 0, items: [] };
+    cacheSet(pageCache, pKey, empty);
+    return empty;
+  }
+  let items;
+  if (proj) items = rowsets.data.map(rowToMedia);
+  else {
+    items = [];
+    for (const row of rowsets.data) {
+      try { if (row.raw_json) items.push(asExactMedia(JSON.parse(row.raw_json))); } catch { /* skip bad row */ }
+    }
+  }
+  // Round trip 2: nested children in one batch (and up to one more for nested media).
+  const children = proj ? proj.children : ALL_CHILDREN;
+  if (children.length && mediaFieldNode) {
+    try {
+      await assembleChildren(items, children, mediaFieldNode, fragments, variables);
+    } catch (e) { dbg('assembleChildren', e); /* children stay as raw_json provided them (raw path) or absent */ }
+  }
+  const out = { total, items };
+  cacheSet(pageCache, pKey, out);
+  return out;
+}
+const ALL_CHILDREN = ['genres', 'tags', 'studios', 'relations', 'characters', 'staff', 'recommendations', 'rankings', 'externalLinks', 'streamingEpisodes', 'stats', 'airingSchedule', 'reviews', 'trends', 'nextAiringEpisode'];
+function searchWhereLikeOnly(search, where, args) {
+  const q = String(search || '').toLowerCase().trim();
+  if (!q || q.length < 2) { where.push('1 = 0'); return; }
+  const tokens = searchTokensSql(q).slice(0, 5);
+  if (!tokens.length) { where.push(`${HAY} LIKE ? ESCAPE '\\'`); args.push(`%${escLike(q)}%`); return; }
+  for (const t of tokens) { where.push(`${HAY} LIKE ? ESCAPE '\\'`); args.push(`%${escLike(t)}%`); }
+}
+async function runPageQueryLike(fargs, page, perPage, proj, mediaFieldNode, fragments, variables, fb) {
+  // LIKE-forced variant (FTS unavailable). Same shape as runPageQuery.
+  const clause = fb.where.join(' AND ');
+  const filterArgs = [...fb.args];
+  let order = tursoOrderClause(fargs.sort);
+  if (fargs.search && !fargs.sort) {
+    const q = String(fargs.search).toLowerCase().trim();
+    order = `CASE WHEN lower(coalesce(a.title_romaji,'')) = ? OR lower(coalesce(a.title_english,'')) = ? OR lower(coalesce(a.title_native,'')) = ? THEN 0 ELSE 1 END, ${order}`;
+    fb.args.push(q, q, q);
+  }
+  const projKey = proj ? `cols:${proj.cols.length}` : 'raw';
+  const childrenKey = proj ? [...proj.children].sort().join(',') : '';
+  const pKey = pageCacheKey(clause, fb.args, order, page, perPage, `${projKey}:like`, childrenKey);
+  const hit = cacheGet(pageCache, pKey, PAGE_TTL_MS);
+  if (hit) return hit;
+  const dataSql = proj
+    ? `SELECT ${proj.cols.join(', ')} FROM anime a WHERE ${clause} ORDER BY ${order} LIMIT ? OFFSET ?`
+    : `SELECT a.raw_json AS raw_json FROM anime a WHERE ${clause} ORDER BY ${order} LIMIT ? OFFSET ?`;
+  const stmts = [
+    { sql: `SELECT COUNT(*) AS n FROM anime a WHERE ${clause}`, args: filterArgs },
+    { sql: dataSql, args: [...fb.args, perPage, (page - 1) * perPage] },
+  ];
+  const rss = await batchExecute(stmts);
+  const total = Number(rss[0].rows[0]?.n || 0);
+  if (total === 0) { const empty = { total: 0, items: [] }; cacheSet(pageCache, pKey, empty); return empty; }
+  let items;
+  if (proj) items = rss[1].rows.map(rowToMedia);
+  else {
+    items = [];
+    for (const row of rss[1].rows) {
+      try { if (row.raw_json) items.push(asExactMedia(JSON.parse(row.raw_json))); } catch { /* skip */ }
+    }
+  }
+  const children = proj ? proj.children : [];
+  if (children.length && mediaFieldNode) {
+    try { await assembleChildren(items, children, mediaFieldNode, fragments, variables); } catch { /* best effort */ }
+  }
+  const out = { total, items };
+  cacheSet(pageCache, pKey, out);
+  return out;
+}
+
+/* --------------------------- single Media fetch --------------------------- */
+async function tursoMediaByArgs(args, mediaFieldNode, fragments, variables) {
+  const c = tursoClient();
+  if (!c) return null;
+  const proj = planProjection(mediaFieldNode, fragments);
+  const select = proj ? proj.cols.join(', ') : 'a.id AS id, a.raw_json AS raw_json';
+
+  const finishBase = async (row) => {
+    if (!row) return null;
+    if (proj) return rowToMedia(row);
+    // raw path with LRU (raw_json blobs are ~350KB — cache parses, not fetches)
+    const key = `r${row.id}`;
+    let m;
+    const cch = rawCache.get(key);
+    if (cch && Date.now() - cch.time < RAW_TTL_MS) m = cch.data;
+    else {
+      m = asExactMedia(JSON.parse(row.raw_json));
+      rawCache.set(key, { data: m, time: Date.now() });
+      if (rawCache.size > MAX_CACHE_ENTRIES) rawCache.delete(rawCache.keys().next().value);
+    }
+    return m;
+  };
+
+  let row = null;
+  if (args.id != null) {
+    const rs = await c.execute({ sql: `SELECT ${select} FROM anime a WHERE a.id = ?`, args: [args.id] });
+    row = rs.rows[0] || null;
+  } else if (args.idMal != null) {
+    const rs = await c.execute({ sql: `SELECT id FROM anime WHERE id_mal = ?`, args: [args.idMal] });
+    const id = rs.rows[0]?.id;
+    if (id == null) return null;
+    const rs2 = await c.execute({ sql: `SELECT ${select} FROM anime a WHERE a.id = ?`, args: [id] });
+    row = rs2.rows[0] || null;
+  } else if (args.search) {
+    const where = [`COALESCE(a.type,'ANIME') = 'ANIME'`];
+    const wargs = [];
+    searchWhere(args.search, where, wargs);
+    const q = String(args.search).toLowerCase().trim();
+    const order = `CASE WHEN lower(coalesce(a.title_romaji,'')) = ? OR lower(coalesce(a.title_english,'')) = ? OR lower(coalesce(a.title_native,'')) = ? THEN 0 ELSE 1 END, popularity DESC NULLS LAST`;
+    const sql = `SELECT ${select} FROM anime a WHERE ${where.join(' AND ')} ORDER BY ${order} LIMIT 1`;
+    try {
+      const rs = await c.execute({ sql, args: [...wargs, q, q, q] });
+      row = rs.rows[0] || null;
+    } catch (e) {
+      // FTS unavailable on this DB → LIKE retry
+      if (hasCJK(args.search)) throw e;
+      const fb = [`COALESCE(a.type,'ANIME') = 'ANIME'`];
+      const fbArgs = [];
+      searchWhereLikeOnly(args.search, fb, fbArgs);
+      const rs = await c.execute({ sql: `SELECT ${select} FROM anime a WHERE ${fb.join(' AND ')} ORDER BY ${order} LIMIT 1`, args: [...fbArgs, q, q, q] });
+      row = rs.rows[0] || null;
+    }
+  } else return null;
+
+  let media = await finishBase(row);
+  if (media && mediaFieldNode) {
+    // assembler overrides raw fetch-time children and honors perPage/sort
+    const children = proj ? proj.children : assemblerChildrenFor(mediaFieldNode, fragments);
+    if (children.length) {
+      try { await assembleChildren([media], children, mediaFieldNode, fragments, variables); } catch (e) { dbg('mediaAssemble', e); /* raw content stands */ }
+    }
+  }
+  if (media && args.type && args.type !== 'ANIME') return null;
+  return media;
+}
+function finalizeMedia(m, args) {
+  if (args.type && args.type !== 'ANIME') return null;
+  return m;
+}
+function assemblerChildrenFor(mediaFieldNode, fragments) {
+  const sels = collectSelections(mediaFieldNode, fragments);
+  const out = new Set();
+  for (const s of sels) {
+    if (s.name.value === 'nextAiringEpisode' || ASSEMBLER_FIELDS.has(s.name.value)) {
+      if (s.selectionSet || s.name.value === 'genres') out.add(s.name.value);
+    }
+  }
+  return [...out];
 }
 
 async function resolvePage(fieldNode, fragments, variables, pageArgs) {
@@ -908,17 +1546,18 @@ async function resolvePage(fieldNode, fragments, variables, pageArgs) {
   const page = fargs.page || 1;
   const perPage = Math.min(fargs.perPage || 25, 50);
 
-  // Fast path: Turso is the primary DB (milliseconds). Only when the remote
+  // Fast path: Turso is the primary DB (indexed SQL). Only when the remote
   // is fully bootstrapped (tursoReady) do we serve from it; partial data
   // never serves. With TURSO_REQUIRED=1 there is no shard fallback.
   const required = tursoRequired();
   if (await tursoReady().catch(() => false)) {
     try {
-      let proj = null;
+      let proj;
       try { proj = planProjection(mediaFieldNode, fragments); } catch { proj = null; }
-      const t = await tursoPage(fargs, page, perPage, proj);
+      const t = await runPageQuery(fargs, page, perPage, proj, mediaFieldNode, fragments, variables);
       if (t) return pageOut(fieldNode, fragments, t.items, t.total, page, perPage);
     } catch (e) {
+      dbg('pageQuery', e);
       if (required) throw tursoUnavailable(`Turso Page query failed: ${e.message || e}`);
       /* shard fallback below */
     }
@@ -926,9 +1565,8 @@ async function resolvePage(fieldNode, fragments, variables, pageArgs) {
     throw tursoUnavailable('Turso not ready (bootstrap flag missing) and TURSO_REQUIRED=1');
   }
 
-  // NOTE: Turso path above already handled everything when remote has data;
-  // this shard fallback only runs pre-bootstrap or on Turso errors.
-  // The 12MB search index loads here for the first time — never on hot path.
+  // Shard fallback (pre-bootstrap or Turso errors). The 12MB search index
+  // loads here for the first time — never on the Turso hot path.
   const index = await getSearchIndex();
   const needFull = fargs.sort || fargs.tagCategory || fargs.tagCategory_in || fargs.tagCategory_not_in
     || fargs.minimumTagRank !== undefined || fargs.isLicensed !== undefined
@@ -958,53 +1596,62 @@ async function resolvePage(fieldNode, fragments, variables, pageArgs) {
   return pageOut(fieldNode, fragments, paged, total, page, perPage);
 }
 
-function splitYMD(s) {
-  const m = String(s || '').match(/^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$/);
-  if (!m) return { year: null, month: null, day: null };
-  return { year: parseInt(m[1], 10), month: m[2] ? parseInt(m[2], 10) : null, day: m[3] ? parseInt(m[3], 10) : null };
+function pageOut(fieldNode, fragments, paged, total, page, perPage) {
+  const out = {};
+  for (const s of fieldNode.selectionSet?.selections || []) {
+    if (s.kind !== Kind.FIELD) continue;
+    const k = s.alias?.value || s.name.value;
+    if (s.name.value === 'media') {
+      out[k] = paged.map((item) => pick(item, collectSelections(s, fragments), fragments));
+    } else if (s.name.value === 'pageInfo') {
+      out[k] = pick(buildPageInfo(total, page, perPage), collectSelections(s, fragments), fragments);
+    } else if (s.name.value === '__typename') {
+      out[k] = 'Page';
+    } else out[k] = null;
+  }
+  return out;
 }
-function jarr(s, fb = []) {
-  try { const v = JSON.parse(s || ''); return Array.isArray(v) ? v : fb; } catch { return fb; }
-}
-// Indexed entity lookups (single-row SQL, ~50ms). Null = fall back to shards.
+
+/* ------------- indexed entity lookups (Character/Staff/Studio) ------------ */
 async function tursoCharacter(args) {
   const c = tursoClient();
   if (!c) return null;
   let rs;
   if (args.id) rs = await c.execute({ sql: `SELECT * FROM characters WHERE id = ?`, args: [args.id] });
-  else if (args.search) rs = await c.execute({ sql: `SELECT * FROM characters WHERE lower(name_full) LIKE ? ESCAPE '\\' ORDER BY favourites DESC NULLS LAST LIMIT 1`, args: [`%${escLike(args.search)}%`] });
-  else return null;
+  else if (args.search) {
+    const expr = ftsExpr(args.search);
+    if (expr && !hasCJK(args.search)) {
+      try {
+        rs = await c.execute({ sql: `SELECT c.* FROM characters c JOIN characters_fts f ON f.rowid = c.id WHERE characters_fts MATCH ? ORDER BY c.favourites DESC NULLS LAST LIMIT 1`, args: [expr] });
+      } catch { rs = null; }
+    }
+    if (!rs || !rs.rows.length) {
+      rs = await c.execute({ sql: `SELECT * FROM characters WHERE lower(name_full) LIKE ? ESCAPE '\\' ORDER BY favourites DESC NULLS LAST LIMIT 1`, args: [`%${escLike(args.search)}%`] });
+    }
+  } else return null;
   const r = rs.rows[0];
   if (!r) return null;
-  return {
-    __typename: 'Character', id: r.id,
-    name: { __typename: 'CharacterName', first: r.name_first, middle: r.name_middle, last: r.name_last, full: r.name_full, native: r.name_native, alternative: jarr(r.name_alternative), alternativeSpoiler: jarr(r.name_alternative_spoiler), userPreferred: r.name_user_preferred || r.name_full },
-    image: { __typename: 'CharacterImage', large: r.image_large, medium: r.image_medium },
-    description: r.description, gender: r.gender, dateOfBirth: { __typename: 'FuzzyDate', ...splitYMD(r.date_of_birth) },
-    age: r.age, bloodType: r.blood_type, favourites: r.favourites, siteUrl: r.site_url,
-    isFavourite: false, isFavouriteBlocked: !!r.is_favourite_blocked,
-  };
+  return charFromRow(r);
 }
 async function tursoStaff(args) {
   const c = tursoClient();
   if (!c) return null;
   let rs;
   if (args.id) rs = await c.execute({ sql: `SELECT * FROM staff WHERE id = ?`, args: [args.id] });
-  else if (args.search) rs = await c.execute({ sql: `SELECT * FROM staff WHERE lower(name_full) LIKE ? ESCAPE '\\' ORDER BY favourites DESC NULLS LAST LIMIT 1`, args: [`%${escLike(args.search)}%`] });
-  else return null;
+  else if (args.search) {
+    const expr = ftsExpr(args.search);
+    if (expr && !hasCJK(args.search)) {
+      try {
+        rs = await c.execute({ sql: `SELECT s.* FROM staff s JOIN staff_fts f ON f.rowid = s.id WHERE staff_fts MATCH ? ORDER BY s.favourites DESC NULLS LAST LIMIT 1`, args: [expr] });
+      } catch { rs = null; }
+    }
+    if (!rs || !rs.rows.length) {
+      rs = await c.execute({ sql: `SELECT * FROM staff WHERE lower(name_full) LIKE ? ESCAPE '\\' ORDER BY favourites DESC NULLS LAST LIMIT 1`, args: [`%${escLike(args.search)}%`] });
+    }
+  } else return null;
   const r = rs.rows[0];
   if (!r) return null;
-  return {
-    __typename: 'Staff', id: r.id, language: r.language,
-    name: { __typename: 'StaffName', first: r.name_first, middle: r.name_middle, last: r.name_last, full: r.name_full, native: r.name_native, alternative: jarr(r.name_alternative), userPreferred: r.name_user_preferred || r.name_full },
-    image: { __typename: 'StaffImage', large: r.image_large, medium: r.image_medium },
-    description: r.description, primaryOccupations: jarr(r.primary_occupations), gender: r.gender,
-    dateOfBirth: { __typename: 'FuzzyDate', ...splitYMD(r.date_of_birth) },
-    dateOfDeath: { __typename: 'FuzzyDate', ...splitYMD(r.date_of_death) },
-    age: r.age, yearsActive: jarr(r.years_active), homeTown: r.home_town, bloodType: r.blood_type,
-    favourites: r.favourites, siteUrl: r.site_url,
-    isFavourite: false, isFavouriteBlocked: !!r.is_favourite_blocked,
-  };
+  return staffFromRow(r);
 }
 async function tursoStudio(args) {
   const c = tursoClient();
@@ -1019,7 +1666,8 @@ async function tursoStudio(args) {
 }
 async function tursoHealth() {
   // Public health signal: which DB host is configured (never the token),
-  // whether it answers, whether the completion flag is set.
+  // whether it answers, whether the completion flag is set, and whether the
+  // child tables actually hold data (drift detection).
   const out = { configured: false, host: null, reachable: false, flagged: false, remoteAnime: null };
   try {
     const raw = (typeof process !== 'undefined' && process.env?.TURSO_URL) || '';
@@ -1034,13 +1682,20 @@ async function tursoHealth() {
     if (!c) return out;
     const withTimeout = (p, ms) => Promise.race([
       p, new Promise((_, rej) => setTimeout(() => rej(new Error('health timeout')), ms))]);
-    const rs = await withTimeout(
-      c.execute({ sql: `SELECT (SELECT COUNT(*) FROM anime) AS n, (SELECT value FROM sync_state WHERE key='bootstrap_complete') AS f`, args: [] }), 8000);
+    const rs = await withTimeout(c.batch([
+      { sql: `SELECT (SELECT COUNT(*) FROM anime) AS n`, args: [] },
+      { sql: `SELECT (SELECT COUNT(*) FROM anime_genres) AS g, (SELECT COUNT(*) FROM relations) AS r, (SELECT COUNT(*) FROM recommendations) AS rec, (SELECT value FROM sync_state WHERE key='bootstrap_complete') AS f`, args: [] },
+    ], 'read'), 8000);
     out.reachable = true;
-    out.remoteAnime = Number(rs.rows[0]?.n ?? -1);
-    out.flagged = rs.rows[0]?.f === '1';
-  } catch { /* stays unreachable */
-  }
+    out.remoteAnime = Number(rs[0].rows[0]?.n ?? -1);
+    out.childCounts = {
+      animeGenres: Number(rs[1].rows[0]?.g ?? -1),
+      relations: Number(rs[1].rows[0]?.r ?? -1),
+      recommendations: Number(rs[1].rows[0]?.rec ?? -1),
+    };
+    out.flagged = rs[1].rows[0]?.f === '1';
+    out.ok = out.flagged && out.remoteAnime > 1000 && out.childCounts.animeGenres > 0 && out.childCounts.relations > 0;
+  } catch { /* stays unreachable */ }
   return out;
 }
 async function tursoHasRows(table) {
@@ -1147,9 +1802,14 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
       case 'Media': {
         if (await tursoReady().catch(() => false)) {
           try {
-            const t = await tursoMediaByArgs(args);
+            const t = await tursoMediaByArgs(args, fieldNode, fragments, variables);
             if (t) return pick(t, sels, fragments);
+            if ((args.id != null || args.idMal != null) && await tursoHasRows('anime')) {
+              throw Object.assign(new Error(`Media not found: ${args.id ?? args.idMal}`), { status: 404 });
+            }
           } catch (e) {
+            dbg('mediaRoot', e);
+            if (e?.status === 404) throw e;
             if (tursoRequired()) throw tursoUnavailable(`Turso Media query failed: ${e.message || e}`);
             /* shard fallback below */
           }
@@ -1189,11 +1849,13 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
       case 'Studio': {
         const fname = fieldNode.name.value;
         const table = fname === 'Character' ? 'characters' : fname === 'Staff' ? 'staff' : 'studios';
+        const cached = entityGet(fname, args);
+        if (cached !== undefined) return pick(cached, sels, fragments);
         if (await tursoReady().catch(() => false)) {
           try {
             const t = table === 'characters' ? await tursoCharacter(args)
               : table === 'staff' ? await tursoStaff(args) : await tursoStudio(args);
-            if (t) return pick(t, sels, fragments);
+            if (t) { entitySet(fname, args, t); return pick(t, sels, fragments); }
             // Authoritative miss only when the remote table holds data.
             if ((args.id || args.search) && await tursoHasRows(table)) {
               throw Object.assign(new Error(`${fname} not found`), { status: 404 });
@@ -1217,10 +1879,12 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
         return pick(list[0] || null, sels, fragments);
       }
       case 'AiringSchedule': {
+        const cached = entityGet('airing', args);
+        if (cached !== undefined) return pick(cached, sels, fragments);
         if (await tursoReady().catch(() => false)) {
           try {
             const t = await tursoAiring(args);
-            if (t) return pick(t, sels, fragments);
+            if (t) { entitySet('airing', args, t); return pick(t, sels, fragments); }
           } catch (e) {
             if (tursoRequired()) throw tursoUnavailable(`Turso AiringSchedule query failed: ${e.message || e}`);
             /* shard fallback below */
@@ -1238,9 +1902,11 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
               const hit = args.id
                 ? edges.find((e) => e.node?.id === args.id)?.node
                 : edges[0]?.node;
-              if (hit) return pick({ __typename: 'AiringSchedule', ...hit }, sels, fragments);
+              if (hit) { const o = { __typename: 'AiringSchedule', ...hit }; entitySet('airing', args, o); return pick(o, sels, fragments); }
               if (args.mediaId && a.nextAiringEpisode) {
-                return pick({ __typename: 'AiringSchedule', ...a.nextAiringEpisode }, sels, fragments);
+                const o = { __typename: 'AiringSchedule', ...a.nextAiringEpisode };
+                entitySet('airing', args, o);
+                return pick(o, sels, fragments);
               }
             }
           }
@@ -1302,14 +1968,18 @@ async function execute(query, variables = {}, operationName = null) {
 
   const data = {};
   const errors = [];
-  for (const field of op.selectionSet.selections) {
-    if (field.kind !== Kind.FIELD) continue;
+  const fields = op.selectionSet.selections.filter((f) => f.kind === Kind.FIELD);
+  // resolve root fields concurrently (independent data sources)
+  const settled = await Promise.all(fields.map(async (field) => {
     try {
-      const result = await resolveNode('RootQuery', field, fragments, variables);
-      data[field.alias?.value || field.name.value] = result;
+      return [field, await resolveNode('RootQuery', field, fragments, variables), null];
     } catch (err) {
-      errors.push({ message: err.message, status: err.status || 500, path: [field.name.value] });
+      return [field, null, err];
     }
+  }));
+  for (const [field, result, err] of settled) {
+    data[field.alias?.value || field.name.value] = result;
+    if (err) errors.push({ message: err.message, status: err.status || 500, path: [field.name.value] });
   }
   return errors.length ? { data, errors } : { data };
 }
@@ -1344,13 +2014,13 @@ export default async function handler(req, res) {
   if (req.method === 'GET') {
     const parsed = new URL(req.url, `https://${req.headers.host || 'localhost'}`);
     // Ops probe: ?health=1 reports Turso reachability + row counts (one
-    // cheap indexed read). Never exposes the auth token.
+    // cheap batched read). Never exposes the auth token.
     if (parsed.searchParams.get('health') === '1') {
       const h = await tursoHealth().catch(() => ({
         configured: false, host: null, reachable: false, flagged: false, remoteAnime: null,
       }));
       return nodeJson(res, {
-        ok: h.configured && h.reachable && h.flagged,
+        ok: !!(h.configured && h.reachable && h.flagged && (h.ok ?? true)),
         tursoRequired: tursoRequired(),
         ...h,
       }, 200);

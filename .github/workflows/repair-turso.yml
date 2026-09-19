@@ -1,0 +1,113 @@
+# One-off / on-demand Turso repair — runs the heavy data work on CI, never
+# on a local machine.
+#
+# What it does:
+#   1. Restores data/anilist.db from the Actions cache or the latest release.
+#   2. Rebuilds child tables from anime.raw_json (the fetcher's original
+#      table upserts silently failed for parts of the catalog — this makes
+#      the local DB complete).
+#   3. Runs scripts/turso_repair.py: verified per-batch push of every
+#      missing row to Turso (FK-filtered, deduped, count-verified).
+#   4. Re-uploads the repaired DB to the daily release so future runs
+#      restore from a complete DB.
+#
+# Dispatch inputs:
+#   rebuild_tables — comma-separated scoped tables to DELETE + fully re-push
+#     (needed when the remote holds PARTIAL rows, e.g. relations,recommendations).
+#     Leave empty for a plain diff + verify pass.
+#   skip_local_rebuild — set true only if data/anilist.db is known complete.
+
+name: Repair Turso
+
+on:
+  workflow_dispatch:
+    inputs:
+      rebuild_tables:
+        description: 'Comma-separated tables to fully rebuild remotely (empty = diff only)'
+        required: false
+        default: ''
+      skip_local_rebuild:
+        description: 'Skip rebuilding child tables from raw_json'
+        required: false
+        default: 'false'
+
+concurrency:
+  group: anilist-repair
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore database cache
+        uses: actions/cache/restore@v4
+        with:
+          path: data/anilist.db
+          key: anilist-db-repair-${{ github.run_id }}
+          restore-keys: |
+            anilist-db-
+
+      - name: Restore DB from release if cache missed
+        if: hashFiles('data/anilist.db') == ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p data
+          TAG=$(gh release view --json tagName -q .tagName 2>/dev/null || echo "")
+          if [ -z "$TAG" ]; then
+            echo "::error::No cached DB and no release to restore from."
+            exit 1
+          fi
+          echo "Downloading anilist.db.gz from $TAG..."
+          gh release download "$TAG" -p "anilist.db.gz" -O data/anilist.db.gz
+          gunzip -f data/anilist.db.gz
+          ls -lh data/anilist.db
+
+      - name: Rebuild child tables from raw_json (local DB completeness)
+        if: inputs.skip_local_rebuild != 'true'
+        run: python scripts/rebuild_children_from_raw.py
+
+      - name: Repair Turso (verified push)
+        env:
+          TURSO_URL: ${{ secrets.TURSO_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: |
+          ARGS=""
+          if [ -n "${{ inputs.rebuild_tables }}" ]; then
+            ARGS="--rebuild-tables ${{ inputs.rebuild_tables }}"
+          fi
+          python scripts/turso_repair.py $ARGS
+
+      - name: Re-release repaired DB
+        if: inputs.skip_local_rebuild != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gzip -kf data/anilist.db
+          TAG=$(gh release view --json tagName -q .tagName 2>/dev/null || echo "")
+          if [ -n "$TAG" ]; then
+            gh release upload "$TAG" data/anilist.db.gz --clobber
+            echo "Replaced anilist.db.gz on $TAG with the repaired DB."
+          else
+            echo "No release found — skipping re-upload."
+          fi
+
+      - name: Save repaired DB to cache (daily runs restore from here)
+        uses: actions/cache/save@v4
+        with:
+          path: data/anilist.db
+          key: anilist-db-daily-${{ github.run_id }}

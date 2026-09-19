@@ -8,11 +8,13 @@ name: Update AniList Database
 # - DAILY-ONLY rails design (Turso free-tier safe):
 #   - fetcher runs `rails` mode: 6 homepage rails only (Trending,
 #     Just Finished, Schedule, Top Airing, Top Movies, Upcoming),
-#     ~13 AniList requests, ~300-600 IDs. No airing full-walk, no
-#     catalog-wide counters.
-#   - turso_sync runs `--write-only`: ZERO remote SELECTs (blind
-#     CREATE IF NOT EXISTS + INSERT OR REPLACE / DELETE only) with a
-#     --max-rows 1000 cap that refuses catalog rewrites.
+#     ~13 AniList requests, ~300-600 IDs, PLUS an `updatedAt` sweep that
+#     fetches EVERY anime AniList touched since the last run (old or new) —
+#     so the mirror stays complete, not just rail-fresh.
+#   - turso_sync pushes touched rows via json_each batched inserts (one
+#     bound param per statement), parallelized, then VERIFIES pushed counts
+#     remotely and fails the run on any error/mismatch. Errors are recorded
+#     in docs/api/sync_report.json — never silent.
 # - GraphQL (api/index.js) is fully Turso-dependent for reads; the workflow
 #   never reads Turso, it only writes rail rows.
 
@@ -36,7 +38,8 @@ permissions:
 
 concurrency:
   group: "anilist-update-daily"
-  cancel-in-progress: true
+  # a cancelled mid-fetch run must not poison the cached DB for the next run
+  cancel-in-progress: false
 
 jobs:
   fetch-and-build:
@@ -114,14 +117,16 @@ jobs:
           python scripts/fetch_anilist.py
           echo "Fetch completed at $(date -u)"
 
-      - name: Sync to Turso (rails-only, write-only — zero remote reads)
-        # Daily rails: blind writes of touched rail IDs only. --write-only
-        # bans every remote SELECT; --max-rows refuses catalog rewrites.
+      - name: Sync to Turso (batched, parallel, verified)
+        # Pushes touched rail IDs via json_each batched inserts (one bound
+        # param per statement, parallel workers), then verifies pushed counts
+        # remotely. Any failed batch or count mismatch fails the run and is
+        # recorded in docs/api/sync_report.json — no silent partial syncs.
         env:
           TURSO_URL: ${{ secrets.TURSO_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: |
-          python scripts/turso_sync.py --write-only --max-minutes 8
+          python scripts/turso_sync.py --write-only --max-minutes 12
           echo "Turso sync completed at $(date -u)"
 
       - name: Show sync summary (what this run pushed to Turso)

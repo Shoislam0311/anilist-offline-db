@@ -285,6 +285,7 @@ RAIL_DEFS = [
     ("schedule", ["TRENDING_DESC"], "RELEASING", None, 2),
 ]
 RAIL_PER_PAGE = 50
+INCREMENTAL_FIRST_WINDOW_DAYS = 7
 
 
 class AniListFetcher:
@@ -595,8 +596,83 @@ class AniListFetcher:
         finally:
             conn.close()
 
-    # Keep other methods (full_fetch, incremental_fetch, etc.) if you still need them.
-    # For daily runs we only care about rails_fetch.
+    def incremental_fetch(self, max_pages=400):
+        """Catalog-wide change sweep.
+
+        AniList exposes `updatedAt` (unix seconds) on every media, so we can
+        fetch EXACTLY what changed since the last sweep — for ALL titles, old
+        and new, not just the homepage rails. Every changed title is fully
+        re-processed (upsert + children + raw_json) and lands in
+        touched_full so turso_sync replaces its Turso rows completely.
+
+        First-ever sweep looks back INCREMENTAL_FIRST_WINDOW_DAYS (7) to
+        cover the pipeline's own age; later sweeps resume from the stored
+        timestamp (minus a 5-minute overlap for boundary safety).
+        """
+        conn = init_db(self.db_path)
+        set_metadata(conn, "fetch_type", "incremental")
+        try:
+            last_raw = get_metadata(conn, "last_incremental_at")
+        except Exception:
+            last_raw = None
+        now = int(time.time())
+        if last_raw:
+            try:
+                since = int(float(last_raw)) - 300  # 5-min overlap
+            except (TypeError, ValueError):
+                since = now - INCREMENTAL_FIRST_WINDOW_DAYS * 86400
+        else:
+            since = now - INCREMENTAL_FIRST_WINDOW_DAYS * 86400
+
+        logger.info(f"Incremental sweep: fetching anime updated since {since} "
+                    f"({datetime.fromtimestamp(since, tz=timezone.utc).isoformat()})")
+        sweep_started_at = now
+        updated = 0
+        new_ids = 0
+        try:
+            for page in range(1, max_pages + 1):
+                data = self._request(INCREMENTAL_FETCH_QUERY, {
+                    "page": page, "perPage": RAIL_PER_PAGE, "updatedAt_greater": since,
+                })
+                if not data or "data" not in data:
+                    time.sleep(3)
+                    data = self._request(INCREMENTAL_FETCH_QUERY, {
+                        "page": page, "perPage": RAIL_PER_PAGE, "updatedAt_greater": since,
+                    })
+                    if not data or "data" not in data:
+                        logger.error(f"Incremental page {page} failed twice — stopping sweep")
+                        break
+                paged = data["data"]["Page"]
+                media_list = paged.get("media", []) or []
+                if not media_list:
+                    break
+                for media in media_list:
+                    aid = media.get("id")
+                    if not aid:
+                        continue
+                    is_new = aid not in {r[0] for r in conn.execute("SELECT id FROM anime WHERE id=?", (aid,)).fetchall()}
+                    self._process_anime(conn, media)
+                    if is_new:
+                        new_ids += 1
+                    updated += 1
+                conn.commit()
+                logger.info(f"  incremental page {page}: {len(media_list)} titles "
+                            f"(total {updated}, {new_ids} brand-new)")
+                if not paged.get("pageInfo", {}).get("hasNextPage"):
+                    break
+                if page == max_pages:
+                    logger.warning(f"Incremental sweep hit the {max_pages}-page cap "
+                                   f"({max_pages * RAIL_PER_PAGE} titles) — resume next run")
+            set_metadata(conn, "last_incremental_at", str(sweep_started_at))
+            conn.commit()
+            logger.info(f"Incremental sweep complete: {updated} titles updated "
+                        f"({new_ids} brand-new) — all queued for full Turso sync")
+        except KeyboardInterrupt:
+            logger.info("Interrupted. Saving progress...")
+            conn.commit()
+        finally:
+            conn.close()
+        return updated
 
 
 def main():
@@ -614,10 +690,15 @@ def main():
 
     if mode in ("daily", "rails"):
         fetcher.rails_fetch()
+        # catalog-wide change sweep: catches edits to ANY title (old or new),
+        # not just the 6 homepage rails. Skippable with SKIP_INCREMENTAL=1.
+        if os.environ.get("SKIP_INCREMENTAL", "") != "1":
+            fetcher.incremental_fetch()
     else:
-        # fallback – you can keep old methods if needed
-        logger.warning(f"Mode {mode} not fully implemented in this SMART version. Running rails.")
+        # fallback – unknown modes run the full daily pipeline
+        logger.warning(f"Mode {mode} not recognized. Running daily pipeline (rails + incremental).")
         fetcher.rails_fetch()
+        fetcher.incremental_fetch()
 
     fetcher._save_touched()
     fetcher.post_fetch()
