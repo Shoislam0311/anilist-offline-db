@@ -483,6 +483,10 @@ def verify(lconn, rconn):
                 f"COALESCE({c}, anime_id) IN (SELECT id FROM anime)" for c in fk)
             l = lconn.execute(
                 f'SELECT COUNT(*) FROM "{t}" WHERE anime_id IN (SELECT id FROM anime) AND {fk_where}').fetchone()[0]
+        elif t in LOGICAL_UNIQUE:
+            # remote is deduped by this key — compare the same locally
+            gc = ", ".join(f'"{c}"' for c in LOGICAL_UNIQUE[t])
+            l = lconn.execute(f'SELECT COUNT(*) FROM (SELECT 1 FROM "{t}" GROUP BY {gc})').fetchone()[0]
         else:
             l = lconn.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0]
         flag = "OK " if r >= l else "MISMATCH"
