@@ -402,8 +402,11 @@ def dedup_nopk_tables(lconn, rconn):
         try:
             r = rconn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
             l = lconn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
-            if r > l:
-                gc = ", ".join(f'"{c}"' for c in group_cols)
+            gc = ", ".join(f'"{c}"' for c in group_cols)
+            # always dedup logically-unique tables: duplicate pairs can exist
+            # even when the total is below local (e.g. after a dropped DELETE)
+            must = table in LOGICAL_UNIQUE or r > l
+            if must:
                 print(f"  dedup {table}: remote={r} local={l}")
                 rconn.execute(
                     f'DELETE FROM "{table}" WHERE rowid NOT IN '
@@ -427,11 +430,19 @@ def rebuild_tables(lconn, rconn_factory, tables, stats):
         if not tcols:
             continue
         t0t = time.monotonic()
-        rconn_factory().execute(f'DELETE FROM "{table}"')
-        try:
-            rconn_factory().commit()
-        except Exception:
-            pass
+        for attempt in range(1, 6):
+            dc = rconn_factory()
+            dc.execute(f'DELETE FROM "{table}"')
+            try:
+                dc.commit()
+            except Exception:
+                pass
+            vc = rconn_factory()
+            left = vc.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+            if left == 0:
+                break
+            print(f"  {table}: DELETE not visible ({left} rows left) — retry {attempt}")
+            time.sleep(1.5 * attempt)
         total_local = 0
         pushed = 0
         batch = 5000
