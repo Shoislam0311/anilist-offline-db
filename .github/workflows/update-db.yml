@@ -242,7 +242,11 @@ jobs:
           fi
 
       - name: Push changes
-        run: git push
+        # A concurrent push (code fix landing mid-run) must not nuke 30
+        # minutes of fetching: rebase onto the branch head and retry.
+        run: |
+          git pull --rebase --autostash origin "${{ github.ref_name }}" || true
+          git push || (git pull --rebase --autostash origin "${{ github.ref_name }}" && git push)
 
       - name: Save database cache
         uses: actions/cache/save@v4
