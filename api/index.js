@@ -477,22 +477,27 @@ function pageInfoOut(sel, info, fragments, vars) {
 
 function normRelations(raw, relFieldNode, edgesSub, nodeSub, pageSel, fragments, vars) {
   const verMap = relationTypeVersions(relFieldNode, fragments, vars);
-  const edges = ((raw && raw.edges) || []).map((e) => {
+  // Keep full (pre-projection) pairs: `nodes` must not depend on whether
+  // `node` was also selected inside `edges`.
+  const full = ((raw && raw.edges) || []).map((e) => {
     const node = e?.node ? pick(asMedia(e.node), nodeSub, fragments, vars) : null;
     const edge = { __typename: 'MediaEdge', id: e?.id ?? null, isMainStudio: false, node };
     for (const { key, version } of verMap) edge[key] = mapRelationType(e || {}, version);
     if (!verMap.length) edge.relationType = mapRelationType(e || {}, undefined);
+    return { edge, node };
+  });
+  const projectEdge = (edge) => {
     if (!edgesSub.length) return edge;
     const out = {};
     for (const s of edgesSub) {
       const k = s.alias?.value || s.name.value;
       if (s.name.value === '__typename') { out[k] = 'MediaEdge'; continue; }
-      out[k] = edge[s.name.value] !== undefined ? edge[s.name.value] : (key => edge[key])(k);
+      out[k] = edge[s.name.value] !== undefined ? edge[s.name.value] : edge[k];
     }
     return out;
-  });
-  // Direct `nodes` selection projects the same node objects as edges[].node.
-  const nodes = edges.map((e) => e.node);
+  };
+  const edges = full.map(({ edge }) => projectEdge(edge));
+  const nodes = full.map(({ node }) => node);
   return {
     __typename: 'MediaConnection',
     edges,
@@ -569,9 +574,9 @@ function normRecs(media, raw, args, edgesSub, nodeSub, pageSel, fragments, vars)
     if (withMedia.mediaRecommendation) withMedia.mediaRecommendation = asMedia(withMedia.mediaRecommendation);
     return pick({ __typename: 'Recommendation', ...withMedia }, nodeSub, fragments, vars);
   };
-  const edges = sliced.map((e) => {
-    const node = project(e);
-    const edge = { __typename: 'RecommendationEdge', node };
+  const nodes = sliced.map((e) => project(e));
+  const edges = sliced.map((e, i) => {
+    const edge = { __typename: 'RecommendationEdge', node: nodes[i] };
     if (!edgesSub.length) return edge;
     const out = {};
     for (const s of edgesSub) {
@@ -584,7 +589,7 @@ function normRecs(media, raw, args, edgesSub, nodeSub, pageSel, fragments, vars)
   return {
     __typename: 'RecommendationConnection',
     edges,
-    nodes: edges.map((e) => e.node),
+    nodes,
     pageInfo: pageSel
       ? pick({ __typename: 'PageInfo', total, perPage, currentPage: page, lastPage, hasNextPage: page < lastPage },
         collectSelections(pageSel, fragments), fragments, vars)
@@ -614,7 +619,7 @@ function normCrew(kind, raw, args, edgesSub, nodeSub, pageSel, fragments, vars) 
     const edge = { __typename: edgeType, id: e?.id ?? null, role: e?.role ?? null, node };
     if (kind === 'characters') { edge.favouriteOrder = e?.favouriteOrder ?? null; edge.voiceActors = e?.voiceActors ?? []; }
     else edge.favouriteOrder = e?.favouriteOrder ?? null;
-    if (!edgesSub.length) return edge;
+    if (!edgesSub.length) return { edge, node };
     const out = {};
     for (const s of edgesSub) {
       const k = s.alias?.value || s.name.value;
@@ -622,12 +627,12 @@ function normCrew(kind, raw, args, edgesSub, nodeSub, pageSel, fragments, vars) 
       if (s.name.value === 'node') { out[k] = node; continue; }
       out[k] = edge[s.name.value] !== undefined ? edge[s.name.value] : (e?.[s.name.value] ?? null);
     }
-    return out;
+    return { edge: out, node };
   });
   return {
     __typename: typename,
-    edges,
-    nodes: edges.map((e) => e.node),
+    edges: edges.map((x) => x.edge),
+    nodes: edges.map((x) => x.node),
     pageInfo: pageSel
       ? pick({ __typename: 'PageInfo', total, perPage, currentPage: page, lastPage, hasNextPage: page < lastPage },
         collectSelections(pageSel, fragments), fragments, vars)
@@ -641,7 +646,7 @@ function normStudios(raw, args, edgesSub, nodeSub, pageSel, fragments, vars) {
   const edges = list.map((e) => {
     const node = e?.node ? pick({ ...e.node, __typename: e.node.__typename || 'Studio' }, nodeSub, fragments, vars) : null;
     const edge = { __typename: 'StudioEdge', id: e?.id ?? null, isMain: !!e?.isMain, favouriteOrder: e?.favouriteOrder ?? null, node };
-    if (!edgesSub.length) return edge;
+    if (!edgesSub.length) return { edge, node };
     const out = {};
     for (const s of edgesSub) {
       const k = s.alias?.value || s.name.value;
@@ -649,12 +654,12 @@ function normStudios(raw, args, edgesSub, nodeSub, pageSel, fragments, vars) {
       if (s.name.value === 'node') { out[k] = node; continue; }
       out[k] = edge[s.name.value] !== undefined ? edge[s.name.value] : (e?.[s.name.value] ?? null);
     }
-    return out;
+    return { edge: out, node };
   });
   return {
     __typename: 'StudioConnection',
-    edges,
-    nodes: edges.map((e) => e.node),
+    edges: edges.map((x) => x.edge),
+    nodes: edges.map((x) => x.node),
     pageInfo: pageSel
       ? pick({ __typename: 'PageInfo', total: null, perPage: null, currentPage: null, lastPage: null, hasNextPage: false },
         collectSelections(pageSel, fragments), fragments, vars)
@@ -673,15 +678,15 @@ function normFeed(kind, raw, args, edgesSub, nodeSub, pageSel, fragments, vars) 
   const typename = kind === 'trends' ? 'MediaTrendConnection' : 'ReviewConnection';
   const edgeType = kind === 'trends' ? 'MediaTrendEdge' : 'ReviewEdge';
   const project = (n) => pick(n && typeof n === 'object' ? n : null, nodeSub, fragments, vars);
-  const edges = sliced.map((n) => {
-    const node = project(n);
-    const edge = { __typename: edgeType, node };
+  const nodes = sliced.map((n) => project(n));
+  const edges = sliced.map((n, i) => {
+    const edge = { __typename: edgeType, node: nodes[i] };
     if (!edgesSub.length) return edge;
     const out = {};
     for (const s of edgesSub) {
       const k = s.alias?.value || s.name.value;
       if (s.name.value === '__typename') { out[k] = edgeType; continue; }
-      if (s.name.value === 'node') { out[k] = node; continue; }
+      if (s.name.value === 'node') { out[k] = nodes[i]; continue; }
       out[k] = edge[s.name.value] ?? null;
     }
     return out;
@@ -689,7 +694,7 @@ function normFeed(kind, raw, args, edgesSub, nodeSub, pageSel, fragments, vars) 
   return {
     __typename: typename,
     edges,
-    nodes: edges.map((e) => e.node),
+    nodes,
     pageInfo: pageSel
       ? pick({ __typename: 'PageInfo', total, perPage, currentPage: page, lastPage, hasNextPage: page < lastPage },
         collectSelections(pageSel, fragments), fragments, vars)

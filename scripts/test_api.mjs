@@ -370,6 +370,13 @@ await test('relations derive nodes + null pageInfo + isMainStudio false', async 
   ok(rel.edges.every((e) => e.isMainStudio === false), 'isMainStudio false');
   eq(rel.pageInfo, { total: null, perPage: null, currentPage: null, lastPage: null, hasNextPage: false }, 'null pageInfo');
 });
+await test('relations nodes work without node in edges selection', async () => {
+  const r = await api.post({ query: '{ Page(page:1, perPage:1) { media(id: 101922) { relations { edges { relationType } nodes { id } } } } }' });
+  const rel = r.json?.data?.Page?.media?.[0]?.relations;
+  eq(rel?.edges?.length, 6, 'edges');
+  eq(rel?.nodes?.length, 6, 'nodes');
+  ok(rel.nodes.every((n) => n && n.id > 0), 'no null nodes: ' + JSON.stringify(rel.nodes));
+});
 await test('relationType versions fall back safely without V2/V3 columns', async () => {
   const r = await api.post({ query: '{ Page(page:1, perPage:1) { media(id: 101922) { relations { edges { relationType relationTypeV2: relationType(version: 2) relationTypeV3: relationType(version: 3) } } } } }' });
   const edges = r.json?.data?.Page?.media?.[0]?.relations?.edges || [];
