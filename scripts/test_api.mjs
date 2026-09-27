@@ -420,6 +420,14 @@ await test('Page.airingSchedules resolves to a list (no crash)', async () => {
   const rows = r.json?.data?.Page?.airingSchedules;
   ok(Array.isArray(rows), 'list, got: ' + JSON.stringify(r.json).slice(0, 200));
 });
+await test('Page.pageInfo follows airingSchedules when media is absent', async () => {
+  const r = await api.post({ query: '{ Page(page:1, perPage:5) { airingSchedules { id } pageInfo { total perPage currentPage lastPage hasNextPage } } }' });
+  const pi = r.json?.data?.Page?.pageInfo;
+  eq(pi.total, 5000, 'estimate total');
+  eq(pi.perPage, 5, 'perPage');
+  eq(pi.lastPage, 1000, 'lastPage');
+  eq(pi.hasNextPage, true, 'hasNextPage');
+});
 
 /* ================================ summary ================================= */
 console.log(`\n${passed} passed, ${failed} failed\n`);

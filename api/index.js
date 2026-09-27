@@ -2211,15 +2211,31 @@ async function resolvePageAiringSchedules(fieldNode, fragments, variables, page,
 
 async function pageOut(fieldNode, fragments, paged, total, page, perPage, variables) {
   const out = {};
-  for (const s of fieldNode.selectionSet?.selections || []) {
+  const selections = fieldNode.selectionSet?.selections || [];
+  const hasMedia = selections.some((s) => s.kind === Kind.FIELD && s.name.value === 'media');
+  const airSel = selections.find((s) => s.kind === Kind.FIELD && s.name.value === 'airingSchedules');
+  let airRows = null;
+  if (airSel) airRows = await resolvePageAiringSchedules(airSel, fragments, variables, page, perPage);
+  // Official Page.pageInfo.total follows the primary field: the media count
+  // when media is selected, else the airingSchedules estimate (5000 flat —
+  // the official estimator ignores filters, so the mirror matches it
+  // whenever the catalog actually holds schedule rows).
+  let effTotal = total;
+  if (airSel && !hasMedia) {
+    try {
+      const index = await getSearchIndex();
+      effTotal = index.some((e) => e.status === 'RELEASING') ? 5000 : 0;
+    } catch { effTotal = airRows.length ? 5000 : 0; }
+  }
+  for (const s of selections) {
     if (s.kind !== Kind.FIELD) continue;
     const k = s.alias?.value || s.name.value;
     if (s.name.value === 'media') {
       out[k] = paged.map((item) => pick(item, collectSelections(s, fragments), fragments, variables));
     } else if (s.name.value === 'pageInfo') {
-      out[k] = pick(buildPageInfo(total, page, perPage), collectSelections(s, fragments), fragments, variables);
+      out[k] = pick(buildPageInfo(effTotal, page, perPage), collectSelections(s, fragments), fragments, variables);
     } else if (s.name.value === 'airingSchedules') {
-      out[k] = await resolvePageAiringSchedules(s, fragments, variables, page, perPage);
+      out[k] = airRows;
     } else if (s.name.value === '__typename') {
       out[k] = 'Page';
     } else out[k] = null;
