@@ -738,24 +738,67 @@ def upsert_tags(conn: sqlite3.Connection, anime_id: int, tags: list):
         tag_name = tag.get("name", "")
         if not tag_name:
             continue
-        conn.execute("""
-            INSERT INTO tags (id, name, description, category, rank, is_general_spoiler, is_media_spoiler, is_adult)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET
-                id=COALESCE(excluded.id, id),
-                description=COALESCE(excluded.description, description),
-                category=COALESCE(excluded.category, category),
-                rank=COALESCE(excluded.rank, rank),
-                is_general_spoiler=excluded.is_general_spoiler,
-                is_media_spoiler=excluded.is_media_spoiler,
-                is_adult=excluded.is_adult
-        """, (
-            tag.get("id"), tag_name, tag.get("description"),
-            tag.get("category"), tag.get("rank", 0),
-            1 if tag.get("isGeneralSpoiler") else 0,
-            1 if tag.get("isMediaSpoiler") else 0,
-            1 if tag.get("isAdult") else 0,
-        ))
+        tag_id = tag.get("id")
+        description = tag.get("description")
+        category = tag.get("category")
+        if tag_id is not None:
+            # tags has TWO independent unique keys (id PK, name UNIQUE), but
+            # AniList renames and re-creates tags over time — the incoming
+            # (id, name) pair can collide with a stale row on the OTHER key.
+            # A bare ON CONFLICT(name) then dies with "UNIQUE constraint
+            # failed: tags.id" (it killed the first full-backfill run on CI).
+            # Retire the stale owner of this name first (keeping its
+            # description/category when the payload omits them), then upsert
+            # keyed by id so renames are adopted in both directions.
+            # anime_tags links by name and tags has no referencing FK, so
+            # swapping the row is safe.
+            owner = conn.execute(
+                "SELECT id, description, category FROM tags WHERE name=? AND id<>?",
+                (tag_name, tag_id),
+            ).fetchone()
+            if owner:
+                if description is None:
+                    description = owner[1]
+                if category is None:
+                    category = owner[2]
+                conn.execute("DELETE FROM tags WHERE id=?", (owner[0],))
+            conn.execute("""
+                INSERT INTO tags (id, name, description, category, rank, is_general_spoiler, is_media_spoiler, is_adult)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name=excluded.name,
+                    description=COALESCE(excluded.description, description),
+                    category=COALESCE(excluded.category, category),
+                    rank=COALESCE(excluded.rank, rank),
+                    is_general_spoiler=excluded.is_general_spoiler,
+                    is_media_spoiler=excluded.is_media_spoiler,
+                    is_adult=excluded.is_adult
+            """, (
+                tag_id, tag_name, description, category,
+                tag.get("rank", 0),
+                1 if tag.get("isGeneralSpoiler") else 0,
+                1 if tag.get("isMediaSpoiler") else 0,
+                1 if tag.get("isAdult") else 0,
+            ))
+        else:
+            # payload gave no id: NULL ids auto-assign and never collide, so
+            # the name-keyed upsert is safe on this path.
+            conn.execute("""
+                INSERT INTO tags (id, name, description, category, rank, is_general_spoiler, is_media_spoiler, is_adult)
+                VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    description=COALESCE(excluded.description, description),
+                    category=COALESCE(excluded.category, category),
+                    rank=COALESCE(excluded.rank, rank),
+                    is_general_spoiler=excluded.is_general_spoiler,
+                    is_media_spoiler=excluded.is_media_spoiler,
+                    is_adult=excluded.is_adult
+            """, (
+                tag_name, description, category, tag.get("rank", 0),
+                1 if tag.get("isGeneralSpoiler") else 0,
+                1 if tag.get("isMediaSpoiler") else 0,
+                1 if tag.get("isAdult") else 0,
+            ))
         conn.execute("""
             INSERT INTO anime_tags (anime_id, tag_name, tag_rank) VALUES (?, ?, ?)
             ON CONFLICT(anime_id, tag_name) DO UPDATE SET tag_rank=excluded.tag_rank

@@ -48,7 +48,7 @@ curl -X POST https://graphql.aniraku.tech/ \
 - **Full Backfill** - Manual `fetch_mode=full` dispatch rebuilds the complete AniList catalog (date-banded walks, split automatically around AniList's 5000-entry page-depth cap)
 - **Crash Recovery** - Resumes from checkpoint if interrupted
 - **GitHub Releases** - Database files attached to each release
-- **Tested** — 32-test suite runs the real Vercel handler in-process (`npm test`)
+- **Tested** — 32-test suite runs the real Vercel handler in-process (`npm test`); fetch-pipeline suites in `test/` cover the sweep, the full backfill, and tag upsert reconciliation (`python3 test/test_sweep.py`, `test_full.py`, `test_tags.py`)
 
 ## Quick Start
 
