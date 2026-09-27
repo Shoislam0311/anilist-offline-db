@@ -364,28 +364,337 @@ function collectSelections(node, fragments, seen = null) {
   }
   return out;
 }
-function pick(obj, sels, fragments) {
+function pick(obj, sels, fragments, variables) {
   if (obj == null) return obj;
   if (!sels || !sels.length) return obj;
+  const vars = variables || {};
   const out = {};
   for (const s of sels) {
     const key = s.alias?.value || s.name.value;
     if (s.name.value === '__typename') { out[key] = obj.__typename || 'Media'; continue; }
     const sub = s.selectionSet ? collectSelections(s, fragments) : null;
+    // Media connections served from raw shard JSON need normalization:
+    // derive nodes, honor page/perPage/sort + filters, map versioned enums,
+    // recompute live fields. Idempotent over Turso-assembled output.
+    if (sub?.length && obj.__typename === 'Media' && MEDIA_CONN_NORM[s.name.value]) {
+      out[key] = pickMediaConn(obj, s, sub, fragments, vars);
+      continue;
+    }
+    // nextAiringEpisode.timeUntilAiring is live (airingAt - now), never stale.
+    if (obj.__typename === 'Media' && s.name.value === 'nextAiringEpisode'
+        && obj.nextAiringEpisode && typeof obj.nextAiringEpisode === 'object') {
+      const na = obj.nextAiringEpisode;
+      const live = { ...na, __typename: na.__typename || 'AiringSchedule' };
+      if (live.airingAt != null) live.timeUntilAiring = Math.max(0, live.airingAt - Math.floor(Date.now() / 1000));
+      if (!sub?.length) { out[key] = live; continue; }
+      out[key] = pick(live, sub, fragments, vars);
+      continue;
+    }
     if (!sub || !sub.length) {
       out[key] = obj[s.name.value] ?? null;
       continue;
     }
     const val = obj[s.name.value];
     if (Array.isArray(val)) {
-      out[key] = val.map((item) => (item && typeof item === 'object' ? pick(item, sub, fragments) : item));
+      out[key] = val.map((item) => (item && typeof item === 'object' ? pick(item, sub, fragments, vars) : item));
     } else if (val && typeof val === 'object') {
-      out[key] = pick(val, sub, fragments);
+      out[key] = pick(val, sub, fragments, vars);
     } else {
       out[key] = val ?? null;
     }
   }
   return out;
+}
+
+/* ------- Media connection normalization (exact official shapes) ------- */
+// Raw shard JSON stores connections exactly as fetched (edges + pageInfo, no
+// nodes). Official clients query nodes / page / perPage / sort / filters and
+// versioned enums, so project them here. Safe to run over already-assembled
+// (Turso) connections: derivation is idempotent, version mapping falls back
+// to the stored base value when version columns are absent.
+const MEDIA_CONN_NORM = {
+  relations: 1, airingSchedule: 1, recommendations: 1, characters: 1,
+  staff: 1, studios: 1, trends: 1, reviews: 1,
+};
+
+function mapRelationType(edge, version) {
+  if (version === 2) return edge.relationTypeV2 ?? edge.relationType ?? null;
+  if (version === 3) return edge.relationTypeV3 ?? edge.relationTypeV2 ?? edge.relationType ?? null;
+  return edge.relationType ?? null;
+}
+
+// Requested `relationType(version:)` values keyed by response key (aliases
+// let one query ask several versions at once).
+function relationTypeVersions(relFieldNode, fragments, variables) {
+  const out = [];
+  for (const s of collectSelections(relFieldNode, fragments)) {
+    if (s.kind === Kind.FIELD && s.name.value === 'edges') {
+      for (const e of collectSelections(s, fragments)) {
+        if (e.kind === Kind.FIELD && e.name.value === 'relationType') {
+          out.push({ key: e.alias?.value || e.name.value, version: collectArgs(e, variables || {}).version });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+function asMedia(node) {
+  if (!node || typeof node !== 'object') return null;
+  return node.__typename ? node : { ...node, __typename: 'Media' };
+}
+
+function pickMediaConn(media, fieldNode, sub, fragments, vars) {
+  const name = fieldNode.name.value;
+  const args = collectArgs(fieldNode, vars);
+  const raw = media[name];
+  const edgesSel = sub.find((s) => s.kind === Kind.FIELD && s.name.value === 'edges');
+  const nodesSel = sub.find((s) => s.kind === Kind.FIELD && s.name.value === 'nodes');
+  const pageSel = sub.find((s) => s.kind === Kind.FIELD && s.name.value === 'pageInfo');
+  const edgesSub = edgesSel ? collectSelections(edgesSel, fragments) : [];
+  const nodeSub = (() => {
+    if (!edgesSel && !nodesSel) return [];
+    const fromEdge = edgesSel
+      ? collectSelections(edgesSel, fragments).find((s) => s.kind === Kind.FIELD && s.name.value === 'node')
+      : null;
+    const src = fromEdge || nodesSel;
+    return src ? collectSelections(src, fragments) : [];
+  })();
+
+  if (name === 'relations') return normRelations(raw, fieldNode, edgesSub, nodeSub, pageSel, fragments, vars);
+  if (name === 'airingSchedule') return normMediaAiring(media, raw, args, edgesSub, nodeSub, pageSel, fragments, vars);
+  if (name === 'recommendations') return normRecs(media, raw, args, edgesSub, nodeSub, pageSel, fragments, vars);
+  if (name === 'characters' || name === 'staff') return normCrew(name, raw, args, edgesSub, nodeSub, pageSel, fragments, vars);
+  if (name === 'studios') return normStudios(raw, args, edgesSub, nodeSub, pageSel, fragments, vars);
+  if (name === 'trends' || name === 'reviews') return normFeed(name, raw, args, edgesSub, nodeSub, pageSel, fragments, vars);
+  return raw ?? null;
+}
+
+function pageInfoOut(sel, info, fragments, vars) {
+  if (!sel) return undefined;
+  return pick(info, collectSelections(sel, fragments), fragments, vars);
+}
+
+function normRelations(raw, relFieldNode, edgesSub, nodeSub, pageSel, fragments, vars) {
+  const verMap = relationTypeVersions(relFieldNode, fragments, vars);
+  const edges = ((raw && raw.edges) || []).map((e) => {
+    const node = e?.node ? pick(asMedia(e.node), nodeSub, fragments, vars) : null;
+    const edge = { __typename: 'MediaEdge', id: e?.id ?? null, isMainStudio: false, node };
+    for (const { key, version } of verMap) edge[key] = mapRelationType(e || {}, version);
+    if (!verMap.length) edge.relationType = mapRelationType(e || {}, undefined);
+    if (!edgesSub.length) return edge;
+    const out = {};
+    for (const s of edgesSub) {
+      const k = s.alias?.value || s.name.value;
+      if (s.name.value === '__typename') { out[k] = 'MediaEdge'; continue; }
+      out[k] = edge[s.name.value] !== undefined ? edge[s.name.value] : (key => edge[key])(k);
+    }
+    return out;
+  });
+  // Direct `nodes` selection projects the same node objects as edges[].node.
+  const nodes = edges.map((e) => e.node);
+  return {
+    __typename: 'MediaConnection',
+    edges,
+    nodes,
+    pageInfo: pageSel
+      ? pick({ __typename: 'PageInfo', total: null, perPage: null, currentPage: null, lastPage: null, hasNextPage: false },
+        collectSelections(pageSel, fragments), fragments, vars)
+      : undefined,
+  };
+}
+
+function liveAiring(n, now) {
+  if (!n || typeof n !== 'object') return null;
+  const o = { __typename: 'AiringSchedule', ...n };
+  if (o.airingAt != null) o.timeUntilAiring = Math.max(0, o.airingAt - now);
+  return o;
+}
+
+function normMediaAiring(media, raw, args, edgesSub, nodeSub, pageSel, fragments, vars) {
+  const now = Math.floor(Date.now() / 1000);
+  const byId = new Map();
+  const push = (n) => {
+    if (!n || n.id == null || byId.has(n.id)) return;
+    byId.set(n.id, liveAiring({ ...n, mediaId: n.mediaId ?? media.id }, now));
+  };
+  for (const e of (raw?.edges || [])) push(e?.node);
+  for (const e of (media.upcomingAiring?.edges || [])) push(e?.node);
+  push(media.nextAiringEpisode);
+  let list = [...byId.values()].sort((a, b) => (a.airingAt || 0) - (b.airingAt || 0));
+  if (args.notYetAired) list = list.filter((n) => (n.airingAt || 0) > now);
+  const storedTotal = raw?.pageInfo?.total ?? media.upcomingAiring?.pageInfo?.total ?? 0;
+  const total = Math.max(storedTotal, list.length);
+  const perPage = Math.min(Math.max(1, args.perPage || 25), 25);
+  const page = Math.max(1, args.page || 1);
+  const sliced = list.slice((page - 1) * perPage, page * perPage);
+  const lastPage = Math.max(1, Math.ceil(total / perPage));
+  const project = (n) => pick(n, nodeSub, fragments, vars);
+  return {
+    __typename: 'AiringScheduleConnection',
+    edges: sliced.map((n) => {
+      const edge = { __typename: 'AiringScheduleEdge', id: n.id ?? null, node: project(n) };
+      if (!edgesSub.length) return edge;
+      const out = {};
+      for (const s of edgesSub) {
+        const k = s.alias?.value || s.name.value;
+        if (s.name.value === '__typename') { out[k] = 'AiringScheduleEdge'; continue; }
+        out[k] = edge[s.name.value] ?? null;
+      }
+      return out;
+    }),
+    nodes: sliced.map(project),
+    pageInfo: pageSel
+      ? pick({ __typename: 'PageInfo', total, perPage, currentPage: page, lastPage, hasNextPage: page < lastPage },
+        collectSelections(pageSel, fragments), fragments, vars)
+      : undefined,
+  };
+}
+
+function normRecs(media, raw, args, edgesSub, nodeSub, pageSel, fragments, vars) {
+  let list = [...((raw && raw.edges) || [])];
+  const sort = args.sort || 'RATING_DESC';
+  if (sort === 'RATING') list.sort((a, b) => (a?.node?.rating || 0) - (b?.node?.rating || 0));
+  else if (sort === 'ID') list.sort((a, b) => (a?.node?.id || 0) - (b?.node?.id || 0));
+  else if (sort === 'ID_DESC') list.sort((a, b) => (b?.node?.id || 0) - (a?.node?.id || 0));
+  else list.sort((a, b) => (b?.node?.rating || 0) - (a?.node?.rating || 0));
+  const total = raw?.pageInfo?.total ?? list.length;
+  const perPage = Math.min(Math.max(1, args.perPage || 25), 25);
+  const page = Math.max(1, args.page || 1);
+  const sliced = list.slice((page - 1) * perPage, page * perPage);
+  const lastPage = Math.max(1, Math.ceil(total / perPage));
+  const project = (e) => {
+    const n = e?.node || {};
+    const withMedia = { ...n, media: n.media || { __typename: 'Media', id: media.id } };
+    if (withMedia.mediaRecommendation) withMedia.mediaRecommendation = asMedia(withMedia.mediaRecommendation);
+    return pick({ __typename: 'Recommendation', ...withMedia }, nodeSub, fragments, vars);
+  };
+  const edges = sliced.map((e) => {
+    const node = project(e);
+    const edge = { __typename: 'RecommendationEdge', node };
+    if (!edgesSub.length) return edge;
+    const out = {};
+    for (const s of edgesSub) {
+      const k = s.alias?.value || s.name.value;
+      if (s.name.value === '__typename') { out[k] = 'RecommendationEdge'; continue; }
+      out[k] = edge[s.name.value] ?? null;
+    }
+    return out;
+  });
+  return {
+    __typename: 'RecommendationConnection',
+    edges,
+    nodes: edges.map((e) => e.node),
+    pageInfo: pageSel
+      ? pick({ __typename: 'PageInfo', total, perPage, currentPage: page, lastPage, hasNextPage: page < lastPage },
+        collectSelections(pageSel, fragments), fragments, vars)
+      : undefined,
+  };
+}
+
+function normCrew(kind, raw, args, edgesSub, nodeSub, pageSel, fragments, vars) {
+  let list = [...((raw && raw.edges) || [])];
+  if (kind === 'characters' && args.role) list = list.filter((e) => e?.role === args.role);
+  const sort = args.sort || '';
+  if (sort.startsWith('FAVOURITES')) {
+    const dir = sort === 'FAVOURITES' ? 1 : -1;
+    list.sort((a, b) => dir * ((a?.node?.favourites || 0) - (b?.node?.favourites || 0)));
+  } else if (sort === 'ID') list.sort((a, b) => (a?.node?.id || 0) - (b?.node?.id || 0));
+  else if (sort === 'ID_DESC') list.sort((a, b) => (b?.node?.id || 0) - (a?.node?.id || 0));
+  const total = raw?.pageInfo?.total ?? list.length;
+  const perPage = Math.min(Math.max(1, args.perPage || 25), 25);
+  const page = Math.max(1, args.page || 1);
+  const sliced = list.slice((page - 1) * perPage, page * perPage);
+  const lastPage = Math.max(1, Math.ceil(total / perPage));
+  const typename = kind === 'characters' ? 'CharacterConnection' : 'StaffConnection';
+  const edgeType = kind === 'characters' ? 'CharacterEdge' : 'StaffEdge';
+  const nodeType = kind === 'characters' ? 'Character' : 'Staff';
+  const edges = sliced.map((e) => {
+    const node = e?.node ? pick({ ...e.node, __typename: e.node.__typename || nodeType }, nodeSub, fragments, vars) : null;
+    const edge = { __typename: edgeType, id: e?.id ?? null, role: e?.role ?? null, node };
+    if (kind === 'characters') { edge.favouriteOrder = e?.favouriteOrder ?? null; edge.voiceActors = e?.voiceActors ?? []; }
+    else edge.favouriteOrder = e?.favouriteOrder ?? null;
+    if (!edgesSub.length) return edge;
+    const out = {};
+    for (const s of edgesSub) {
+      const k = s.alias?.value || s.name.value;
+      if (s.name.value === '__typename') { out[k] = edgeType; continue; }
+      if (s.name.value === 'node') { out[k] = node; continue; }
+      out[k] = edge[s.name.value] !== undefined ? edge[s.name.value] : (e?.[s.name.value] ?? null);
+    }
+    return out;
+  });
+  return {
+    __typename: typename,
+    edges,
+    nodes: edges.map((e) => e.node),
+    pageInfo: pageSel
+      ? pick({ __typename: 'PageInfo', total, perPage, currentPage: page, lastPage, hasNextPage: page < lastPage },
+        collectSelections(pageSel, fragments), fragments, vars)
+      : undefined,
+  };
+}
+
+function normStudios(raw, args, edgesSub, nodeSub, pageSel, fragments, vars) {
+  let list = [...((raw && raw.edges) || [])];
+  if (args.isMain !== undefined) list = list.filter((e) => !!e?.isMain === !!args.isMain);
+  const edges = list.map((e) => {
+    const node = e?.node ? pick({ ...e.node, __typename: e.node.__typename || 'Studio' }, nodeSub, fragments, vars) : null;
+    const edge = { __typename: 'StudioEdge', id: e?.id ?? null, isMain: !!e?.isMain, favouriteOrder: e?.favouriteOrder ?? null, node };
+    if (!edgesSub.length) return edge;
+    const out = {};
+    for (const s of edgesSub) {
+      const k = s.alias?.value || s.name.value;
+      if (s.name.value === '__typename') { out[k] = 'StudioEdge'; continue; }
+      if (s.name.value === 'node') { out[k] = node; continue; }
+      out[k] = edge[s.name.value] !== undefined ? edge[s.name.value] : (e?.[s.name.value] ?? null);
+    }
+    return out;
+  });
+  return {
+    __typename: 'StudioConnection',
+    edges,
+    nodes: edges.map((e) => e.node),
+    pageInfo: pageSel
+      ? pick({ __typename: 'PageInfo', total: null, perPage: null, currentPage: null, lastPage: null, hasNextPage: false },
+        collectSelections(pageSel, fragments), fragments, vars)
+      : undefined,
+  };
+}
+
+function normFeed(kind, raw, args, edgesSub, nodeSub, pageSel, fragments, vars) {
+  let list = [...((raw && raw.edges) || [])].map((e) => (e && e.node ? e.node : e));
+  if (kind === 'trends' && args.releasing !== undefined) list = list.filter((n) => !!n?.releasing === !!args.releasing);
+  const total = raw?.pageInfo?.total ?? list.length;
+  const perPage = Math.min(Math.max(1, args.perPage || 25), 25);
+  const page = Math.max(1, args.page || 1);
+  const sliced = list.slice((page - 1) * perPage, page * perPage);
+  const lastPage = Math.max(1, Math.ceil(total / perPage));
+  const typename = kind === 'trends' ? 'MediaTrendConnection' : 'ReviewConnection';
+  const edgeType = kind === 'trends' ? 'MediaTrendEdge' : 'ReviewEdge';
+  const project = (n) => pick(n && typeof n === 'object' ? n : null, nodeSub, fragments, vars);
+  const edges = sliced.map((n) => {
+    const node = project(n);
+    const edge = { __typename: edgeType, node };
+    if (!edgesSub.length) return edge;
+    const out = {};
+    for (const s of edgesSub) {
+      const k = s.alias?.value || s.name.value;
+      if (s.name.value === '__typename') { out[k] = edgeType; continue; }
+      if (s.name.value === 'node') { out[k] = node; continue; }
+      out[k] = edge[s.name.value] ?? null;
+    }
+    return out;
+  });
+  return {
+    __typename: typename,
+    edges,
+    nodes: edges.map((e) => e.node),
+    pageInfo: pageSel
+      ? pick({ __typename: 'PageInfo', total, perPage, currentPage: page, lastPage, hasNextPage: page < lastPage },
+        collectSelections(pageSel, fragments), fragments, vars)
+      : undefined,
+  };
 }
 
 /* ------------------------- AniList filter + sort -------------------------- */
@@ -1317,11 +1626,26 @@ async function assembleChildren(items, children, mediaFieldNode, fragments, vari
       const mediaMap = relIds.length
         ? await fetchNestedMedia(relIds, relNodeSel, fragments)
         : new Map();
+      // Honor relationType(version:) — versioned values ride along when the
+      // relations table carries them, else the stored base stands (idempotent).
+      let relVersion;
+      if (relSel?.selectionSet) {
+        const rs = collectSelections(relSel, fragments);
+        const edgeField = rs.find((s) => s.name.value === 'edges');
+        const rtField = edgeField
+          ? collectSelections(edgeField, fragments).find((s) => s.name.value === 'relationType')
+          : null;
+        relVersion = rtField ? collectArgs(rtField, variables).version : undefined;
+      }
       const tmp = new Map(ids.map((id) => [id, []]));
       for (const r of relRows) {
         if (!tmp.has(r.anime_id)) continue;
         tmp.get(r.anime_id).push({
-          __typename: 'MediaEdge', relationType: r.relation_type, isMainStudio: false,
+          __typename: 'MediaEdge', relationType: mapRelationType({
+            relationType: r.relation_type,
+            relationTypeV2: r.relation_type_v2,
+            relationTypeV3: r.relation_type_v3,
+          }, relVersion), isMainStudio: false,
           node: mediaMap.get(r.related_anime_id) || null,
         });
       }
@@ -1748,7 +2072,7 @@ async function resolvePage(fieldNode, fragments, variables, pageArgs) {
       let proj;
       try { proj = planProjection(mediaFieldNode, fragments); } catch { proj = null; }
       const t = await runPageQuery(fargs, page, perPage, proj, mediaFieldNode, fragments, variables);
-      if (t) return pageOut(fieldNode, fragments, t.items, t.total, page, perPage);
+      if (t) return await pageOut(fieldNode, fragments, t.items, t.total, page, perPage, variables);
     } catch (e) {
       dbg('pageQuery', e);
       if (required) throw tursoUnavailable(`Turso Page query failed: ${e.message || e}`);
@@ -1783,7 +2107,7 @@ async function resolvePage(fieldNode, fragments, variables, pageArgs) {
 
   // Fast path: every requested field lives in the index -> zero network.
   if (!hardFilters && canServeFromIndex(mediaFieldNode, fragments)) {
-    return pageOut(fieldNode, fragments, pagedRows.map(indexToMedia), total, page, perPage);
+    return await pageOut(fieldNode, fragments, pagedRows.map(indexToMedia), total, page, perPage, variables);
   }
 
   // Hard filters: hydrate the full id set once, apply full-object checks.
@@ -1793,24 +2117,104 @@ async function resolvePage(fieldNode, fragments, variables, pageArgs) {
     full = full.filter((m) => matchMedia(rowsById.get(m.id) || {}, m, fargs));
     sortMediaList(full, fargs.sort);
     const t = full.length;
-    return pageOut(fieldNode, fragments, full.slice((page - 1) * perPage, page * perPage), t, page, perPage);
+    return await pageOut(fieldNode, fragments, full.slice((page - 1) * perPage, page * perPage), t, page, perPage, variables);
   }
 
   // Shard-only fields requested: hydrate just the visible slice (a couple of
   // shards at most — the index already decided order and membership).
   const paged = await getAnimeBatch(pagedRows.map((e) => e.id));
-  return pageOut(fieldNode, fragments, paged, total, page, perPage);
+  return await pageOut(fieldNode, fragments, paged, total, page, perPage, variables);
 }
 
-function pageOut(fieldNode, fragments, paged, total, page, perPage) {
+/* Page.airingSchedules on the shard path: scan RELEASING titles' shards for
+ * schedule rows (past page-1 rows + upcoming rows + nextAiringEpisode),
+ * then apply the official filter/sort/page semantics. Official pageInfo.total
+ * is a clamped estimate (5000) that ignores filters — mirror matches it. */
+async function resolvePageAiringSchedules(fieldNode, fragments, variables, page, perPage) {
+  const args = collectArgs(fieldNode, variables || {});
+  const sels = collectSelections(fieldNode, fragments);
+  const now = Math.floor(Date.now() / 1000);
+  const index = await getSearchIndex();
+  let ids = index.filter((e) => e.status === 'RELEASING').map((e) => e.id);
+  const inList = (v, arr) => Array.isArray(arr) && arr.includes(v);
+  if (args.mediaId != null) ids = ids.filter((id) => id === args.mediaId);
+  if (args.mediaId_in) ids = ids.filter((id) => inList(id, args.mediaId_in));
+  if (args.mediaId_not != null) ids = ids.filter((id) => id !== args.mediaId_not);
+  if (args.mediaId_not_in) ids = ids.filter((id) => !inList(id, args.mediaId_not_in));
+  const shardStartIds = await getShardStartIds();
+  const byShard = new Map();
+  for (const id of ids) {
+    const si = shardStartIds.length ? shardIdxForId(shardStartIds, id) : -1;
+    if (si < 0) continue;
+    if (!byShard.has(si)) byShard.set(si, []);
+    byShard.get(si).push(id);
+  }
+  const found = new Map();
+  await Promise.all([...byShard.entries()].map(async ([si, arr]) => {
+    const shard = await getShard(si).catch(() => []);
+    for (const a of shard) if (arr.includes(a.id)) found.set(a.id, a);
+  }));
+  const all = new Map();
+  for (const a of found.values()) {
+    const push = (n) => {
+      if (!n || n.id == null || all.has(n.id)) return;
+      all.set(n.id, {
+        __typename: 'AiringSchedule', id: n.id, episode: n.episode ?? null,
+        airingAt: n.airingAt ?? null,
+        timeUntilAiring: n.airingAt != null ? Math.max(0, n.airingAt - now) : 0,
+        mediaId: a.id,
+      });
+    };
+    for (const e of a.airingSchedule?.edges || []) push(e?.node);
+    for (const e of a.upcomingAiring?.edges || []) push(e?.node);
+    push(a.nextAiringEpisode);
+  }
+  let list = [...all.values()];
+  const numFilter = (get, base, not, arrIn, arrNot, greater, lesser) => {
+    if (base != null) list = list.filter((n) => get(n) === base);
+    if (not != null) list = list.filter((n) => get(n) !== not);
+    if (arrIn) list = list.filter((n) => inList(get(n), arrIn));
+    if (arrNot) list = list.filter((n) => !inList(get(n), arrNot));
+    if (greater != null) list = list.filter((n) => (get(n) ?? -Infinity) > greater);
+    if (lesser != null) list = list.filter((n) => (get(n) ?? Infinity) < lesser);
+  };
+  numFilter((n) => n.id, args.id, args.id_not, args.id_in, args.id_not_in);
+  numFilter((n) => n.episode, args.episode, args.episode_not, args.episode_in, args.episode_not_in, args.episode_greater, args.episode_lesser);
+  numFilter((n) => n.airingAt, args.airingAt, args.airingAt_not, args.airingAt_in, args.airingAt_not_in, args.airingAt_greater, args.airingAt_lesser);
+  if (args.notYetAired) list = list.filter((n) => (n.airingAt || 0) > now);
+  const sorts = Array.isArray(args.sort) ? args.sort : (args.sort ? [args.sort] : ['TIME']);
+  const cmp = (a, b) => {
+    for (const srt of sorts) {
+      let d = 0;
+      if (srt === 'TIME_DESC') d = (b.airingAt || 0) - (a.airingAt || 0);
+      else if (srt === 'EPISODE') d = (a.episode || 0) - (b.episode || 0);
+      else if (srt === 'EPISODE_DESC') d = (b.episode || 0) - (a.episode || 0);
+      else if (srt === 'ID') d = (a.id || 0) - (b.id || 0);
+      else if (srt === 'ID_DESC') d = (b.id || 0) - (a.id || 0);
+      else if (srt === 'MEDIA_ID') d = (a.mediaId || 0) - (b.mediaId || 0);
+      else if (srt === 'MEDIA_ID_DESC') d = (b.mediaId || 0) - (a.mediaId || 0);
+      else d = (a.airingAt || 0) - (b.airingAt || 0);
+      if (d) return d;
+    }
+    return (a.id || 0) - (b.id || 0);
+  };
+  list.sort(cmp);
+  const total = all.size ? 5000 : 0;
+  const sliced = list.slice((page - 1) * perPage, page * perPage);
+  return sliced.map((n) => pick(n, sels, fragments, variables || {}));
+}
+
+async function pageOut(fieldNode, fragments, paged, total, page, perPage, variables) {
   const out = {};
   for (const s of fieldNode.selectionSet?.selections || []) {
     if (s.kind !== Kind.FIELD) continue;
     const k = s.alias?.value || s.name.value;
     if (s.name.value === 'media') {
-      out[k] = paged.map((item) => pick(item, collectSelections(s, fragments), fragments));
+      out[k] = paged.map((item) => pick(item, collectSelections(s, fragments), fragments, variables));
     } else if (s.name.value === 'pageInfo') {
-      out[k] = pick(buildPageInfo(total, page, perPage), collectSelections(s, fragments), fragments);
+      out[k] = pick(buildPageInfo(total, page, perPage), collectSelections(s, fragments), fragments, variables);
+    } else if (s.name.value === 'airingSchedules') {
+      out[k] = await resolvePageAiringSchedules(s, fragments, variables, page, perPage);
     } else if (s.name.value === '__typename') {
       out[k] = 'Page';
     } else out[k] = null;
@@ -2011,7 +2415,7 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
         if (await tursoReady().catch(() => false)) {
           try {
             const t = await tursoMediaByArgs(args, fieldNode, fragments, variables);
-            if (t) return pick(t, sels, fragments);
+            if (t) return pick(t, sels, fragments, variables);
             if ((args.id != null || args.idMal != null) && await tursoHasRows('anime')) {
               throw Object.assign(new Error(`Media not found: ${args.id ?? args.idMal}`), { status: 404 });
             }
@@ -2031,14 +2435,14 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
             e.status = 404;
             throw e;
           }
-          return pick(anime, sels, fragments);
+          return pick(anime, sels, fragments, variables);
         }
         if (args.idMal) {
           const index = await getSearchIndex();
           const hit = index.find((e) => e.idMal === args.idMal);
           if (!hit) throw Object.assign(new Error(`Media not found: idMal ${args.idMal}`), { status: 404 });
           const anime = await getAnimeById(hit.id);
-          return pick(anime, sels, fragments);
+          return pick(anime, sels, fragments, variables);
         }
         if (args.search) {
           const index = await getSearchIndex();
@@ -2048,7 +2452,7 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
             .sort((a, b) => (b.s - a.s) || ((b.e.popularity || 0) - (a.e.popularity || 0)));
           if (!ranked.length) throw Object.assign(new Error('Media not found'), { status: 404 });
           const anime = await getAnimeById(ranked[0].e.id);
-          return pick(anime, sels, fragments);
+          return pick(anime, sels, fragments, variables);
         }
         throw Object.assign(new Error('Media query requires id, idMal or search'), { status: 400 });
       }
@@ -2058,12 +2462,12 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
         const fname = fieldNode.name.value;
         const table = fname === 'Character' ? 'characters' : fname === 'Staff' ? 'staff' : 'studios';
         const cached = entityGet(fname, args);
-        if (cached !== undefined) return pick(cached, sels, fragments);
+        if (cached !== undefined) return pick(cached, sels, fragments, variables);
         if (await tursoReady().catch(() => false)) {
           try {
             const t = table === 'characters' ? await tursoCharacter(args)
               : table === 'staff' ? await tursoStaff(args) : await tursoStudio(args);
-            if (t) { entitySet(fname, args, t); return pick(t, sels, fragments); }
+            if (t) { entitySet(fname, args, t); return pick(t, sels, fragments, variables); }
             // Authoritative miss only when the remote table holds data.
             if ((args.id || args.search) && await tursoHasRows(table)) {
               throw Object.assign(new Error(`${fname} not found`), { status: 404 });
@@ -2082,17 +2486,17 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
         if (args.id) {
           const one = list.find((x) => x.id === args.id);
           if (!one) throw Object.assign(new Error(`${fieldNode.name.value} not found: ${args.id}`), { status: 404 });
-          return pick(one, sels, fragments);
+          return pick(one, sels, fragments, variables);
         }
-        return pick(list[0] || null, sels, fragments);
+        return pick(list[0] || null, sels, fragments, variables);
       }
       case 'AiringSchedule': {
         const cached = entityGet('airing', args);
-        if (cached !== undefined) return pick(cached, sels, fragments);
+        if (cached !== undefined) return pick(cached, sels, fragments, variables);
         if (await tursoReady().catch(() => false)) {
           try {
             const t = await tursoAiring(args);
-            if (t) { entitySet('airing', args, t); return pick(t, sels, fragments); }
+            if (t) { entitySet('airing', args, t); return pick(t, sels, fragments, variables); }
           } catch (e) {
             if (tursoRequired()) throw tursoUnavailable(`Turso AiringSchedule query failed: ${e.message || e}`);
             /* shard fallback below */
@@ -2110,11 +2514,11 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
               const hit = args.id
                 ? edges.find((e) => e.node?.id === args.id)?.node
                 : edges[0]?.node;
-              if (hit) { const o = { __typename: 'AiringSchedule', ...hit }; entitySet('airing', args, o); return pick(o, sels, fragments); }
+              if (hit) { const o = { __typename: 'AiringSchedule', ...hit }; entitySet('airing', args, o); return pick(o, sels, fragments, variables); }
               if (args.mediaId && a.nextAiringEpisode) {
                 const o = { __typename: 'AiringSchedule', ...a.nextAiringEpisode };
                 entitySet('airing', args, o);
-                return pick(o, sels, fragments);
+                return pick(o, sels, fragments, variables);
               }
             }
           }
@@ -2136,7 +2540,7 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
             const t = await tursoTags();
             if (t?.length) {
               if (!sels.length) return t;
-              return t.map((x) => pick(x, sels, fragments));
+              return t.map((x) => pick(x, sels, fragments, variables));
             }
           } catch (e) {
             if (tursoRequired()) throw tursoUnavailable(`Turso tags query failed: ${e.message || e}`);
@@ -2152,7 +2556,7 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
         }
         const list = [...tags.values()].map((t) => ({ __typename: 'MediaTag', ...t }));
         if (!sels.length) return list;
-        return list.map((t) => pick(t, sels, fragments));
+        return list.map((t) => pick(t, sels, fragments, variables));
       }
       default:
         throw Object.assign(new Error(`Unsupported root field in offline anime mirror: ${fieldNode.name.value}`), { status: 400 });

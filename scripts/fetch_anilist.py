@@ -84,7 +84,9 @@ MEDIA_FIELDS = """
       relations {
         edges {
           id
-          relationType(version: 2)
+          relationType
+          relationTypeV2: relationType(version: 2)
+          relationTypeV3: relationType(version: 3)
           node {
             id idMal title { romaji english native userPreferred }
             type format status(version: 2)
@@ -145,6 +147,10 @@ MEDIA_FIELDS = """
       isFavouriteBlocked
       nextAiringEpisode { id airingAt timeUntilAiring episode mediaId }
       airingSchedule(page: 1, perPage: 50) {
+        edges { node { id airingAt timeUntilAiring episode mediaId } }
+        pageInfo { total perPage currentPage lastPage hasNextPage }
+      }
+      upcomingAiring: airingSchedule(notYetAired: true, page: 1, perPage: 25) {
         edges { node { id airingAt timeUntilAiring episode mediaId } }
         pageInfo { total perPage currentPage lastPage hasNextPage }
       }
@@ -474,11 +480,26 @@ class AniListFetcher:
         except Exception:
             pass
 
-        sched = media.get("airingSchedule") or {}
-        if isinstance(sched, dict) and sched.get("edges"):
-            upsert_airing_schedule(conn, media["id"], sched.get("edges") or [])
-        elif media.get("nextAiringEpisode"):
-            upsert_airing_schedule(conn, media["id"], [media["nextAiringEpisode"]])
+        sched_nodes = []
+        for _key in ("airingSchedule", "upcomingAiring"):
+            _sched = media.get(_key) or {}
+            if isinstance(_sched, dict) and _sched.get("edges"):
+                for _e in _sched.get("edges") or []:
+                    _n = (_e or {}).get("node") if isinstance(_e, dict) and "node" in _e else _e
+                    if isinstance(_n, dict) and _n.get("id"):
+                        sched_nodes.append(_n)
+        if media.get("nextAiringEpisode"):
+            sched_nodes.append(media["nextAiringEpisode"])
+        # Dedupe by schedule id so page-1 history + upcoming + next-ep merge
+        # into one timeline (upsert_airing_schedule replaces per-anime rows).
+        _seen, _merged = set(), []
+        for _n in sched_nodes:
+            if _n.get("id") in _seen:
+                continue
+            _seen.add(_n.get("id"))
+            _merged.append(_n)
+        if _merged:
+            upsert_airing_schedule(conn, media["id"], _merged)
 
         upsert_external_links(conn, media["id"], media.get("externalLinks", []) or [])
         upsert_streaming_episodes(conn, media["id"], media.get("streamingEpisodes", []) or [])
@@ -507,8 +528,16 @@ class AniListFetcher:
             pass
 
         try:
+            _airing_nodes = []
+            _up = (media.get("upcomingAiring") or {}).get("edges") or []
+            for _e in _up:
+                _n = (_e or {}).get("node") if isinstance(_e, dict) and "node" in _e else _e
+                if isinstance(_n, dict) and _n.get("id"):
+                    _airing_nodes.append(_n)
             if next_ep:
-                upsert_airing_schedule(conn, aid, [next_ep])
+                _airing_nodes.append(next_ep)
+            if _airing_nodes:
+                upsert_airing_schedule(conn, aid, _airing_nodes)
         except Exception:
             pass
 
@@ -786,8 +815,19 @@ class AniListFetcher:
     def _fdate(dt) -> int:
         return dt.year * 10000 + dt.month * 100 + dt.day
 
+    @staticmethod
+    def _fparse(v: int):
+        """Parse a FuzzyDateInt band bound into a date for split math.
+
+        Bounds use sentinels like y*10000-1 (month/day 99) which are not
+        real dates — clamp month/day so datetime() stays valid; the clamp
+        maps sentinels to the natural year boundary.
+        """
+        y, m, d = v // 10000, (v // 100) % 100, v % 100
+        return datetime(y, min(max(m, 1), 12), min(max(d, 1), 31))
+
     def _full_walk_band(self, conn, g: int, l: int):
-        """Enumerate every anime whose startDate falls in [g, l] (yyyymmdd).
+        """Enumerate every anime whose startDate falls strictly in (g, l).
 
         Returns (count, hit_depth_cap). Pages are ID-sorted (unique total
         order) and we never request past AniList's 5000-entry depth cap; if
@@ -822,8 +862,8 @@ class AniListFetcher:
         stats["count"] += count
         if not hit_cap:
             return
-        gd = datetime(g // 10000, (g // 100) % 100, g % 100)
-        ld = datetime(l // 10000, (l // 100) % 100, l % 100)
+        gd = self._fparse(g)
+        ld = self._fparse(l)
         if gd >= ld or depth >= 10:
             logger.error(f"band {g}-{l} hit the entry cap and cannot be split further — skipped")
             stats["capped"] += 1
@@ -831,8 +871,10 @@ class AniListFetcher:
         mid = gd + (ld - gd) // 2
         logger.warning(f"band {g}-{l} hit AniList's {DEEP_PAGE_CAP * RAIL_PER_PAGE}-entry depth "
                        f"cap — splitting at {mid.date()}")
-        self._full_fetch_band(conn, stats, self._fdate(gd), self._fdate(mid), depth + 1)
-        self._full_fetch_band(conn, stats, self._fdate(mid + timedelta(days=1)), self._fdate(ld), depth + 1)
+        # open-interval partition: (g, mid+1d) ∪ (mid, l) == (g, l) exactly
+        # — no title lost at the seam regardless of the exclusive bounds.
+        self._full_fetch_band(conn, stats, g, self._fdate(mid + timedelta(days=1)), depth + 1)
+        self._full_fetch_band(conn, stats, self._fdate(mid), l, depth + 1)
 
     def _full_fetch_undated(self, conn, stats):
         """Titles with no startDate — they sort FIRST under START_DATE."""
@@ -864,9 +906,14 @@ class AniListFetcher:
     def full_fetch(self, start_date: int = 19000101, end_date: Optional[int] = None):
         """Full-catalog backfill: EVERY anime AniList knows (FETCH_MODE=full).
 
-        Walks startDate year bands (ID-sorted, split recursively whenever a
-        band would bust the 5000-entry page depth) plus the undated-title
-        bucket, fully processing every title (upsert + children + raw_json).
+        Walks startDate year bands (open bounds (y*10000-1, y*10000+9999)
+        because AniList compares strictly — this covers year-only dates
+        like {year: 1984, month: null} and Dec-31 dates exactly, with no
+        gap or overlap between adjacent years; ID-sorted, split
+        recursively whenever a band would bust the 5000-entry page depth)
+        plus the undated-title bucket, fully processing every title
+        (upsert + children + raw_json). start_date/end_date are
+        year-granular: the first/last year is always fully covered.
         On success it resets `last_incremental_at` so tomorrow's daily sweep
         starts from this build instead of re-walking a huge window.
 
@@ -878,16 +925,27 @@ class AniListFetcher:
         set_metadata(conn, "fetch_started_at", datetime.now(timezone.utc).isoformat())
         stats = {"count": 0, "capped": 0}
         if end_date is None:
-            end_date = (datetime.now(timezone.utc).year + 2) * 10000 + 1231
+            # year-granular: +5y of margin so far-future year-only
+            # announcements ({year: 2030, month: null}) still get a band
+            end_date = (datetime.now(timezone.utc).year + 5) * 10000 + 1231
         try:
             logger.info(f"FULL fetch: startDate bands {start_date}..{end_date} "
-                        f"(undated titles first, then year bands)")
+                        f"(year-granular; undated titles first, then year bands)")
             self._full_fetch_undated(conn, stats)
             year = start_date // 10000
             end_year = end_date // 10000
             while year <= end_year:
-                g = max(start_date, year * 10000 + 101)
-                l = min(end_date, year * 10000 + 1231)
+                # AniList's startDate_greater/lesser are STRICTLY open on
+                # both ends (verified live). A year-only date
+                # ({year: 1984, month: null, day: null}) is FuzzyDateInt
+                # 19840000 — it fell through Jan-1-bounded bands (the gap
+                # that hid 157 titles from the first full build), and
+                # Dec-31 dates fell out of a Dec-31-bounded l. Open bounds
+                # (y*10000-1, y*10000+9999) partition the year exactly:
+                # every real value y*10000..y*10000+1231 sits strictly
+                # inside, and adjacent bands neither gap nor overlap.
+                g = year * 10000 - 1
+                l = year * 10000 + 9999
                 before = stats["count"]
                 self._full_fetch_band(conn, stats, g, l)
                 if stats["count"] != before:

@@ -16,6 +16,10 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const FIXTURES = join(ROOT, 'test', 'fixtures');
+// Live dataset size: the bundled search_index.json grows with every fetch,
+// so totals derive from it instead of a hardcoded snapshot count.
+const _indexRaw = JSON.parse(readFileSync(join(ROOT, 'docs', 'api', 'search_index.json'), 'utf8'));
+const TOTAL_ANIME = Array.isArray(_indexRaw) ? _indexRaw.length : (_indexRaw.rows || _indexRaw.anime || []).length;
 
 /* ------------------------------ tiny harness ------------------------------ */
 let passed = 0, failed = 0;
@@ -171,7 +175,7 @@ await test('warm card query is fast (< 1200ms end-to-end)', async () => {
 await test('POPULARITY_DESC ordering + pageInfo totals come from the index', async () => {
   const r = await api.post({ query: CARD_QUERY });
   const { media, pageInfo } = r.json.data.Page;
-  eq(pageInfo.total, 14780, 'total anime');
+  eq(pageInfo.total, TOTAL_ANIME, 'total anime');
   const pops = media.map((m) => m.popularity);
   for (let i = 1; i < pops.length; i++) ok(pops[i - 1] >= pops[i], 'descending popularity');
   ok(media.every((m) => m.coverImage?.large || m.coverImage?.medium), 'covers present');
@@ -202,8 +206,8 @@ await test('tag_not_in filter excludes the tag (index path)', async () => {
   const t2 = q2.json?.data?.Page?.pageInfo?.total;
   ok(m1.length > 0, `tag: Isekai returned rows (got ${m1.length})`);
   ok(m2.length > 0, 'tag_not_in returned rows');
-  ok(t1 > 0 && t1 < 14780, `Isekai tag count sane (got ${t1})`);
-  eq(t2, 14780 - t1, 'tag_not_in total excludes exactly the tagged rows');
+  ok(t1 > 0 && t1 < TOTAL_ANIME, `Isekai tag count sane (got ${t1})`);
+  eq(t2, TOTAL_ANIME - t1, 'tag_not_in total excludes exactly the tagged rows');
   const ids2 = new Set(m2.map((m) => m.id));
   ok(m1.every((m) => !ids2.has(m.id)), 'no tagged id appears in the excluded set');
 });
@@ -218,8 +222,8 @@ await test('pagination pageInfo (page 2, perPage 50)', async () => {
   const pi = r.json?.data?.Page?.pageInfo;
   eq(pi.currentPage, 2, 'currentPage');
   eq(pi.perPage, 50, 'perPage');
-  eq(pi.total, 14780, 'total');
-  eq(pi.lastPage, Math.ceil(14780 / 50), 'lastPage');
+  eq(pi.total, TOTAL_ANIME, 'total');
+  eq(pi.lastPage, Math.ceil(TOTAL_ANIME / 50), 'lastPage');
   eq(pi.hasNextPage, true, 'hasNextPage');
   eq(pi.hasPreviousPage, true, 'hasPreviousPage');
 });
@@ -354,6 +358,60 @@ await test('tursoWhere(tag_not_in) builds a valid, count-matched statement', asy
   eq(placeholders, args.length, 'placeholder/arg count must match');
   ok(clause.includes('NOT EXISTS'), 'uses NOT EXISTS');
   eq(args.length, 2, 'two args');
+});
+
+console.log('\n== media connection normalization (nodes/pagination/versions) ==');
+await test('relations derive nodes + null pageInfo + isMainStudio false', async () => {
+  const r = await api.post({ query: '{ Page(page:1, perPage:1) { media(id: 101922) { relations { edges { id relationType isMainStudio node { id } } nodes { id } pageInfo { total perPage currentPage lastPage hasNextPage } } } } }' });
+  const rel = r.json?.data?.Page?.media?.[0]?.relations;
+  eq(rel?.edges?.length, 6, 'edges');
+  eq(rel?.nodes?.length, 6, 'nodes derived');
+  eq(rel.nodes.map((n) => n.id), rel.edges.map((e) => e.node.id), 'nodes match edges');
+  ok(rel.edges.every((e) => e.isMainStudio === false), 'isMainStudio false');
+  eq(rel.pageInfo, { total: null, perPage: null, currentPage: null, lastPage: null, hasNextPage: false }, 'null pageInfo');
+});
+await test('relationType versions fall back safely without V2/V3 columns', async () => {
+  const r = await api.post({ query: '{ Page(page:1, perPage:1) { media(id: 101922) { relations { edges { relationType relationTypeV2: relationType(version: 2) relationTypeV3: relationType(version: 3) } } } } }' });
+  const edges = r.json?.data?.Page?.media?.[0]?.relations?.edges || [];
+  eq(edges.length, 6, 'edges');
+  ok(edges.every((e) => e.relationTypeV2 === e.relationType && e.relationTypeV3 === e.relationType), 'versions fall back to base');
+  eq(edges[0].relationType, 'ADAPTATION', 'base value intact');
+});
+await test('recommendations honor perPage/sort and derive nodes', async () => {
+  const r = await api.post({ query: '{ Page(page:1, perPage:1) { media(id: 101922) { recommendations(page: 1, perPage: 2) { edges { node { rating mediaRecommendation { id } } } nodes { rating } pageInfo { total perPage currentPage hasNextPage } } } } }' });
+  const rec = r.json?.data?.Page?.media?.[0]?.recommendations;
+  eq(rec?.edges?.length, 2, 'perPage slice');
+  eq(rec?.nodes?.length, 2, 'nodes derived');
+  eq(rec.pageInfo.perPage, 2, 'pageInfo perPage');
+  const ratings = rec.edges.map((e) => e.node.rating);
+  ok(ratings[0] >= ratings[1] && ratings[0] === 3346, `RATING_DESC order kept (${ratings})`);
+});
+await test('characters honor perPage and derive nodes', async () => {
+  const r = await api.post({ query: '{ Page(page:1, perPage:1) { media(id: 101922) { characters(page: 1, perPage: 2) { edges { role node { id } } nodes { id } pageInfo { perPage } } } } }' });
+  const ch = r.json?.data?.Page?.media?.[0]?.characters;
+  eq(ch?.edges?.length, 2, 'perPage slice');
+  eq(ch?.nodes?.length, 2, 'nodes derived');
+  eq(ch.pageInfo.perPage, 2, 'pageInfo perPage');
+});
+await test('studios derive nodes and honor isMain filter', async () => {
+  const r = await api.post({ query: '{ Page(page:1, perPage:1) { media(id: 101922) { studios { edges { isMain node { id } } nodes { id } } main: studios(isMain: true) { edges { isMain } } } } }' });
+  const st = r.json?.data?.Page?.media?.[0]?.studios;
+  eq(st?.nodes?.length, st?.edges?.length, 'nodes derived');
+  const main = r.json?.data?.Page?.media?.[0]?.main;
+  ok(main?.edges?.length >= 1 && main.edges.every((e) => e.isMain === true), 'isMain filter');
+});
+await test('empty airingSchedule projects cleanly (no crash)', async () => {
+  const r = await api.post({ query: '{ Page(page:1, perPage:1) { media(id: 101922) { airingSchedule { edges { node { id } } nodes { id } pageInfo { total perPage } } nextAiringEpisode { id } } } }' });
+  const m = r.json?.data?.Page?.media?.[0];
+  eq(m?.airingSchedule?.edges?.length, 4, 'stored rows served');
+  eq(m?.airingSchedule?.nodes?.length, 4, 'nodes derived');
+  eq(m?.airingSchedule?.pageInfo?.total, 4, 'total falls back to stored length');
+  eq(m?.nextAiringEpisode, null, 'null next episode stays null');
+});
+await test('Page.airingSchedules resolves to a list (no crash)', async () => {
+  const r = await api.post({ query: '{ Page(page:1, perPage:5) { airingSchedules { id episode airingAt mediaId } pageInfo { total } } }' });
+  const rows = r.json?.data?.Page?.airingSchedules;
+  ok(Array.isArray(rows), 'list, got: ' + JSON.stringify(r.json).slice(0, 200));
 });
 
 /* ================================ summary ================================= */

@@ -269,6 +269,20 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # fetch-and-build pushed new commits mid-run; the default checkout
+          # pins the dispatch SHA (stale docs). Track the branch head instead.
+          ref: ${{ github.ref_name }}
+
+      - name: Purge jsDelivr CDN cache for data files
+        # The API + site read docs/api via jsDelivr, which caches branch
+        # files for hours after a push. Purge so the new releaseTag/index
+        # go live immediately (release shards are immutable per tag).
+        run: |
+          for f in metadata.json search_index.json search_index.json.gz shard_manifest.json sample.json; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "https://purge.jsdelivr.net/gh/${{ github.repository }}@main/docs/api/$f")
+            echo "purge $f -> $code"
+          done
 
       - name: Setup Pages
         uses: actions/configure-pages@v5

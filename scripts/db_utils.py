@@ -257,6 +257,8 @@ CREATE TABLE IF NOT EXISTS relations (
     anime_id INTEGER NOT NULL,
     related_anime_id INTEGER NOT NULL,
     relation_type TEXT NOT NULL,
+    relation_type_v2 TEXT,
+    relation_type_v3 TEXT,
     FOREIGN KEY (anime_id) REFERENCES anime(id) ON DELETE CASCADE,
     FOREIGN KEY (related_anime_id) REFERENCES anime(id) ON DELETE CASCADE
 );
@@ -534,6 +536,8 @@ CREATE TABLE IF NOT EXISTS reviews (
         ("anime_characters", "edge_id", "INTEGER"), ("anime_characters", "favourite_order", "INTEGER"),
         ("anime_studios", "edge_id", "INTEGER"), ("anime_studios", "favourite_order", "INTEGER"),
         ("airing_schedule", "media_id", "INTEGER"),
+        ("relations", "relation_type_v2", "TEXT"),
+        ("relations", "relation_type_v3", "TEXT"),
         ("external_links", "id", "INTEGER"), ("external_links", "type", "TEXT"),
         ("streaming_episodes", "url", "TEXT"),
         ("tags", "is_general_spoiler", "INTEGER DEFAULT 0"),
@@ -964,16 +968,29 @@ def upsert_staff(conn: sqlite3.Connection, anime_id: int, staff_data: dict):
 
 def upsert_relations(conn: sqlite3.Connection, anime_id: int, relations_data: dict):
     conn.execute("DELETE FROM relations WHERE anime_id=?", (anime_id,))
+    has_v2 = has_v3 = True
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(relations)").fetchall()}
+        has_v2 = "relation_type_v2" in cols
+        has_v3 = "relation_type_v3" in cols
+    except Exception:
+        pass
     for edge in relations_data.get("edges", []):
         node = edge.get("node") or {}
         related_id = node.get("id")
         rel_type = edge.get("relationType")
         if related_id and rel_type:
             try:
-                conn.execute("""
-                    INSERT INTO relations (anime_id, related_anime_id, relation_type)
-                    VALUES (?, ?, ?)
-                """, (anime_id, related_id, rel_type))
+                if has_v2 and has_v3:
+                    conn.execute("""
+                        INSERT INTO relations (anime_id, related_anime_id, relation_type, relation_type_v2, relation_type_v3)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (anime_id, related_id, rel_type, edge.get("relationTypeV2"), edge.get("relationTypeV3")))
+                else:
+                    conn.execute("""
+                        INSERT INTO relations (anime_id, related_anime_id, relation_type)
+                        VALUES (?, ?, ?)
+                    """, (anime_id, related_id, rel_type))
             except Exception:
                 pass
 

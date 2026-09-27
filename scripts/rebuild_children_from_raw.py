@@ -86,11 +86,24 @@ def main():
                     upsert_reviews(conn, aid2, media.get("reviews", {}) or {})
                 with contextlib.suppress(Exception):
                     upsert_statistics(conn, aid2, media.get("stats", {}) or {})
-                sched = media.get("airingSchedule") or {}
-                if isinstance(sched, dict) and sched.get("edges"):
-                    upsert_airing_schedule(conn, aid2, sched.get("edges") or [])
-                elif media.get("nextAiringEpisode"):
-                    upsert_airing_schedule(conn, aid2, [media["nextAiringEpisode"]])
+                _sched_nodes = []
+                for _key in ("airingSchedule", "upcomingAiring"):
+                    _s = media.get(_key) or {}
+                    if isinstance(_s, dict) and _s.get("edges"):
+                        for _e in _s.get("edges") or []:
+                            _n = (_e or {}).get("node") if isinstance(_e, dict) and "node" in _e else _e
+                            if isinstance(_n, dict) and _n.get("id"):
+                                _sched_nodes.append(_n)
+                if media.get("nextAiringEpisode"):
+                    _sched_nodes.append(media["nextAiringEpisode"])
+                _seen, _merged = set(), []
+                for _n in _sched_nodes:
+                    if _n.get("id") in _seen:
+                        continue
+                    _seen.add(_n.get("id"))
+                    _merged.append(_n)
+                if _merged:
+                    upsert_airing_schedule(conn, aid2, _merged)
                 upsert_external_links(conn, aid2, media.get("externalLinks", []) or [])
                 upsert_streaming_episodes(conn, aid2, media.get("streamingEpisodes", []) or [])
             except Exception as e:

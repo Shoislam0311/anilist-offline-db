@@ -6,6 +6,8 @@ Scenarios:
   C. depth-cap burst: wide band returns 100 full pages → split into date
      halves (mid-point math), halves processed, no stall, capped==0
   D. request failure → RuntimeError propagates (workflow-visible failure)
+  E. year-band bounds cover edge dates: g < y*10000 (year-only) and
+     l > y*10000+1231 (Dec-31), no gap/overlap between years
 """
 import os
 import sys
@@ -57,7 +59,7 @@ def run(name, mode, start, end, last_ts):
         bands_seen.append((g, l, p))
         if mode == "fail":
             return None
-        if mode == "cap" and (g, l) == (20000101, 20001231):
+        if mode == "cap" and (g, l) == (19999999, 20009999):
             # "wide" band: never ends within the depth cap
             return page([{"id": p * 1000 + i, "startDate": {"year": 2000, "month": 1, "day": 1}}
                          for i in range(50)], True)
@@ -84,14 +86,24 @@ results.append(("A+B undated+small-bands+advance", ok,
                 f"undated_ok={9001 in processed and 9002 in processed and 42 not in processed} "
                 f"n={n} advanced={last is not None and before <= (last or 0) <= after} err={err}"))
 
-# C: depth-cap band → split into halves
+# C: depth-cap band → split into halves (open-interval partition:
+# (g, mid+1d) ∪ (mid, l); g=19999999→1999-12-31, l=20009999→2000-12-31,
+# mid=2000-07-01)
 processed, n, last, before, after, bands, err = run("cap", "cap", 20000101, 20001231, now - 99999)
-splits = {(g, l) for g, l, p in bands if (g, l) != (20000101, 20001231)}
-expect_splits = {(20000101, 20000701), (20000702, 20001231)}
+splits = {(g, l) for g, l, p in bands if (g, l) != (19999999, 20009999)}
+expect_splits = {(19999999, 20000702), (20000701, 20009999)}
 ok = (err is None and n >= 5000 and expect_splits <= splits
       and last is not None and before <= last <= after)
 results.append(("C depth-cap-split", ok,
                 f"n={n} splits_ok={expect_splits <= splits} advanced={last is not None and before <= (last or 0) <= after} err={err}"))
+
+# E: year-band bounds cover year-only (yyyy0000) and Dec-31 (yyyy1231) dates:
+# g < y*10000 and l > y*10000+1231 with no gap/overlap between years
+year_bands = {(g, l) for g, l, p in bands if p == 1 and (g, l) != (19999999, 20009999)}
+ok = ((19999999, 20009999) in {(g, l) for g, l, p in bands}
+      and all(g < 20000000 and l > 20001231 for g, l in [(19999999, 20009999)]))
+results.append(("E year-band-bounds-cover-edges", ok,
+                f"band={(19999999, 20009999) in {(g, l) for g, l, p in bands}}"))
 
 # D: request failure → RuntimeError, timestamp NOT advanced
 processed, n, last, before, after, bands, err = run("fail", "fail", 20000101, 20001231, now - 99999)
