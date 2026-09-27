@@ -187,9 +187,38 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload shard assets
+        # --clobber is delete-then-upload (non-atomic): 8 parallel streams
+        # hit secondary rate limits and a failed batch DELETES assets without
+        # re-uploading them (that's how 19 shards went missing). So: gentle
+        # parallelism, per-file retries, then a count check that fails loudly
+        # instead of deploying partial. Never fail silently partial.
         run: |
           cd docs/api/shards
-          ls shard_*.json.gz | xargs -P 8 -n 20 gh release upload "${{ steps.rel.outputs.tag }}" --clobber
+          EXPECTED=$(python -c "import json; print(json.load(open('../shard_manifest.json'))['totalShards'])")
+          echo "expecting $EXPECTED shard assets"
+          upload_one() {
+            local f="$1" tag="$2" attempt=1
+            while [ $attempt -le 4 ]; do
+              if gh release upload "$tag" --clobber "$f" >/dev/null 2>&1; then return 0; fi
+              echo "retry $f (attempt $attempt)"
+              sleep $((attempt * 15)); attempt=$((attempt + 1))
+            done
+            echo "::error::upload failed 4x: $f"; return 1
+          }
+          export -f upload_one
+          export TAG="${{ steps.rel.outputs.tag }}"
+          ls shard_*.json.gz | xargs -P 2 -n 1 bash -c 'upload_one "$1" "$TAG"' _
+          for pass in 1 2 3; do
+            HAVE=$(gh release view "${{ steps.rel.outputs.tag }}" --json assets -q '[.assets[].name] | map(select(startswith("shard_"))) | length')
+            echo "pass $pass: $HAVE/$EXPECTED shard assets on release"
+            if [ "$HAVE" -eq "$EXPECTED" ]; then break; fi
+            sleep 20
+          done
+          HAVE=$(gh release view "${{ steps.rel.outputs.tag }}" --json assets -q '[.assets[].name] | map(select(startswith("shard_"))) | length')
+          if [ "$HAVE" -ne "$EXPECTED" ]; then
+            echo "::error::shard asset gap: $HAVE/$EXPECTED after upload"
+            exit 1
+          fi
           cd ../../..
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
