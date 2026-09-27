@@ -381,8 +381,12 @@ await test('relationType versions fall back safely without V2/V3 columns', async
   const r = await api.post({ query: '{ Page(page:1, perPage:1) { media(id: 101922) { relations { edges { relationType relationTypeV2: relationType(version: 2) relationTypeV3: relationType(version: 3) } } } } }' });
   const edges = r.json?.data?.Page?.media?.[0]?.relations?.edges || [];
   eq(edges.length, 6, 'edges');
-  ok(edges.every((e) => e.relationTypeV2 === e.relationType && e.relationTypeV3 === e.relationType), 'versions fall back to base');
-  eq(edges[0].relationType, 'ADAPTATION', 'base value intact');
+  // First fixture edge carries stored V2/V3 (mirrors production shards).
+  eq(edges[0].relationType, 'ADAPTATION', 'v1 base');
+  eq(edges[0].relationTypeV2, 'SOURCE', 'aliased version:2 maps stored V2');
+  eq(edges[0].relationTypeV3, 'SOURCE', 'aliased version:3 maps stored V3');
+  // Edges without stored versions fall back to the base value.
+  ok(edges.slice(1).every((e) => e.relationTypeV2 === e.relationType && e.relationTypeV3 === e.relationType), 'fallback to base');
 });
 await test('recommendations honor perPage/sort and derive nodes', async () => {
   const r = await api.post({ query: '{ Page(page:1, perPage:1) { media(id: 101922) { recommendations(page: 1, perPage: 2) { edges { node { rating mediaRecommendation { id } } } nodes { rating } pageInfo { total perPage currentPage hasNextPage } } } } }' });

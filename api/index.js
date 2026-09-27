@@ -492,7 +492,9 @@ function normRelations(raw, relFieldNode, edgesSub, nodeSub, pageSel, fragments,
     for (const s of edgesSub) {
       const k = s.alias?.value || s.name.value;
       if (s.name.value === '__typename') { out[k] = 'MediaEdge'; continue; }
-      out[k] = edge[s.name.value] !== undefined ? edge[s.name.value] : edge[k];
+      // Versioned/aliased fields are stored under the RESPONSE key (k), not
+      // the schema name — e.g. v2: relationType(version: 2) reads edge.v2.
+      out[k] = edge[k] !== undefined ? edge[k] : (edge[s.name.value] ?? null);
     }
     return out;
   };
@@ -2140,7 +2142,16 @@ async function resolvePageAiringSchedules(fieldNode, fragments, variables, page,
   const sels = collectSelections(fieldNode, fragments);
   const now = Math.floor(Date.now() / 1000);
   const index = await getSearchIndex();
-  let ids = index.filter((e) => e.status === 'RELEASING').map((e) => e.id);
+  // Premieres drift: a title airing this week is often still
+  // NOT_YET_RELEASED in the snapshot (status lags by hours/days), so the
+  // scan covers those too — pruned by startDate against the window end so
+  // far-future announcements never cost shard loads.
+  const lesser = args.airingAt_lesser;
+  let ids = index.filter((e) => {
+    if (e.status === 'RELEASING') return true;
+    if (e.status === 'NOT_YET_RELEASED' && (lesser == null || (e.startDate || 99999999) <= lesser)) return true;
+    return false;
+  }).map((e) => e.id);
   const inList = (v, arr) => Array.isArray(arr) && arr.includes(v);
   if (args.mediaId != null) ids = ids.filter((id) => id === args.mediaId);
   if (args.mediaId_in) ids = ids.filter((id) => inList(id, args.mediaId_in));
