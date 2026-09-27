@@ -6,8 +6,8 @@ Why: the original fetcher's table upserts silently failed for large parts of
 the catalog (relations covers only ~7k of 14.7k anime, recommendations ~9k,
 characters ~12k) while anime.raw_json (byte-identical AniList responses)
 stored everything. This script replays the fetcher's own upsert_* functions
-over every raw_json so the local DB becomes complete, then turso_repair.py
-pushes the diff to Turso.
+over every raw_json so the local DB becomes complete — the local DB is the
+single source api_generator.py builds the shipped shards/search_index from.
 
 Idempotent: child upserts are DELETE-then-INSERT per anime. Anime rows and
 raw_json are untouched (no network needed).

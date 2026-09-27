@@ -388,8 +388,9 @@ CREATE INDEX IF NOT EXISTS idx_trends_anime ON trends(anime_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_anime ON reviews(anime_id);
 """
 
-# Indexes the Turso sync (and any existing DB) must have for scoped
-# DELETE/SELECT by anime_id. Shared with _migrate and turso_sync.
+# Indexes generated shards/search_index (and any existing DB) need for
+# scoped DELETE/SELECT by anime_id. Shared with _migrate and
+# rebuild_children_from_raw.
 SCOPED_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_cva_anime ON character_voice_actors(anime_id)",
     "CREATE INDEX IF NOT EXISTS idx_external_links_anime ON external_links(anime_id)",

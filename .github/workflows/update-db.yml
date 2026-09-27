@@ -5,31 +5,29 @@ name: Update AniList Database
 #   (git cannot hold 4GB: 2GB push cap, 100MB/file block, 1GB repo guideline).
 # - Git tracks only small files: metadata, search_index, sample, manifest, site.
 # - The SQLite DB persists between ephemeral runners via actions/cache.
-# - DAILY-ONLY rails design (Turso free-tier safe):
+# - DAILY-ONLY rails design:
 #   - fetcher runs `rails` mode: 6 homepage rails only (Trending,
 #     Just Finished, Schedule, Top Airing, Top Movies, Upcoming),
 #     ~13 AniList requests, ~300-600 IDs, PLUS an `updatedAt` sweep that
 #     fetches EVERY anime AniList touched since the last run (old or new) —
 #     so the mirror stays complete, not just rail-fresh.
-#   - turso_sync pushes touched rows via json_each batched inserts (one
-#     bound param per statement), parallelized, then VERIFIES pushed counts
-#     remotely and fails the run on any error/mismatch. Errors are recorded
-#     in docs/api/sync_report.json — never silent.
-# - GraphQL (api/index.js) is fully Turso-dependent for reads; the workflow
-#   never reads Turso, it only writes rail rows.
+# - No external databases: shards (release assets), search_index and
+#   metadata are the only serving data. The daily commit redeploys the
+#   Vercel endpoint automatically; deploy-pages refreshes GitHub Pages.
 
 on:
   schedule:
-    - cron: '0 4 * * *'    # Daily 04:00 UTC -> rails refresh only
+    - cron: '0 4 * * *'    # Daily 04:00 UTC -> rails + catalog-wide updatedAt sweep
   workflow_dispatch:
     inputs:
       fetch_mode:
-        description: 'Fetch mode (daily rails only)'
+        description: 'daily = rails + updatedAt sweep; full = complete catalog backfill'
         required: false
         default: 'daily'
         type: choice
         options:
           - daily
+          - full
 
 permissions:
   contents: write
@@ -66,10 +64,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Determine fetch mode (daily rails only)
+      - name: Determine fetch mode (scheduled runs default to daily)
         id: mode
         run: |
-          echo "mode=daily" >> $GITHUB_OUTPUT
+          echo "mode=${{ inputs.fetch_mode || 'daily' }}" >> $GITHUB_OUTPUT
 
       - name: Restore database cache (runners are ephemeral)
         uses: actions/cache/restore@v4
@@ -77,7 +75,6 @@ jobs:
           path: |
             data/anilist.db
             data/.checkpoint.json
-            data/turso_sync_progress.json
           key: anilist-db-${{ steps.mode.outputs.mode }}-${{ github.run_id }}
           restore-keys: |
             anilist-db-
@@ -117,21 +114,8 @@ jobs:
           python scripts/fetch_anilist.py
           echo "Fetch completed at $(date -u)"
 
-      - name: Sync to Turso (batched, parallel, verified)
-        # Pushes touched rail IDs via json_each batched inserts (one bound
-        # param per statement, parallel workers), then verifies pushed counts
-        # remotely. Any failed batch or count mismatch fails the run and is
-        # recorded in docs/api/sync_report.json — no silent partial syncs.
-        env:
-          TURSO_URL: ${{ secrets.TURSO_URL }}
-          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+      - name: Show fetch summary (what this run touched)
         run: |
-          python scripts/turso_sync.py --write-only --max-minutes 12
-          echo "Turso sync completed at $(date -u)"
-
-      - name: Show sync summary (what this run pushed to Turso)
-        run: |
-          python -c "import json; r=json.load(open('docs/api/sync_report.json')); print('SYNC REPORT:', json.dumps({k:v for k,v in r.items() if k!='ids'}, indent=2)); print('IDS PUSHED:', len(r.get('ids',[])))" || echo "no sync report (sync step skipped or failed)"
           python -c "import json; m=json.load(open('docs/api/rail_manifest.json')); print('RAILS:', {k:{'count':v['count'],'new':v['new']} for k,v in m['rails'].items()}, 'unique:', m['uniqueIds'])" || echo "no rail manifest"
 
       - name: Generate API data (EXACT shards)
@@ -240,9 +224,8 @@ jobs:
           git add docs/api/metadata.json docs/api/search_index.json docs/api/search_index.json.gz \
             docs/api/sample.json docs/api/shard_manifest.json docs/index.html docs/api.js \
             .github/workflows/update-db.yml
-          # rail manifest + sync report exist after rails runs — never fail the add on them
+          # rail manifest exists after rails runs — never fail the add on it
           test -f docs/api/rail_manifest.json && git add docs/api/rail_manifest.json || true
-          test -f docs/api/sync_report.json && git add docs/api/sync_report.json || true
           # changelog.md only exists after incremental runs — never fail the add on it
           test -f data/changelog.md && git add data/changelog.md || true
           echo "Refusing to push any staged file over 90MB (fail fast, not after a 2-min push):"
@@ -268,7 +251,6 @@ jobs:
           path: |
             data/anilist.db
             data/.checkpoint.json
-            data/turso_sync_progress.json
           key: anilist-db-${{ steps.mode.outputs.mode }}-${{ github.run_id }}
 
   deploy-pages:

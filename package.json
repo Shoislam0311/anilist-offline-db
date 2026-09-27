@@ -3,6 +3,11 @@
   "private": true,
   "type": "module",
   "main": "api/index.js",
+  "scripts": {
+    "test": "node scripts/test_api.mjs",
+    "dev": "node scripts/dev_server.mjs",
+    "probe": "node scripts/probe.mjs"
+  },
   "dependencies": {
     "@libsql/client": "^0.18.0",
     "graphql": "^16.10.0"

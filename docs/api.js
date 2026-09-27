@@ -51,18 +51,86 @@ const apiUrl = (p) => `${API_BASE}/${p}`;
  * Only tiny git-tracked files (metadata, search_index) load directly.
  */
 
-const VERCEL_API = 'https://anilist-offline-db-phi.vercel.app/';
+/**
+ * GraphQL endpoint discovery — the hardcoded single URL is gone.
+ * Order: explicit override -> same-origin (Vercel deploys rewrite `/` to the
+ * API) -> the public deployment. On GitHub Pages the origin is skipped (it
+ * would 404), so the site goes straight to the public endpoint. The winning
+ * endpoint is remembered for the tab session.
+ */
+const PUBLIC_APIS = [
+  'https://graphql.aniraku.tech/',                              // documented primary (custom domain)
+  'https://anilist-offline-db-phi.vercel.app/',                 // direct Vercel deployment
+];
+const API_ENDPOINTS = (() => {
+  const list = [];
+  if (typeof window !== 'undefined' && window.ANILIST_API_BASE) list.push(window.ANILIST_API_BASE);
+  const origin = (typeof location !== 'undefined' && location.origin) || '';
+  if (origin.startsWith('http') && !origin.includes('github.io')) list.push(origin + '/');
+  list.push(...PUBLIC_APIS);
+  return [...new Set(list)];
+})();
+let activeEndpoint = (() => {
+  try { return sessionStorage.getItem('anilist_api_endpoint'); } catch { return null; }
+})() || API_ENDPOINTS[0];
 
-async function apiQuery(query, variables = {}) {
-  const r = await fetch(VERCEL_API, {
+function rememberEndpoint(ep) {
+  activeEndpoint = ep;
+  try { sessionStorage.setItem('anilist_api_endpoint', ep); } catch { /* private mode */ }
+}
+
+async function requestEndpoint(endpoint, query, variables) {
+  const hasVars = variables && Object.keys(variables).length > 0;
+  const params = 'query=' + encodeURIComponent(query)
+    + (hasVars ? '&variables=' + encodeURIComponent(JSON.stringify(variables)) : '');
+  // GET-first: the API edge-caches GET queries (s-maxage + ETag revalidation),
+  // so warm rails and repeat detail views skip the function invocation entirely.
+  if (endpoint.length + params.length < 1900) {
+    try {
+      const r = await fetch(endpoint + '?' + params, { headers: { Accept: 'application/json' } });
+      if (r.ok || r.status === 400 || r.status === 404) return await r.json();
+    } catch { /* fall through to POST */ }
+  }
+  const r = await fetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, variables }),
   });
   if (!r.ok) throw new Error('API offline (HTTP ' + r.status + ')');
-  const d = await r.json();
-  if (d.errors && !d.data) throw new Error(d.errors[0]?.message || 'API error');
-  return d.data;
+  return await r.json();
+}
+
+async function apiCall(query, variables = {}) {
+  const others = API_ENDPOINTS.filter((e) => e !== activeEndpoint);
+  const order = [activeEndpoint, ...others].filter(Boolean);
+  let lastErr = null;
+  for (const ep of order) {
+    try {
+      const json = await requestEndpoint(ep, query, variables);
+      if (ep !== activeEndpoint) rememberEndpoint(ep);
+      return json;
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('All API endpoints failed');
+}
+
+/* Client response cache (60s TTL + in-flight dedupe): repeat rails, detail
+ * revisits and double-clicks resolve from memory with zero network. */
+const qCache = new Map();
+const Q_CACHE_TTL = 60 * 1000;
+const Q_CACHE_MAX = 300;
+async function apiQuery(query, variables = {}) {
+  const key = query + '|' + JSON.stringify(variables || {});
+  const hit = qCache.get(key);
+  if (hit && Date.now() - hit.t < Q_CACHE_TTL) return await hit.promise;
+  const promise = apiCall(query, variables).then((d) => {
+    if (d.errors && !d.data) throw new Error(d.errors[0]?.message || 'API error');
+    return d.data;
+  });
+  qCache.set(key, { t: Date.now(), promise });
+  if (qCache.size > Q_CACHE_MAX) qCache.delete(qCache.keys().next().value);
+  try { return await promise; }
+  catch (e) { qCache.delete(key); throw e; }
 }
 // Force https on every rendered image (kills Mixed Content blocks).
 const https = (u) => String(u || '').replace(/^http:\/\//i, 'https://');
@@ -76,7 +144,8 @@ async function init() {
           metadata = await fetchFirst(API_BASES.map((b) => `${b}/metadata.json`));
         }
         const base = API_BASE.replace(/\/api$/, '');
-        document.getElementById('apiEndpoint').textContent = window.location.origin + '/api/graphql (Vercel) + this Pages mirror';
+        document.getElementById('apiEndpoint').textContent =
+          `${PUBLIC_APIS[0]} · GET/POST ${window.location.origin}/ (same-origin on Vercel deploys)`;
         document.getElementById('docBaseUrl').textContent = base + '/api/';
         document.getElementById('statTotal').textContent = (metadata.totalAnime || 0).toLocaleString();
         document.getElementById('statCharacters').textContent = (metadata.totalCharacters || 0).toLocaleString();
@@ -150,11 +219,23 @@ const DETAIL_FIELDS = `id idMal title { romaji english native userPreferred } de
   airingSchedule { edges { node { episode airingAt } } } nextAiringEpisode { episode airingAt }
   streamingEpisodes { title url site } externalLinks { site url }`;
 
+/* Detail cache: memoized per id for 5 minutes — reopening a modal, hovering
+ * cards, or double-clicks never re-hit the network for the same anime. */
+const detailMemo = new Map();
+const DETAIL_TTL = 5 * 60 * 1000;
+const DETAIL_MAX = 200;
 async function loadAnimeById(id) {
-  try {
-    const d = await apiQuery(`{ Media(id: ${parseInt(id, 10)}) { ${DETAIL_FIELDS} } }`);
-    return d?.Media || null;
-  } catch (e) { return null; }
+  const key = parseInt(id, 10);
+  const hit = detailMemo.get(key);
+  if (hit && Date.now() - hit.t < DETAIL_TTL) return await hit.promise;
+  const promise = apiQuery(`{ Media(id: ${key}) { ${DETAIL_FIELDS} } }`)
+    .then((d) => d?.Media || null)
+    .catch(() => null); // API down -> same as before: "not found", never throw
+  detailMemo.set(key, { t: Date.now(), promise });
+  if (detailMemo.size > DETAIL_MAX) detailMemo.delete(detailMemo.keys().next().value);
+  const media = await promise;
+  if (!media) detailMemo.delete(key); // misses are not memoized
+  return media;
 }
 async function fetchRail({ sort, status, limit = 18 }) {
   const args = [`type: ANIME`, `sort: ${sort}`, `isAdult: false`];
@@ -869,13 +950,9 @@ async function executeQuery() {
     output.innerHTML = '<span style="color: #8ba0b0;">Executing...</span>';
 
     try {
-        // Single hop straight to the edge API (exact schema, Turso-fast).
-        const r = await fetch(VERCEL_API, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ query }),
-        });
-        const result = await r.json();
+        // Single hop to the edge API (GET-first: warm queries come straight
+        // from the CDN). Raw JSON is displayed, errors included.
+        const result = await apiCall(query);
         output.textContent = JSON.stringify(result, null, 2);
     } catch (e) {
         output.innerHTML = `<span class="error">${esc(e.message)}</span>`;

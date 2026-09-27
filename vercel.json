@@ -1,5 +1,7 @@
 {
   "rewrites": [
+    { "source": "/", "destination": "/api/index.js" },
+    { "source": "/api", "destination": "/api/index.js" },
     { "source": "/graphql", "destination": "/api/index.js" },
     { "source": "/api/graphql", "destination": "/api/index.js" }
   ],
@@ -9,8 +11,17 @@
       "headers": [
         { "key": "Access-Control-Allow-Origin", "value": "*" },
         { "key": "Access-Control-Allow-Methods", "value": "GET, POST, OPTIONS" },
-        { "key": "Access-Control-Allow-Headers", "value": "Content-Type" }
+        { "key": "Access-Control-Allow-Headers", "value": "Content-Type, X-Requested-With, If-None-Match" },
+        { "key": "Access-Control-Max-Age", "value": "86400" },
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "Referrer-Policy", "value": "no-referrer" }
       ]
     }
-  ]
+  ],
+  "functions": {
+    "api/index.js": {
+      "memory": 1769,
+      "maxDuration": 30
+    }
+  }
 }

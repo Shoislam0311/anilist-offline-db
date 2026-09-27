@@ -15,7 +15,7 @@ import time
 import logging
 import hashlib
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -232,10 +232,16 @@ query ($page: Int, $perPage: Int, $status: MediaStatus) {
 }
 """ % MEDIA_FIELDS
 
+# AniList has NO updatedAt filter on Page.media (updatedAt_greater → 400),
+# so the sweep walks pages sorted NEWEST-FIRST and stops at the frontier:
+# the first title with updatedAt < since means everything after is older.
+# Every walk is scoped to one status×format slice (see SWEEP_STATUSES) so
+# no single query can pile up a whole day of churn against AniList's
+# 5000-entry page-depth cap.
 INCREMENTAL_FETCH_QUERY = """
-query ($page: Int, $perPage: Int, $updatedAt_greater: Int) {
+query ($page: Int, $perPage: Int, $status: MediaStatus, $format: MediaFormat) {
   Page(page: $page, perPage: $perPage) {
-    media(type: ANIME, sort: UPDATED_AT_DESC, updatedAt_greater: $updatedAt_greater) {
+    media(type: ANIME, status: $status, format: $format, sort: UPDATED_AT_DESC) {
       %s
     }
     pageInfo { total hasNextPage currentPage lastPage }
@@ -243,13 +249,44 @@ query ($page: Int, $perPage: Int, $updatedAt_greater: Int) {
 }
 """ % MEDIA_FIELDS
 
-ID_FETCH_QUERY = """
-query ($page: Int, $perPage: Int, $id_greater: Int) {
-  Page(page: $page, perPage: $perPage) {
-    media(type: ANIME, sort: ID, id_greater: $id_greater) {
+# Titles whose format is null match NO format slice (24 in the current
+# mirror) — every known one is refetched unconditionally each run so it
+# can never rot outside the grid.
+NULL_FORMAT_REFETCH_QUERY = """
+query ($ids: [Int]) {
+  Page(page: 1, perPage: 50) {
+    media(type: ANIME, id_in: $ids) {
       %s
     }
-    pageInfo { total hasNextPage currentPage lastPage }
+  }
+}
+""" % MEDIA_FIELDS
+
+# Full-catalog backfill (FETCH_MODE=full): every anime AniList knows, sliced
+# by startDate bands. sort: ID is a total order (IDs unique) and pagination
+# under it is verified consistent; a band that would bust AniList's
+# 5000-entry page depth is split recursively until it fits.
+FULL_FETCH_QUERY = """
+query ($page: Int, $perPage: Int, $sort: [MediaSort], $g: FuzzyDateInt, $l: FuzzyDateInt) {
+  Page(page: $page, perPage: $perPage) {
+    media(type: ANIME, sort: $sort, startDate_greater: $g, startDate_lesser: $l) {
+      %s
+    }
+    pageInfo { hasNextPage currentPage lastPage }
+  }
+}
+""" % MEDIA_FIELDS
+
+# Titles with NO startDate match no date band at all — they sort FIRST
+# under START_DATE (verified live), so this walk collects exactly those
+# until the first dated title appears.
+FULL_FETCH_NULL_QUERY = """
+query ($page: Int, $perPage: Int, $sort: [MediaSort]) {
+  Page(page: $page, perPage: $perPage) {
+    media(type: ANIME, sort: $sort) {
+      %s
+    }
+    pageInfo { hasNextPage currentPage lastPage }
   }
 }
 """ % MEDIA_FIELDS
@@ -286,6 +323,18 @@ RAIL_DEFS = [
 ]
 RAIL_PER_PAGE = 50
 INCREMENTAL_FIRST_WINDOW_DAYS = 7
+
+# Incremental sweep slices: disjoint status×format cells (every anime has
+# exactly one status and one format; MANGA/NOVEL/ONE_SHOT never occur under
+# type=ANIME — verified against live counts, they return 0). AniList rejects
+# page*perPage > 5000 entries ("Page depth exceeds maximum allowed"), so a
+# single newest-first walk dies past page 100 at perPage 50 — while a full
+# day of updatedAt churn is bigger than 5000 titles. Slicing keeps every
+# individual walk far below the depth cap. RELEASING first: airing freshness
+# matters most.
+SWEEP_STATUSES = ["RELEASING", "FINISHED", "NOT_YET_RELEASED", "CANCELLED", "HIATUS"]
+SWEEP_FORMATS = ["TV", "TV_SHORT", "MOVIE", "SPECIAL", "OVA", "ONA", "MUSIC"]
+DEEP_PAGE_CAP = 5000 // RAIL_PER_PAGE  # AniList hard limit: page * perPage <= 5000
 
 
 class AniListFetcher:
@@ -601,13 +650,25 @@ class AniListFetcher:
 
         AniList exposes `updatedAt` (unix seconds) on every media, so we can
         fetch EXACTLY what changed since the last sweep — for ALL titles, old
-        and new, not just the homepage rails. Every changed title is fully
-        re-processed (upsert + children + raw_json) and lands in
-        touched_full so turso_sync replaces its Turso rows completely.
+        and new, not just the homepage rails. AniList offers no updatedAt
+        filter and caps page depth at 5000 entries, so the catalog is walked
+        as disjoint status×format slices (SWEEP_STATUSES × SWEEP_FORMATS),
+        each sorted UPDATED_AT_DESC until the first title older than `since`
+        (its frontier). Every changed title is fully re-processed (upsert +
+        children + raw_json). Known format-null titles — which match no
+        slice — are refetched unconditionally via id_in.
 
         First-ever sweep looks back INCREMENTAL_FIRST_WINDOW_DAYS (7) to
         cover the pipeline's own age; later sweeps resume from the stored
         timestamp (minus a 5-minute overlap for boundary safety).
+
+        `last_incremental_at` is advanced ONLY when every slice reached its
+        frontier cleanly. If a request fails mid-sweep, the timestamp is
+        left untouched so the next run re-covers the whole window — a failed
+        sweep must never silently drop changes forever. Exception: if a
+        slice busts the 5000-entry depth cap (extreme churn burst), the
+        timestamp still advances with a loud error — the daily pipeline
+        must never stall, and retrying a window that only grows is a stall.
         """
         conn = init_db(self.db_path)
         set_metadata(conn, "fetch_type", "incremental")
@@ -629,50 +690,218 @@ class AniListFetcher:
         sweep_started_at = now
         updated = 0
         new_ids = 0
+        completed = True
+        burst_slices = []
+        page_limit = min(max_pages, DEEP_PAGE_CAP)
         try:
-            for page in range(1, max_pages + 1):
-                data = self._request(INCREMENTAL_FETCH_QUERY, {
-                    "page": page, "perPage": RAIL_PER_PAGE, "updatedAt_greater": since,
-                })
-                if not data or "data" not in data:
-                    time.sleep(3)
-                    data = self._request(INCREMENTAL_FETCH_QUERY, {
-                        "page": page, "perPage": RAIL_PER_PAGE, "updatedAt_greater": since,
-                    })
-                    if not data or "data" not in data:
-                        logger.error(f"Incremental page {page} failed twice — stopping sweep")
+            for status in SWEEP_STATUSES:
+                if not completed:
+                    break
+                for fmt in SWEEP_FORMATS:
+                    slice_count = 0
+                    slice_frontier = False
+                    for page in range(1, page_limit + 1):
+                        variables = {"page": page, "perPage": RAIL_PER_PAGE,
+                                     "status": status, "format": fmt}
+                        data = self._request(INCREMENTAL_FETCH_QUERY, variables)
+                        if not data or "data" not in data:
+                            time.sleep(3)
+                            data = self._request(INCREMENTAL_FETCH_QUERY, variables)
+                            if not data or "data" not in data:
+                                logger.error(f"slice {status}/{fmt} page {page} failed twice — aborting sweep "
+                                             "(last_incremental_at stays put, next run retries this window)")
+                                completed = False
+                                break
+                        paged = data["data"]["Page"]
+                        media_list = paged.get("media", []) or []
+                        if not media_list:
+                            break
+                        for media in media_list:
+                            aid = media.get("id")
+                            if not aid:
+                                continue
+                            # sort: UPDATED_AT_DESC → titles arrive newest-first;
+                            # the first one older than `since` closes this slice.
+                            ua = media.get("updatedAt")
+                            if ua is not None and int(ua) < since:
+                                slice_frontier = True
+                                break
+                            is_new = aid not in {r[0] for r in conn.execute("SELECT id FROM anime WHERE id=?", (aid,)).fetchall()}
+                            self._process_anime(conn, media)
+                            if is_new:
+                                new_ids += 1
+                            updated += 1
+                            slice_count += 1
+                        conn.commit()
+                        if slice_frontier:
+                            break
+                        if not paged.get("pageInfo", {}).get("hasNextPage"):
+                            break
+                        if page == page_limit:
+                            logger.error(f"slice {status}/{fmt} hit AniList's {page_limit * RAIL_PER_PAGE}-entry depth "
+                                         f"cap with in-window titles remaining — burst churn exceeded this slice; "
+                                         f"sweep advances anyway (older in-window edits there are skipped this run)")
+                            burst_slices.append(f"{status}/{fmt}")
+                    if slice_count:
+                        logger.info(f"  slice {status}/{fmt}: {slice_count} titles in window (total {updated})")
+                    if not completed:
                         break
-                paged = data["data"]["Page"]
-                media_list = paged.get("media", []) or []
-                if not media_list:
-                    break
-                for media in media_list:
-                    aid = media.get("id")
-                    if not aid:
+            # known format-null titles match no slice — refetch them
+            # unconditionally (id_in, chunked) so they can never rot
+            null_ids = [r[0] for r in conn.execute(
+                "SELECT id FROM anime WHERE format IS NULL OR format = ''").fetchall()]
+            if null_ids:
+                for i in range(0, len(null_ids), 50):
+                    chunk = null_ids[i:i + 50]
+                    nd = self._request(NULL_FORMAT_REFETCH_QUERY, {"ids": chunk})
+                    if not nd or "data" not in nd:
+                        logger.warning(f"null-format refetch for {len(chunk)} ids failed — will retry next run")
                         continue
-                    is_new = aid not in {r[0] for r in conn.execute("SELECT id FROM anime WHERE id=?", (aid,)).fetchall()}
-                    self._process_anime(conn, media)
-                    if is_new:
-                        new_ids += 1
-                    updated += 1
+                    for media in nd["data"]["Page"].get("media", []) or []:
+                        if not media.get("id"):
+                            continue
+                        self._process_anime(conn, media)
+                        updated += 1
                 conn.commit()
-                logger.info(f"  incremental page {page}: {len(media_list)} titles "
-                            f"(total {updated}, {new_ids} brand-new)")
-                if not paged.get("pageInfo", {}).get("hasNextPage"):
-                    break
-                if page == max_pages:
-                    logger.warning(f"Incremental sweep hit the {max_pages}-page cap "
-                                   f"({max_pages * RAIL_PER_PAGE} titles) — resume next run")
-            set_metadata(conn, "last_incremental_at", str(sweep_started_at))
-            conn.commit()
-            logger.info(f"Incremental sweep complete: {updated} titles updated "
-                        f"({new_ids} brand-new) — all queued for full Turso sync")
+            if completed:
+                set_metadata(conn, "last_incremental_at", str(sweep_started_at))
+                conn.commit()
+                logger.info(f"Incremental sweep complete: {updated} titles updated "
+                            f"({new_ids} brand-new)")
+                if burst_slices:
+                    logger.error(f"DEPTH-CAP BURSTS (churn exceeded slice capacity): "
+                                 f"{', '.join(burst_slices)} — older in-window edits in those slices were skipped")
+            else:
+                conn.commit()
+                logger.warning("Incremental sweep did NOT reach its frontier — "
+                               "last_incremental_at NOT advanced; next run re-covers this window")
         except KeyboardInterrupt:
-            logger.info("Interrupted. Saving progress...")
+            logger.info("Interrupted. Saving progress — last_incremental_at NOT advanced...")
             conn.commit()
         finally:
             conn.close()
         return updated
+
+    @staticmethod
+    def _fdate(dt) -> int:
+        return dt.year * 10000 + dt.month * 100 + dt.day
+
+    def _full_walk_band(self, conn, g: int, l: int):
+        """Enumerate every anime whose startDate falls in [g, l] (yyyymmdd).
+
+        Returns (count, hit_depth_cap). Pages are ID-sorted (unique total
+        order) and we never request past AniList's 5000-entry depth cap; if
+        the cap is hit with pages remaining, the caller splits the band.
+        """
+        count = 0
+        for page in range(1, DEEP_PAGE_CAP + 1):
+            variables = {"page": page, "perPage": RAIL_PER_PAGE, "sort": ["ID"],
+                         "g": g, "l": l}
+            data = self._request(FULL_FETCH_QUERY, variables)
+            if not data or "data" not in data:
+                time.sleep(3)
+                data = self._request(FULL_FETCH_QUERY, variables)
+                if not data or "data" not in data:
+                    raise RuntimeError(f"full fetch band {g}-{l} page {page} failed twice")
+            paged = data["data"]["Page"]
+            media_list = paged.get("media", []) or []
+            if not media_list:
+                return count, False
+            for media in media_list:
+                self._process_anime(conn, media)
+                count += 1
+            conn.commit()
+            if not paged.get("pageInfo", {}).get("hasNextPage"):
+                return count, False
+            if page == DEEP_PAGE_CAP:
+                return count, True
+        return count, False
+
+    def _full_fetch_band(self, conn, stats, g: int, l: int, depth: int = 0):
+        count, hit_cap = self._full_walk_band(conn, g, l)
+        stats["count"] += count
+        if not hit_cap:
+            return
+        gd = datetime(g // 10000, (g // 100) % 100, g % 100)
+        ld = datetime(l // 10000, (l // 100) % 100, l % 100)
+        if gd >= ld or depth >= 10:
+            logger.error(f"band {g}-{l} hit the entry cap and cannot be split further — skipped")
+            stats["capped"] += 1
+            return
+        mid = gd + (ld - gd) // 2
+        logger.warning(f"band {g}-{l} hit AniList's {DEEP_PAGE_CAP * RAIL_PER_PAGE}-entry depth "
+                       f"cap — splitting at {mid.date()}")
+        self._full_fetch_band(conn, stats, self._fdate(gd), self._fdate(mid), depth + 1)
+        self._full_fetch_band(conn, stats, self._fdate(mid + timedelta(days=1)), self._fdate(ld), depth + 1)
+
+    def _full_fetch_undated(self, conn, stats):
+        """Titles with no startDate — they sort FIRST under START_DATE."""
+        for page in range(1, DEEP_PAGE_CAP + 1):
+            variables = {"page": page, "perPage": RAIL_PER_PAGE, "sort": ["START_DATE"]}
+            data = self._request(FULL_FETCH_NULL_QUERY, variables)
+            if not data or "data" not in data:
+                time.sleep(3)
+                data = self._request(FULL_FETCH_NULL_QUERY, variables)
+                if not data or "data" not in data:
+                    raise RuntimeError(f"full fetch undated page {page} failed twice")
+            paged = data["data"]["Page"]
+            media_list = paged.get("media", []) or []
+            if not media_list:
+                return
+            reached_dated = False
+            for media in media_list:
+                sd = media.get("startDate") or {}
+                if sd.get("year") is not None:
+                    reached_dated = True
+                    break
+                self._process_anime(conn, media)
+                stats["count"] += 1
+            conn.commit()
+            if reached_dated or not paged.get("pageInfo", {}).get("hasNextPage"):
+                return
+        logger.error("undated-title bucket hit the depth cap — re-run to cover the rest")
+
+    def full_fetch(self, start_date: int = 19000101, end_date: Optional[int] = None):
+        """Full-catalog backfill: EVERY anime AniList knows (FETCH_MODE=full).
+
+        Walks startDate year bands (ID-sorted, split recursively whenever a
+        band would bust the 5000-entry page depth) plus the undated-title
+        bucket, fully processing every title (upsert + children + raw_json).
+        On success it resets `last_incremental_at` so tomorrow's daily sweep
+        starts from this build instead of re-walking a huge window.
+
+        Idempotent: safe to re-run after a mid-flight failure — already
+        upserted pages are simply processed again.
+        """
+        conn = init_db(self.db_path)
+        set_metadata(conn, "fetch_type", "full")
+        set_metadata(conn, "fetch_started_at", datetime.now(timezone.utc).isoformat())
+        stats = {"count": 0, "capped": 0}
+        if end_date is None:
+            end_date = (datetime.now(timezone.utc).year + 2) * 10000 + 1231
+        try:
+            logger.info(f"FULL fetch: startDate bands {start_date}..{end_date} "
+                        f"(undated titles first, then year bands)")
+            self._full_fetch_undated(conn, stats)
+            year = start_date // 10000
+            end_year = end_date // 10000
+            while year <= end_year:
+                g = max(start_date, year * 10000 + 101)
+                l = min(end_date, year * 10000 + 1231)
+                before = stats["count"]
+                self._full_fetch_band(conn, stats, g, l)
+                if stats["count"] != before:
+                    logger.info(f"  band {year}: {stats['count'] - before} titles (total {stats['count']})")
+                year += 1
+            set_metadata(conn, "last_incremental_at", str(int(time.time())))
+            conn.commit()
+            logger.info(f"FULL FETCH COMPLETE: {stats['count']} titles processed "
+                        f"({stats['capped']} capped bands)")
+            if stats["capped"]:
+                logger.error(f"{stats['capped']} band(s) hit the depth cap beyond splitting — re-run to cover them")
+        finally:
+            conn.close()
+        return stats["count"]
 
 
 def main():
@@ -688,7 +917,10 @@ def main():
 
     start_time = time.time()
 
-    if mode in ("daily", "rails"):
+    if mode == "full":
+        # full-catalog parity backfill: every anime AniList knows
+        fetcher.full_fetch()
+    elif mode in ("daily", "rails"):
         fetcher.rails_fetch()
         # catalog-wide change sweep: catches edits to ANY title (old or new),
         # not just the 6 homepage rails. Skippable with SKIP_INCREMENTAL=1.

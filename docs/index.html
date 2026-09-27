@@ -4,6 +4,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AniList Offline — Browse Anime with Zero Rate Limits</title>
+    <meta name="description" content="Free, no-auth GraphQL mirror of AniList: browse, search and inspect 14,000+ anime with no rate limits. Same schema as graphql.anilist.co.">
+    <link rel="preconnect" href="https://graphql.aniraku.tech">
+    <link rel="preconnect" href="https://anilist-offline-db-phi.vercel.app">
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+    <link rel="preconnect" href="https://s4.anilist.co" crossorigin>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0b1622; color: #ced9e0; line-height: 1.6; }
@@ -124,7 +129,7 @@
 
     <div class="container">
         <div class="endpoint-box">
-            <p><span class="method">POST</span> <span class="endpoint-url" id="apiEndpoint">Loading...</span></p>
+            <p><span class="method">GET · POST</span> <span class="endpoint-url" id="apiEndpoint">Loading...</span></p>
             <p style="margin-top: 0.5rem; color: #8ba0b0; font-size: 0.9rem;">
                 Same GraphQL schema as AniList. No authentication required. No rate limits.
             </p>
@@ -258,6 +263,7 @@
         <div id="tab-docs" class="tab-content">
             <h2 style="color: #3db4f2; margin-bottom: 1rem;">API Documentation</h2>
             <p style="margin-bottom: 1rem;">This API mirrors the official AniList GraphQL API at <code>graphql.anilist.co</code>. Use the same queries, variables, and schema.</p>
+            <p style="margin-bottom: 1rem; color: #8ba0b0;">Full introspection works: <code>{ __schema { types { name } } }</code> and <code>{ __type(name: "Media") { fields { name } } }</code> are answered from the official AniList schema.</p>
 
             <h3 style="color: #e5c07b; margin: 1rem 0 0.5rem;">Base URL</h3>
             <div class="code-block"><span class="string" id="docBaseUrl">Loading...</span></div>

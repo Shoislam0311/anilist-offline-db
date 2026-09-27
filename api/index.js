@@ -1,26 +1,38 @@
-import { parse, Kind } from 'graphql';
+import { parse, Kind, execute as gqlExecute, buildSchema } from 'graphql';
 import { gunzipSync } from 'node:zlib';
+import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { createClient } from '@libsql/client';
-// Deploy-time snapshot of the small files (search_index ~12MB, metadata tiny).
-// LAZY-loaded: the Turso hot path never touches them, so cold starts must NOT
-// pay a 12MB JSON parse. Only the shard fallback (Turso down / not required)
-// triggers the first load, then caches in memory.
+/* Deploy-time snapshot of the small files (search_index ~12MB, metadata tiny).
+ * Read via fs FIRST (works on every Node >= 18 — JSON import attributes are
+ * Node-version-sensitive: `{ with: { type: 'json' } }` rejects on Node 18),
+ * then dynamic import as secondary, then null -> network fetch fallback.
+ * LAZY-loaded: cold starts must NOT pay a 12MB JSON parse until first use. */
 let _bundledIndex = null, _bundledIndexTried = false;
 let _bundledMeta = null, _bundledMetaTried = false;
+function readJsonUrl(url) {
+  try { return JSON.parse(readFileSync(url, 'utf8')); } catch { return null; }
+}
 async function loadBundled(kind) {
   try {
     if (kind === 'index') {
       if (!_bundledIndexTried) {
         _bundledIndexTried = true;
-        const m = await import('../docs/api/search_index.json', { with: { type: 'json' } });
-        _bundledIndex = m?.default ?? null;
+        _bundledIndex = readJsonUrl(new URL('../docs/api/search_index.json', import.meta.url));
+        if (_bundledIndex === null) {
+          const m = await import('../docs/api/search_index.json', { with: { type: 'json' } });
+          _bundledIndex = m?.default ?? null;
+        }
       }
       return _bundledIndex;
     }
     if (!_bundledMetaTried) {
       _bundledMetaTried = true;
-      const m = await import('../docs/api/metadata.json', { with: { type: 'json' } });
-      _bundledMeta = m?.default ?? null;
+      _bundledMeta = readJsonUrl(new URL('../docs/api/metadata.json', import.meta.url));
+      if (_bundledMeta === null) {
+        const m = await import('../docs/api/metadata.json', { with: { type: 'json' } });
+        _bundledMeta = m?.default ?? null;
+      }
     }
     return _bundledMeta;
   } catch { return null; }
@@ -33,14 +45,24 @@ async function loadBundled(kind) {
  */
 const DATA_BASE = (typeof process !== 'undefined' && process.env?.DATA_BASE_URL)
   || 'https://cdn.jsdelivr.net/gh/Shoislam0311/anilist-offline-db@main/docs/api';
+/* An explicitly configured data source (tests, staging, self-hosted) must be
+ * tried BEFORE GitHub release assets — otherwise release shards (a different
+ * dataset revision) shadow the configured source. Captured at module init so
+ * each deployed/test instance sees a consistent value. */
+const CUSTOM_BASE = !!String((typeof process !== 'undefined' && process.env?.DATA_BASE_URL) || '').trim();
+/* Per-attempt network timeout: GitHub release shards need ~10s for 2.5MB;
+ * nothing should ever hang toward the platform's 300s ceiling. */
+const NET_TIMEOUT_MS = Number((typeof process !== 'undefined' && process.env?.FETCH_TIMEOUT_MS) || 15000);
+const FAIL_BACKOFF_MS = 20000;  // negative-cache window after a failed fetch
 const CACHE_TTL_MS = 10 * 60 * 1000;
 const MAX_SHARD_CACHE = 12; // decompressed shards are ~15MB each; cap RAM (~180MB)
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Headers': 'Content-Type, If-None-Match',
   'Access-Control-Max-Age': '86400',
+  'X-Content-Type-Options': 'nosniff',
 };
 
 const INFO = {
@@ -95,15 +117,17 @@ async function fetchJSON(url) {
     );
   }
   const tried = new Set();
+  let lastErr = null;
   for (const u of [url, ...mirrors]) {
     if (tried.has(u)) continue;
     tried.add(u);
     try {
-      const r = await fetch(u);
+      const r = await fetch(u, { signal: AbortSignal.timeout(NET_TIMEOUT_MS) });
       if (r.ok) return r.json();
-    } catch { /* try next mirror */ }
+      lastErr = Object.assign(new Error(`HTTP ${r.status} for ${u}`), { status: r.status });
+    } catch (e) { lastErr = e; }
   }
-  throw new Error(`all mirrors failed for ${url}`);
+  throw lastErr || new Error(`all mirrors failed for ${url}`);
 }
 function fresh(entry) { return entry && Date.now() - entry.time < CACHE_TTL_MS; }
 
@@ -117,19 +141,41 @@ async function bundledFirst(kind) {
   return null;
 }
 
+/* Fetch-first when a custom source is configured (explicit config beats the
+ * deploy-time snapshot); bundled-first otherwise (zero network). On fetch
+ * failure the bundled snapshot still serves — a dead source degrades instead
+ * of erroring. Failures negative-cache for FAIL_BACKOFF_MS so a dead upstream
+ * is not hammered once per query. */
+let metaFailAt = 0, indexFailAt = 0;
 async function getMetadata() {
-  if (!fresh(metaEntry)) {
-    const local = await bundledFirst('meta');
-    metaEntry = { data: local || await fetchJSON(`${DATA_BASE}/metadata.json`), time: Date.now() };
+  if (fresh(metaEntry)) return metaEntry.data;
+  const bundled = await bundledFirst('meta');
+  if (!CUSTOM_BASE && bundled) { metaEntry = { data: bundled, time: Date.now() }; return bundled; }
+  if (Date.now() - metaFailAt < FAIL_BACKOFF_MS && bundled) return bundled;
+  try {
+    const data = await fetchJSON(`${DATA_BASE}/metadata.json`);
+    metaEntry = { data, time: Date.now() };
+    return data;
+  } catch (e) {
+    metaFailAt = Date.now();
+    if (bundled) { metaEntry = { data: bundled, time: Date.now() }; return bundled; }
+    throw e;
   }
-  return metaEntry.data;
 }
 async function getSearchIndex() {
-  if (!fresh(indexEntry)) {
-    const local = await bundledFirst('index');
-    indexEntry = { data: local || await fetchJSON(`${DATA_BASE}/search_index.json`), time: Date.now() };
+  if (fresh(indexEntry)) return indexEntry.data;
+  const bundled = await bundledFirst('index');
+  if (!CUSTOM_BASE && bundled) { indexEntry = { data: bundled, time: Date.now() }; return bundled; }
+  if (Date.now() - indexFailAt < FAIL_BACKOFF_MS && bundled) return bundled;
+  try {
+    const data = await fetchJSON(`${DATA_BASE}/search_index.json`);
+    indexEntry = { data, time: Date.now() };
+    return data;
+  } catch (e) {
+    indexFailAt = Date.now();
+    if (bundled) { indexEntry = { data: bundled, time: Date.now() }; return bundled; }
+    throw e;
   }
-  return indexEntry.data;
 }
 async function getShardStartIds() {
   const meta = await getMetadata().catch(() => null);
@@ -185,27 +231,39 @@ async function decodeBody(r, url) {
   return JSON.parse(buf.toString('utf8'));
 }
 
+const shardFailAt = new Map(); // negative cache: shardKey -> last failure time
+
 async function getShard(idx) {
   let entry = shardCache.get(idx);
   if (!fresh(entry)) {
+    const failKey = `s${idx}`;
+    const failedAt = shardFailAt.get(failKey);
+    if (failedAt && Date.now() - failedAt < 15000) {
+      throw Object.assign(new Error(`shard ${idx} recently failed`), { status: 502 });
+    }
     const padded = String(idx).padStart(4, '0');
     const meta = await getMetadata().catch(() => null);
-    // Release assets first (exact, full dataset); git shards as legacy fallback
-    // so the API keeps serving while a full re-scrape is in flight.
-    const urls = [
-      ...releaseShardUrls(padded, meta?.releaseTag),
-      `${DATA_BASE}/shards/shard_${padded}.json`,
-    ];
+    const localUrl = `${DATA_BASE}/shards/shard_${padded}.json`;
+    // A configured custom data source is tried FIRST: release assets are a
+    // different dataset revision and would shadow it. Release assets are still
+    // kept as a fallback so the API keeps serving if the custom source 404s.
+    const urls = CUSTOM_BASE
+      ? [localUrl, ...releaseShardUrls(padded, meta?.releaseTag)]
+      : [...releaseShardUrls(padded, meta?.releaseTag), localUrl];
     let data = null, lastErr = null;
     for (const u of urls) {
       try {
-        const r = await fetch(u);
+        const r = await fetch(u, { signal: AbortSignal.timeout(NET_TIMEOUT_MS) });
         if (!r.ok) continue;
         data = await decodeBody(r, u);
         break;
       } catch (e) { lastErr = e; }
     }
-    if (!data) throw lastErr || new Error(`shard ${idx} unavailable on all mirrors`);
+    if (!data) {
+      shardFailAt.set(failKey, Date.now());
+      throw lastErr || new Error(`shard ${idx} unavailable on all mirrors`);
+    }
+    shardFailAt.delete(failKey);
     entry = { data, time: Date.now() };
     shardCache.set(idx, entry);
     if (shardCache.size > MAX_SHARD_CACHE) {
@@ -227,12 +285,18 @@ async function getAnimeById(id) {
   const shardStartIds = await getShardStartIds();
   if (!shardStartIds.length) return null;
   const idx = shardIdxForId(shardStartIds, id);
+  let lastErr = null, loaded = 0;
   for (const tryIdx of [idx, idx - 1, idx + 1]) {
     if (tryIdx < 0 || tryIdx >= shardStartIds.length) continue;
-    const shard = await getShard(tryIdx).catch(() => []);
-    const found = shard.find((a) => a.id === id);
-    if (found) return asExactMedia(found);
+    try {
+      const shard = await getShard(tryIdx);
+      loaded++;
+      const found = shard.find((a) => a.id === id);
+      if (found) return asExactMedia(found);
+    } catch (e) { lastErr = e; }
   }
+  // A shard outage must surface as an error, never as a bogus 404.
+  if (lastErr && !loaded) throw lastErr;
   return null;
 }
 async function getAnimeBatch(ids) {
@@ -248,8 +312,15 @@ async function getAnimeBatch(ids) {
   const found = new Map();
   // Parallel fetch: one batch, not sequential.
   const shards = await Promise.all(
-    [...byShard.keys()].map((shardIdx) =>
-      getShard(shardIdx).then((s) => ({ shardIdx, s })).catch(() => ({ shardIdx, s: [] }))));
+    [...byShard.keys()].map(async (shardIdx) => {
+      try { return { shardIdx, s: await getShard(shardIdx) }; }
+      catch (e) { return { shardIdx, s: [], err: e }; }
+    }));
+  const failed = shards.find((x) => x.err);
+  if (failed) {
+    // Fail loudly: silently truncating a page would report wrong results.
+    throw failed.err;
+  }
   const byIdx = new Map(shards.map(({ shardIdx, s }) => [shardIdx, s]));
   const missing = [];
   for (const [shardIdx, shardIds] of byShard) {
@@ -275,16 +346,20 @@ async function getAnimeBatch(ids) {
 }
 
 /* ----------------------------- field resolver ----------------------------- */
-function collectSelections(node, fragments) {
+function collectSelections(node, fragments, seen = null) {
   if (!node?.selectionSet) return [];
   const out = [];
   for (const sel of node.selectionSet.selections) {
     if (sel.kind === Kind.FIELD) out.push(sel);
     else if (sel.kind === Kind.FRAGMENT_SPREAD) {
-      const frag = fragments[sel.name.value];
-      if (frag) out.push(...collectSelections(frag, fragments));
+      const name = sel.name.value;
+      // Guard against cyclic spreads (fragment A -> B -> A): graphql-js would
+      // reject these at validation, but we execute without validation.
+      if (seen?.has(name)) continue;
+      const frag = fragments[name];
+      if (frag) out.push(...collectSelections(frag, fragments, new Set(seen || []).add(name)));
     } else if (sel.kind === Kind.INLINE_FRAGMENT) {
-      out.push(...collectSelections(sel, fragments));
+      out.push(...collectSelections(sel, fragments, seen ? new Set(seen) : null));
     }
   }
   return out;
@@ -475,6 +550,124 @@ function buildPageInfo(total, page, perPage) {
   };
 }
 
+/* --------------------- index-only serving (zero network) -------------------
+ * The bundled search index holds every scalar a card/browse query needs. When
+ * the requested media selection is fully covered by it, results are built
+ * straight from index rows — no shard download, no hydration, no network.
+ * Verified against live AniList (unauthenticated):
+ *   - title.userPreferred === title.romaji
+ *   - index cover ("/cover/medium/") === AniList coverImage.large;
+ *     extraLarge = /medium/ -> /large/, medium = /medium/ -> /small/
+ */
+function fuzzyFromInt(v) {
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  return { __typename: 'FuzzyDate', year: Math.floor(n / 10000), month: Math.floor((n % 10000) / 100), day: n % 100 };
+}
+function indexToMedia(e) {
+  const cover = e.cover || null;
+  return {
+    __typename: 'Media', type: 'ANIME', isFavourite: false,
+    id: e.id, idMal: e.idMal ?? null,
+    format: e.format ?? null, status: e.status ?? null,
+    episodes: e.episodes ?? null, duration: e.duration ?? null,
+    chapters: e.chapters ?? null, volumes: e.volumes ?? null,
+    averageScore: e.score ?? null, meanScore: e.meanScore ?? null,
+    popularity: e.popularity ?? 0, favourites: e.favourites ?? 0, trending: e.trending ?? 0,
+    season: e.season ?? null, seasonYear: e.year ?? null,
+    countryOfOrigin: e.country ?? null, source: e.source ?? null, hashtag: e.hashtag ?? null,
+    isAdult: !!e.adult,
+    updatedAt: e.updatedAt == null ? null : parseInt(e.updatedAt, 10),
+    siteUrl: `https://anilist.co/anime/${e.id}`,
+    title: {
+      __typename: 'MediaTitle', romaji: e.romaji ?? null, english: e.english ?? null,
+      native: e.native ?? null, userPreferred: e.romaji ?? e.english ?? null,
+    },
+    coverImage: cover ? {
+      __typename: 'CoverImage',
+      extraLarge: cover.replace('/medium/', '/large/'),
+      large: cover,
+      medium: cover.replace('/medium/', '/small/'),
+      color: null, // shard-only (layout convenience, never breaks a card)
+    } : null,
+    startDate: fuzzyFromInt(e.startDate),
+    endDate: fuzzyFromInt(e.endDate),
+    synonyms: e.synonyms || [],
+    genres: e.genres || [],
+  };
+}
+const INDEX_SCALAR = new Set([
+  'id', 'idMal', 'type', 'format', 'status', 'episodes', 'duration', 'chapters', 'volumes',
+  'averageScore', 'meanScore', 'popularity', 'favourites', 'trending', 'season', 'seasonYear',
+  'countryOfOrigin', 'source', 'hashtag', 'isAdult', 'updatedAt', 'siteUrl', 'synonyms',
+  'genres', 'isFavourite',
+]);
+const INDEX_OBJECTS = {
+  title: new Set(['romaji', 'english', 'native', 'userPreferred']),
+  coverImage: new Set(['extraLarge', 'large', 'medium']),
+  startDate: new Set(['year', 'month', 'day']),
+  endDate: new Set(['year', 'month', 'day']),
+};
+function canServeFromIndex(mediaFieldNode, fragments) {
+  if (!mediaFieldNode?.selectionSet) return true;
+  for (const s of collectSelections(mediaFieldNode, fragments)) {
+    if (s.name.value === '__typename') continue;
+    const sub = s.selectionSet ? collectSelections(s, fragments) : null;
+    if (sub && sub.length) {
+      const allowed = INDEX_OBJECTS[s.name.value];
+      if (!allowed) return false; // tags/studios/characters/… need shards
+      for (const c of sub) {
+        if (c.name.value === '__typename') continue;
+        if (c.selectionSet) return false; // no deeper nesting index-side
+        if (!allowed.has(c.name.value)) return false; // e.g. coverImage.color
+      }
+    } else if (!INDEX_SCALAR.has(s.name.value)) {
+      return false; // description/bannerImage/trailer/…
+    }
+  }
+  return true;
+}
+function indexSortValue(e, field) {
+  switch (field) {
+    case 'ID': return e.id ?? 0;
+    case 'TITLE_ROMAJI': return (e.romaji || '').toLowerCase();
+    case 'TITLE_ENGLISH': return (e.english || e.romaji || '').toLowerCase();
+    case 'TITLE_NATIVE': return (e.native || '').toLowerCase();
+    case 'TYPE': return 'ANIME';
+    case 'FORMAT': return e.format || '';
+    case 'STATUS': return e.status || '';
+    case 'POPULARITY': return e.popularity ?? 0;
+    case 'SCORE': return e.score ?? e.meanScore ?? 0;
+    case 'TRENDING': return e.trending ?? 0;
+    case 'FAVOURITES': return e.favourites ?? 0;
+    case 'EPISODES': return e.episodes ?? 0;
+    case 'DURATION': return e.duration ?? 0;
+    case 'CHAPTERS': return e.chapters ?? 0;
+    case 'VOLUMES': return e.volumes ?? 0;
+    case 'START_DATE': return e.startDate ?? 0;
+    case 'END_DATE': return e.endDate ?? 0;
+    case 'UPDATED_AT': return e.updatedAt == null ? 0 : parseInt(e.updatedAt, 10) || 0;
+    default: return e.popularity ?? 0;
+  }
+}
+function sortIndexRows(rows, sort) {
+  const sorts = (Array.isArray(sort) ? sort : [sort]).filter(Boolean);
+  if (!sorts.length) sorts.push('POPULARITY_DESC'); // AniList default
+  for (let i = sorts.length - 1; i >= 0; i--) {
+    const s = sorts[i];
+    const desc = s.endsWith('_DESC');
+    const field = s.replace(/_DESC$/, '').replace(/_ASC$/, '');
+    rows.sort((a, b) => {
+      const av = indexSortValue(a, field), bv = indexSortValue(b, field);
+      if (av === bv) return 0;
+      const cmp = av > bv ? 1 : -1;
+      return desc ? -cmp : cmp;
+    });
+  }
+  return rows;
+}
+
 /* ----------------------------- query executor ----------------------------- */
 function argValue(v, variables) {
   if (!v) return undefined;
@@ -662,7 +855,7 @@ function tursoWhere(fargs) {
   if (a.genre_not_in) { where.push(`NOT EXISTS (SELECT 1 FROM anime_genres ag JOIN genres g ON g.id = ag.genre_id WHERE ag.anime_id = a.id AND g.name IN (${a.genre_not_in.map(() => '?').join(',')}))`); args.push(...a.genre_not_in); }
   if (a.tag) { where.push(`EXISTS (SELECT 1 FROM anime_tags at WHERE at.anime_id = a.id AND at.tag_name = ?)`); args.push(a.tag); }
   if (a.tag_in) { where.push(`EXISTS (SELECT 1 FROM anime_tags at WHERE at.anime_id = a.id AND at.tag_name IN (${a.tag_in.map(() => '?').join(',')}))`); args.push(...a.tag_in); }
-  if (a.tag_not_in) { where.push(`NOT EXISTS (SELECT 1 FROM anime_tags at WHERE at.anime_id = a.id AND at.tag_name IN (${a.tag_in.map(() => '?').join(',')}))`); args.push(...a.tag_not_in); }
+  if (a.tag_not_in) { where.push(`NOT EXISTS (SELECT 1 FROM anime_tags at WHERE at.anime_id = a.id AND at.tag_name IN (${a.tag_not_in.map(() => '?').join(',')}))`); args.push(...a.tag_not_in); }
   if (a.tagCategory_in) { where.push(`EXISTS (SELECT 1 FROM anime_tags at JOIN tags t ON t.name = at.tag_name WHERE at.anime_id = a.id AND t.category IN (${a.tagCategory_in.map(() => '?').join(',')}))`); args.push(...a.tagCategory_in); }
   if (a.tagCategory) { where.push(`EXISTS (SELECT 1 FROM anime_tags at JOIN tags t ON t.name = at.tag_name WHERE at.anime_id = a.id AND t.category = ?)`); args.push(a.tagCategory); }
   if (a.tagCategory_not_in) { where.push(`NOT EXISTS (SELECT 1 FROM anime_tags at JOIN tags t ON t.name = at.tag_name WHERE at.anime_id = a.id AND t.category IN (${a.tagCategory_not_in.map(() => '?').join(',')}))`); args.push(...a.tagCategory_not_in); }
@@ -1565,34 +1758,47 @@ async function resolvePage(fieldNode, fragments, variables, pageArgs) {
     throw tursoUnavailable('Turso not ready (bootstrap flag missing) and TURSO_REQUIRED=1');
   }
 
-  // Shard fallback (pre-bootstrap or Turso errors). The 12MB search index
-  // loads here for the first time — never on the Turso hot path.
+  // Shard fallback (pre-bootstrap or Turso errors). Filter + sort run on the
+  // bundled index rows (no network); hydration happens only when the selection
+  // needs shard-only fields — and then only for the visible page slice.
   const index = await getSearchIndex();
-  const needFull = fargs.sort || fargs.tagCategory || fargs.tagCategory_in || fargs.tagCategory_not_in
-    || fargs.minimumTagRank !== undefined || fargs.isLicensed !== undefined
-    || fargs.startDate || fargs.endDate;
-  let ids = index.filter((e) => matchMedia(e, null, fargs)).map((e) => e.id);
+  let rows = index.filter((e) => matchMedia(e, null, fargs));
 
-  let full = [];
-  if (needFull || ids.length <= 2000) {
-    full = await getAnimeBatch(ids);
-    full = full.filter((m) => matchMedia(index.find((e) => e.id === m.id) || {}, m, fargs));
+  // Filters that need full Media objects (tag categories, rank, license) can
+  // only be evaluated after hydration of the whole result set.
+  const hardFilters = !!(fargs.tagCategory || fargs.tagCategory_in || fargs.tagCategory_not_in
+    || fargs.minimumTagRank !== undefined || fargs.isLicensed !== undefined);
+
+  const q = fargs.search ? String(fargs.search).trim() : '';
+  if (q && !fargs.sort) {
+    // Relevance ordering when the client asked for no explicit sort (AniList
+    // ranks exact/word matches ahead of raw popularity for search queries).
+    rows.sort((a, b) => (searchScore(b, q) - searchScore(a, q)) || ((b.popularity || 0) - (a.popularity || 0)));
+  } else {
+    sortIndexRows(rows, fargs.sort);
+  }
+
+  const total = rows.length;
+  const pagedRows = rows.slice((page - 1) * perPage, page * perPage);
+
+  // Fast path: every requested field lives in the index -> zero network.
+  if (!hardFilters && canServeFromIndex(mediaFieldNode, fragments)) {
+    return pageOut(fieldNode, fragments, pagedRows.map(indexToMedia), total, page, perPage);
+  }
+
+  // Hard filters: hydrate the full id set once, apply full-object checks.
+  if (hardFilters) {
+    const rowsById = new Map(index.map((e) => [e.id, e]));
+    let full = await getAnimeBatch(rows.map((e) => e.id));
+    full = full.filter((m) => matchMedia(rowsById.get(m.id) || {}, m, fargs));
     sortMediaList(full, fargs.sort);
-  } else {
-    // large un-sorted result: keep index order (popularity DESC) and page by IDs
-    full = null;
+    const t = full.length;
+    return pageOut(fieldNode, fragments, full.slice((page - 1) * perPage, page * perPage), t, page, perPage);
   }
 
-  let total, paged;
-  if (full) {
-    total = full.length;
-    paged = full.slice((page - 1) * perPage, page * perPage);
-  } else {
-    total = ids.length;
-    const pagedIds = ids.slice((page - 1) * perPage, page * perPage);
-    paged = await getAnimeBatch(pagedIds);
-  }
-
+  // Shard-only fields requested: hydrate just the visible slice (a couple of
+  // shards at most — the index already decided order and membership).
+  const paged = await getAnimeBatch(pagedRows.map((e) => e.id));
   return pageOut(fieldNode, fragments, paged, total, page, perPage);
 }
 
@@ -1797,6 +2003,8 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
 
   if (typeName === 'RootQuery' || typeName === 'Query') {
     switch (fieldNode.name.value) {
+      case '__typename':
+        return 'Query';
       case 'Page':
         return resolvePage(fieldNode, fragments, variables, args);
       case 'Media': {
@@ -1953,7 +2161,87 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
   return null;
 }
 
+/* ------------------------------ introspection ------------------------------
+ * __schema / __type are executed by graphql-js against the official AniList
+ * SDL (api/schema.graphql, dumped from graphql.anilist.co). Normal data fields
+ * keep using the fast custom engine; a mixed document runs both and merges. */
+const MAX_QUERY_CHARS = 65536;
+const MAX_QUERY_DEPTH = 20;
+let _gqlSchema; // undefined = not attempted yet
+
+function collectVariableUsages(selections, into = new Set()) {
+  const walk = (node) => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { node.forEach(walk); return; }
+    if (node.kind === Kind.VARIABLE) { into.add(node.name.value); return; }
+    for (const k of Object.keys(node)) {
+      if (k === 'kind' || k === 'loc') continue;
+      walk(node[k]);
+    }
+  };
+  walk(selections);
+  return into;
+}
+function reachableFragments(selections, fragments, into = new Set()) {
+  for (const s of selections || []) {
+    if (s.kind === Kind.FIELD && s.selectionSet) reachableFragments(s.selectionSet.selections, fragments, into);
+    else if (s.kind === Kind.INLINE_FRAGMENT) reachableFragments(s.selectionSet?.selections, fragments, into);
+    else if (s.kind === Kind.FRAGMENT_SPREAD && fragments[s.name.value] && !into.has(s.name.value)) {
+      into.add(s.name.value);
+      reachableFragments(fragments[s.name.value].selectionSet?.selections, fragments, into);
+    }
+  }
+  return into;
+}
+function selectionDepth(node, fragments, seen = new Set(), depth = 1) {
+  if (!node?.selectionSet) return depth;
+  let max = depth;
+  for (const sel of node.selectionSet.selections) {
+    if (sel.kind === Kind.FIELD) max = Math.max(max, selectionDepth(sel, fragments, seen, depth + 1));
+    else if (sel.kind === Kind.INLINE_FRAGMENT) max = Math.max(max, selectionDepth(sel, fragments, seen, depth));
+    else if (sel.kind === Kind.FRAGMENT_SPREAD && fragments[sel.name.value] && !seen.has(sel.name.value)) {
+      max = Math.max(max, selectionDepth(
+        fragments[sel.name.value], fragments, new Set(seen).add(sel.name.value), depth + 1));
+    }
+  }
+  return max;
+}
+async function introspect(fieldNodes, fragments, variables, opVariableDefs = []) {
+  if (_gqlSchema === undefined) {
+    _gqlSchema = null;
+    try {
+      _gqlSchema = buildSchema(readFileSync(new URL('./schema.graphql', import.meta.url), 'utf8'));
+    } catch (e) { dbg('schema', e); }
+  }
+  if (!_gqlSchema) return { data: {}, errors: [{ message: 'Introspection schema unavailable', path: [] }] };
+  const usedVars = collectVariableUsages(fieldNodes);
+  const document = {
+    kind: Kind.DOCUMENT,
+    definitions: [
+      {
+        kind: Kind.OPERATION_DEFINITION, operation: 'query', directives: [],
+        variableDefinitions: (opVariableDefs || []).filter((vd) => usedVars.has(vd.variable.name.value)),
+        selectionSet: { kind: Kind.SELECTION_SET, selections: fieldNodes },
+      },
+      ...[...reachableFragments(fieldNodes, fragments)].map((n) => fragments[n]),
+    ],
+  };
+  try {
+    const res = await gqlExecute({ schema: _gqlSchema, document, variableValues: variables });
+    return {
+      data: res.data || {},
+      errors: (res.errors || []).map((e) => ({ message: e.message, path: e.path ? [...e.path] : [], status: 400 })),
+    };
+  } catch (e) {
+    return { data: {}, errors: [{ message: e.message || String(e), path: [], status: 400 }] };
+  }
+}
+
 async function execute(query, variables = {}, operationName = null) {
+  if (typeof query !== 'string' || !query.trim()) return { errors: [{ message: 'No query provided', status: 400 }] };
+  if (query.length > MAX_QUERY_CHARS) {
+    return { errors: [{ message: `Query exceeds ${MAX_QUERY_CHARS} characters`, status: 400 }] };
+  }
   let doc;
   try { doc = parse(query); }
   catch (e) { return { errors: [{ message: `Syntax Error: ${e.message}`, status: 400 }] }; }
@@ -1966,18 +2254,38 @@ async function execute(query, variables = {}, operationName = null) {
     : doc.definitions.find((d) => d.kind === Kind.OPERATION_DEFINITION);
   if (!op) return { errors: [{ message: 'No operation found', status: 400 }] };
 
+  const depth = selectionDepth(op, fragments);
+  if (depth > MAX_QUERY_DEPTH) {
+    return { errors: [{ message: `Query depth ${depth} exceeds max ${MAX_QUERY_DEPTH}`, status: 400 }] };
+  }
+
   const data = {};
   const errors = [];
   const fields = op.selectionSet.selections.filter((f) => f.kind === Kind.FIELD);
+  const isIntrospection = (f) => f.name.value === '__schema' || f.name.value === '__type';
+  const dataFields = fields.filter((f) => !isIntrospection(f));
+  const introFields = fields.filter(isIntrospection);
+
   // resolve root fields concurrently (independent data sources)
-  const settled = await Promise.all(fields.map(async (field) => {
+  const tasks = dataFields.map(async (field) => {
     try {
-      return [field, await resolveNode('RootQuery', field, fragments, variables), null];
+      return { field, result: await resolveNode('RootQuery', field, fragments, variables), err: null };
     } catch (err) {
-      return [field, null, err];
+      return { field, result: null, err };
     }
-  }));
-  for (const [field, result, err] of settled) {
+  });
+  if (introFields.length) {
+    tasks.push(introspect(introFields, fragments, variables, op.variableDefinitions)
+      .then((r) => ({ intro: true, result: r })));
+  }
+  const settled = await Promise.all(tasks);
+  for (const it of settled) {
+    if (it.intro) {
+      Object.assign(data, it.result.data || {});
+      for (const e of it.result.errors || []) errors.push(e);
+      continue;
+    }
+    const { field, result, err } = it;
     data[field.alias?.value || field.name.value] = result;
     if (err) errors.push({ message: err.message, status: err.status || 500, path: [field.name.value] });
   }
@@ -1985,26 +2293,77 @@ async function execute(query, variables = {}, operationName = null) {
 }
 
 /* -------------------------------- handler --------------------------------- */
-function readBody(req) {
+const MAX_BODY_BYTES = 1024 * 1024;   // 1MB holds any real GraphQL document
+const HARD_BODY_CAP = 64 * 1024 * 1024; // beyond this the socket is cut (abuse)
+const RESP_CACHE_MAX = 200;
+const RESP_CACHE_TTL_MS = 60 * 1000;
+const respCache = new Map(); // request key -> { body, time } (LRU)
+
+/* Bounded body reader. Oversized requests are drained quietly and answered
+ * with 413 only once the upload completes — responding while the client is
+ * still writing would reset its connection mid-send. Beyond HARD_BODY_CAP the
+ * socket is cut outright. */
+function readBody(req, limit = MAX_BODY_BYTES) {
   return new Promise((resolve, reject) => {
+    const declared = Number(req.headers['content-length'] || 0);
+    const fail413 = () => reject(Object.assign(new Error(`Payload too large (max ${limit} bytes)`), { status: 413 }));
+    let tooLarge = declared > limit;
     const chunks = [];
-    req.on('data', (c) => chunks.push(c));
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (tooLarge) {
+        if (size > HARD_BODY_CAP) req.destroy();
+        return;
+      }
+      if (size > limit) { tooLarge = true; chunks.length = 0; return; }
+      chunks.push(c);
+    });
     req.on('end', () => {
+      if (tooLarge) return fail413();
       try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
       catch (e) { reject(e); }
     });
     req.on('error', reject);
   });
 }
-function nodeJson(res, data, status = 200, cacheSeconds = 0) {
+function respCacheGet(key) {
+  const hit = respCache.get(key);
+  if (!hit) return undefined;
+  if (Date.now() - hit.time > RESP_CACHE_TTL_MS) { respCache.delete(key); return undefined; }
+  respCache.delete(key);       // LRU touch
+  respCache.set(key, hit);
+  return hit.body;
+}
+function respCacheSet(key, body) {
+  respCache.set(key, { body, time: Date.now() });
+  if (respCache.size > RESP_CACHE_MAX) respCache.delete(respCache.keys().next().value);
+}
+function respKey(query, variables, operationName) {
+  return `${operationName || ''}\u0000${query}\u0000${JSON.stringify(variables || {})}`;
+}
+function nodeJson(req, res, data, status = 200, cacheSeconds = 0) {
+  return sendRaw(req, res, JSON.stringify(data), status, cacheSeconds);
+}
+function sendRaw(req, res, body, status = 200, cacheSeconds = 0) {
   const headers = { 'Content-Type': 'application/json', ...CORS };
   // Edge-cache GET responses (identical rail/search queries served from edge,
-  // zero compute and zero Turso reads). POSTs stay uncached (same as AniList).
+  // zero compute). max-age gives browsers a short local window on top of the
+  // CDN's s-maxage. POSTs stay uncached (same as AniList).
   if (cacheSeconds > 0) {
-    headers['Cache-Control'] = `public, s-maxage=${cacheSeconds}, stale-while-revalidate=86400`;
+    headers['Cache-Control'] = `public, max-age=${Math.min(cacheSeconds, 60)}, s-maxage=${cacheSeconds}, stale-while-revalidate=86400`;
+  }
+  // ETag revalidation for GET: repeat queries skip the body transfer.
+  if (req?.method === 'GET' && status === 200) {
+    const etag = `W/"${createHash('sha1').update(body).digest('base64')}"`;
+    headers.ETag = etag;
+    if (req.headers['if-none-match'] === etag) {
+      res.writeHead(304, headers);
+      return res.end();
+    }
   }
   res.writeHead(status, headers);
-  res.end(JSON.stringify(data));
+  res.end(body);
 }
 export default async function handler(req, res) {
   if (req.method === 'OPTIONS') {
@@ -2019,29 +2378,48 @@ export default async function handler(req, res) {
       const h = await tursoHealth().catch(() => ({
         configured: false, host: null, reachable: false, flagged: false, remoteAnime: null,
       }));
-      return nodeJson(res, {
+      return nodeJson(req, res, {
         ok: !!(h.configured && h.reachable && h.flagged && (h.ok ?? true)),
         tursoRequired: tursoRequired(),
         ...h,
       }, 200);
     }
     const query = parsed.searchParams.get('query');
-    if (!query) return nodeJson(res, INFO, 200);
+    if (!query) return nodeJson(req, res, INFO, 200);
     let variables = {};
     try { variables = JSON.parse(parsed.searchParams.get('variables') || '{}'); }
-    catch { return nodeJson(res, { errors: [{ message: 'Invalid variables JSON', status: 400 }] }, 400); }
-    return nodeJson(res, await execute(query, variables, parsed.searchParams.get('operationName')), 200, 300);
+    catch { return nodeJson(req, res, { errors: [{ message: 'Invalid variables JSON', status: 400 }] }, 400); }
+    const key = respKey(query, variables, parsed.searchParams.get('operationName'));
+    const hit = respCacheGet(key);
+    if (hit !== undefined) return sendRaw(req, res, hit, 200, 300);
+    const out = await execute(query, variables, parsed.searchParams.get('operationName'));
+    const body = JSON.stringify(out);
+    if (!out.errors) respCacheSet(key, body);
+    return sendRaw(req, res, body, 200, 300);
   }
   if (req.method === 'POST') {
     let body;
     try { body = await readBody(req); }
-    catch { return nodeJson(res, { errors: [{ message: 'Invalid JSON body', status: 400 }] }, 400); }
-    if (!body || !body.query) return nodeJson(res, { errors: [{ message: 'No query provided', status: 400 }] }, 400);
+    catch (e) {
+      if (e?.status === 413) return nodeJson(req, res, { errors: [{ message: e.message, status: 413 }] }, 413);
+      return nodeJson(req, res, { errors: [{ message: 'Invalid JSON body', status: 400 }] }, 400);
+    }
+    if (!body || !body.query) return nodeJson(req, res, { errors: [{ message: 'No query provided', status: 400 }] }, 400);
     try {
-      return nodeJson(res, await execute(body.query, body.variables || {}, body.operationName || null), 200);
+      const key = respKey(body.query, body.variables, body.operationName || null);
+      const hit = respCacheGet(key);
+      if (hit !== undefined) return sendRaw(req, res, hit, 200);
+      const out = await execute(body.query, body.variables || {}, body.operationName || null);
+      const outBody = JSON.stringify(out);
+      // Cache successful responses only — transient errors must not stick.
+      if (!out.errors) respCacheSet(key, outBody);
+      return sendRaw(req, res, outBody, 200);
     } catch (e) {
-      return nodeJson(res, { errors: [{ message: e.message || 'Internal error', status: 500 }] }, 500);
+      return nodeJson(req, res, { errors: [{ message: e.message || 'Internal error', status: e.status || 500 }] }, e.status >= 400 && e.status < 600 ? e.status : 500);
     }
   }
-  return nodeJson(res, { errors: [{ message: 'Method not allowed', status: 405 }] }, 405);
+  return nodeJson(req, res, { errors: [{ message: 'Method not allowed', status: 405 }] }, 405);
 }
+
+/* Test-only surface (scripts/test_api.mjs) — not part of the public API. */
+export const __test = { tursoWhere, matchMedia, indexToMedia, canServeFromIndex, sortIndexRows, searchScore };

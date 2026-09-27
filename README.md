@@ -31,9 +31,12 @@ curl -X POST https://graphql.aniraku.tech/ \
 
 ## Features
 
-- **Full GraphQL API** - Mirrors `graphql.anilist.co` with identical schema, zero rate limits
-- **SQLite + JSON** - Queryable database + JSON export
-- **FTS5 Search** - Full-text search on titles, descriptions, characters, genres, tags
+- **Drop-in AniList replacement** — same GraphQL schema as `graphql.anilist.co`, no auth, no rate limits
+- **Full introspection** — `{ __schema { ... } }` / `{ __type(name: "Media") { ... } }` answered from the official AniList SDL
+- **Index-only fast path** — card/search/browse queries (filters, sorts, pagination, titles, covers, scores) resolve from a bundled 14.8k-row search index with *zero network I/O*
+- **Shard-backed depth** — descriptions, characters, studios, relations, recommendations and airing data hydrate from JSON shards (only the visible page slice is fetched)
+- **Edge caching** — GET queries carry `Cache-Control: s-maxage` + `ETag`/`304`; warm queries skip the function entirely
+- **Response cache** — identical repeat POSTs answer from a 60s in-memory LRU
 - **Anime Recommendations** - Each anime's recommended similar anime with ratings
 - **Anime Relations** - Sequels, prequels, adaptations, side stories, etc.
 - **Characters & Voice Actors** - Japanese voice actors, character roles, images
@@ -42,8 +45,10 @@ curl -X POST https://graphql.aniraku.tech/ \
 - **All Languages** - Titles in Romaji, English, Native Japanese + alternative titles
 - **Daily Updates** - Automated GitHub Actions workflow runs daily
 - **Incremental Updates** - Only fetches anime modified since last run
+- **Full Backfill** - Manual `fetch_mode=full` dispatch rebuilds the complete AniList catalog (date-banded walks, split automatically around AniList's 5000-entry page-depth cap)
 - **Crash Recovery** - Resumes from checkpoint if interrupted
 - **GitHub Releases** - Database files attached to each release
+- **Tested** — 32-test suite runs the real Vercel handler in-process (`npm test`)
 
 ## Quick Start
 
@@ -60,8 +65,8 @@ Visit the web UI: `https://shoislam0311.github.io/anilist-offline-db/`
       averageScore
       popularity
       genres
-      characters { edges { node { name full } role } }
-      recommendations { edges { node { mediaRecommendation { title romaji } rating } } }
+      characters { edges { role node { name { full } } } }
+      recommendations { edges { node { rating mediaRecommendation { title { romaji } } } } }
     }
   }
 }
@@ -148,8 +153,8 @@ git push
 4. Save
 
 The workflow will automatically:
-- Run daily at 04:00 UTC
-- Fetch only updated anime (incremental)
+- Run daily at 04:00 UTC (homepage rails + catalog-wide updatedAt sweep)
+- Or, when dispatched manually, run a complete catalog backfill (`fetch_mode=full`)
 - Commit changes
 - Create GitHub Release with database files
 - Deploy updated Pages site
@@ -200,34 +205,48 @@ For the full catalog (~22K anime):
 
 ## APIs
 
-### Vercel GraphQL API (server-side)
+### GraphQL API (Vercel, primary data path)
 
-`POST https://anilist-offline-db-phi.vercel.app/` with `{ "query", "variables", "operationName" }` — same contract as `graphql.anilist.co`. Also supports `GET` with `?query=` + `?variables=`. Supports `Page` + `Media` roots, filters (`search`, `genre`, `format`, `status`, `season`, `seasonYear`, `id`), all sorts, variables, aliases, fragments, and `operationName`. Open CORS.
+`POST https://graphql.aniraku.tech/` (or `https://anilist-offline-db-phi.vercel.app/`) with `{ "query", "variables", "operationName" }` — same contract as `graphql.anilist.co`. Also:
 
-### GitHub Pages API (client-side)
+- `GET /?query=...&variables=...` — edge-cacheable (`s-maxage=300` + `ETag`/`304` revalidation)
+- Routes: `/`, `/graphql`, `/api`, `/api/graphql`
+- Roots: `Page`, `Media`, `Character`, `Staff`, `Studio`, `GenreCollection`, `MediaTagCollection`, `AiringSchedule` (+ `__schema`/`__type` introspection)
+- Filters (`search`, `genre(_in/_not_in)`, `tag(_in/_not_in)`, `format`, `status`, `season`, `seasonYear`, `id(_in)`, `isAdult`, …), all `MediaSort` orders, variables, aliases, fragments, `operationName`
+- Open CORS (`*`), `X-Content-Type-Options: nosniff`, query depth/size guards
 
-The static site loads JSON data shards and resolves GraphQL queries client-side:
+```bash
+curl -X POST https://graphql.aniraku.tech/ \
+  -H "Content-Type: application/json" \
+  -d '{"query": "{ Page(page:1, perPage:5) { media(sort:POPULARITY_DESC) { id title { romaji english } averageScore } } }"}'
+```
 
-- **Zero rate limits** - All data is local
-- **Same schema** - Identical to `graphql.anilist.co`
-- **Search** - Full-text search with filters
-- **Browse** - Filter by genre, status, format, sort
-- **Playground** - Interactive query editor
+```bash
+# GET variant — served from the CDN edge when warm
+curl 'https://graphql.aniraku.tech/?query=%7B%20Page(page%3A1%2C%20perPage%3A5)%7B%20media(sort%3APOPULARITY_DESC)%7B%20id%20title%7B%20romaji%20%7D%20%7D%20%7D%20%7D'
+```
 
-### API Endpoints (via GraphQL)
+### GitHub Pages site
+
+`https://shoislam0311.github.io/anilist-offline-db/` — browse/search/schedule UI plus a playground. It calls the Vercel API above (GET-first, endpoint failover); tiny files (`metadata.json`, `search_index.json`) load directly from the Pages/CDN mirror for offline-capable search.
+
+### API Examples
 
 ```graphql
 # Get anime by ID
 { Media(id: 16498) { id title { romaji } } }
 
 # Search
-{ Page(search: "one piece") { media { id title { romaji } } } }
+{ Page { media(search: "one piece") { id title { romaji } } } }
 
 # Filter
-{ Page(genre: "Action", seasonYear: 2024, sort: SCORE_DESC) { media { id } } }
+{ Page { media(genre: "Action", seasonYear: 2024, sort: SCORE_DESC) { id } } }
 
 # Paginate
-{ Page(page: 2, perPage: 20, sort: POPULARITY_DESC) { media { id } } }
+{ Page(page: 2, perPage: 20) { media(sort: POPULARITY_DESC) { id } pageInfo { total lastPage } } }
+
+# Introspection
+{ __type(name: "Media") { fields { name } } }
 ```
 
 ## CLI Reference
@@ -265,36 +284,55 @@ export                   Export filtered data to JSON
   --limit, -n            Max results
 ```
 
+## Architecture — why it's fast
+
+1. **Bundled search index first.** `docs/api/search_index.json` (14,780 rows × 29 fields) ships inside the function. Filters, sorts, search relevance, pagination and `pageInfo` totals all run in-process — a card query never touches the network.
+2. **Shards only for deep fields.** Selections like `description`, `characters`, `studios`, `relations` hydrate exactly the visible page slice from JSON shards (GitHub release assets, cached in-memory per instance).
+3. **Configured data source wins.** With `DATA_BASE_URL` set, that base is tried *before* release assets, with fetch timeouts and a 20s failure backoff; the bundled snapshot degrades gracefully when the source is dead.
+4. **Caching at every layer.** Browser `max-age` → CDN `s-maxage` → function response LRU → per-instance shard/index caches.
+5. **Introspection via graphql-js** against `api/schema.graphql` (dumped from `graphql.anilist.co`), partitioned from the fast custom engine — mixed documents run both.
+
+## Testing
+
+```bash
+npm test          # 32 tests: boots the real Vercel handler in-process
+                  # (fixtures + request-logging file server, no network)
+npm run probe     # latency probe: root/cards/introspection/detail/GET
+npm run dev       # local dev server (reads .env if present, optional)
+node scripts/dump_schema.mjs   # re-dump the official SDL -> api/schema.graphql
+```
+
+The suite asserts the routing/headers contract, index-only serving (zero shard fetches for cards), filter/sort/pagination correctness, introspection, shard hydration, caching (ETag/304/response cache), and dead-source resilience.
+
 ## Project Structure
 
 ```
 anilist-offline-db/
-├── .github/workflows/
-├── update-db.yml                       #Daily Workflow Run for Daily Upgrades
-├── pages.yaml                          #For Github pages you know!
+├── .github/workflows/                    # daily fetch + Pages deploy
 ├── api/
-│   └── index.js                        # Vercel serverless GraphQL handler
-├── vercel.json                         # Vercel rewrites + CORS headers
-├── package.json                        # Node deps (graphql parser)
+│   ├── index.js                          # Vercel serverless GraphQL handler
+│   └── schema.graphql                    # official AniList SDL (introspection)
+├── vercel.json                           # rewrites (/, /graphql, /api) + headers
+├── package.json                          # Node deps (graphql) + test/dev/probe
 ├── scripts/
-│   ├── fetch_anilist.py                # Main API scraper
-│   ├── db_utils.py                     # SQLite + FTS5 utilities
-│   ├── cli.py                          # CLI filter/export tool
-│   └── api_generator.py                # JSON shard generator
+│   ├── fetch_anilist.py                  # Main API scraper
+│   ├── api_generator.py                  # JSON shard + search_index generator
+│   ├── cli.py / db_utils.py              # CLI + SQLite/FTS5 utilities
+│   ├── test_api.mjs                      # 32-test suite (npm test)
+│   ├── probe.mjs                         # latency probe (npm run probe)
+│   ├── dev_server.mjs                    # local dev server (npm run dev)
+│   ├── dump_schema.mjs                   # SDL dump -> api/schema.graphql
+│   └── make_fixtures.mjs                 # builds test/fixtures/
+├── test/fixtures/                        # committed fixture shards + metadata
 ├── docs/
-│   ├── index.html                      # GitHub Pages site
-│   ├── api.js                          # GraphQL engine (client-side)
-│   └── api/                            # Generated JSON data
+│   ├── index.html                        # GitHub Pages site
+│   ├── api.js                            # site data layer (endpoint failover, GET-first)
+│   └── api/                              # Generated JSON data
 │       ├── metadata.json
 │       ├── search_index.json
-│       ├── sample.json
-|       ├── .nojekyll
+│       └── shards/                       # generated on update (release assets)
 ├── requirements.txt
-├── .gitignore
-├── package-lock.json
-├── package.json
-├── vercel.json                         # Vercel Configuration
-├── LICENSE                             # Apache-2.0
+├── LICENSE                               # Apache-2.0
 └── README.md
 ```
 ## Contributing
