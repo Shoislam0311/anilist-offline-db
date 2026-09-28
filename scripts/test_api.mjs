@@ -424,6 +424,13 @@ await test('Page.airingSchedules resolves to a list (no crash)', async () => {
   const rows = r.json?.data?.Page?.airingSchedules;
   ok(Array.isArray(rows), 'list, got: ' + JSON.stringify(r.json).slice(0, 200));
 });
+await test('pastAiring middle rows merge into airingSchedule timeline', async () => {
+  const r = await api.post({ query: '{ Page(page:1, perPage:1) { media(id: 1) { airingSchedule { edges { node { id episode } } nodes { id episode } pageInfo { total } } } } }' });
+  const sch = r.json?.data?.Page?.media?.[0]?.airingSchedule;
+  eq(sch?.edges?.length, 1, 'middle row served');
+  eq(sch.edges[0].node, { id: 991, episode: 26 }, 'row content');
+  eq(sch?.nodes?.length, 1, 'nodes derived');
+});
 await test('Page.pageInfo follows airingSchedules when media is absent', async () => {
   const r = await api.post({ query: '{ Page(page:1, perPage:5) { airingSchedules { id } pageInfo { total perPage currentPage lastPage hasNextPage } } }' });
   const pi = r.json?.data?.Page?.pageInfo;

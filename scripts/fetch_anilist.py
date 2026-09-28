@@ -26,7 +26,7 @@ from db_utils import (
     upsert_genres, upsert_tags, upsert_studios, upsert_characters,
     upsert_staff, upsert_relations, upsert_recommendations, upsert_airing_schedule,
     upsert_external_links, upsert_streaming_episodes, upsert_statistics,
-    upsert_rankings, upsert_trends, upsert_reviews,
+    upsert_rankings, upsert_trends, upsert_reviews, collect_schedule_nodes,
     generate_changelog, export_json, get_database_stats, connect_db
 )
 
@@ -268,6 +268,22 @@ query ($ids: [Int]) {
 }
 """ % MEDIA_FIELDS
 
+# Middle-history schedule pages for long-runners: Media.airingSchedule has
+# no sort/filter args, so pages 2..N are the only way to reach episodes
+# between page-1 history and upcoming rows. Capped: 50 pages x 25 rows.
+MIDDLE_PAGE_CAP = 50
+MIDDLE_SCHEDULE_QUERY = """
+query ($id: Int, $page: Int) {
+  Media(id: $id, type: ANIME) {
+    id
+    airingSchedule(page: $page, perPage: 25) {
+      edges { node { id airingAt timeUntilAiring episode mediaId } }
+      pageInfo { total perPage currentPage lastPage hasNextPage }
+    }
+  }
+}
+"""
+
 # Full-catalog backfill (FETCH_MODE=full): every anime AniList knows, sliced
 # by startDate bands. sort: ID is a total order (IDs unique) and pagination
 # under it is verified consistent; a band that would bust AniList's
@@ -357,6 +373,10 @@ class AniListFetcher:
         })
         self.request_count = 0
         self.last_request_time = 0
+        # Middle-history schedule pages (episodes between page-1 history and
+        # upcoming) are only backfilled on full runs: daily rails/sweep keep
+        # page-1 + upcoming + next fresh, history is immutable anyway.
+        self.fetch_middle_pages = False
 
         # SMART tracking
         self.touched_full = set()       # brand-new titles only
@@ -438,6 +458,35 @@ class AniListFetcher:
         if os.path.exists(self.checkpoint_path):
             os.remove(self.checkpoint_path)
 
+    def _backfill_middle_pages(self, media: dict):
+        """Fetch schedule pages between page-1 history and upcoming rows.
+
+        Only long-runners (pageInfo.total > what page 1 + upcoming cover)
+        need this — e.g. Xian Ni ep160 sits between page-1 (eps 1-25) and
+        upcoming (ep161+). Rows accumulate under media["pastAiring"] so the
+        normal merge + raw_json pick them up. Capped to bound request cost.
+        """
+        sched = media.get("airingSchedule") or {}
+        pi = (sched.get("pageInfo") or {}) if isinstance(sched, dict) else {}
+        total = pi.get("total") or 0
+        have = len(sched.get("edges") or []) + len(((media.get("upcomingAiring") or {}).get("edges")) or [])
+        if not total or total <= max(have, 50):
+            return
+        pages = min((total + 24) // 25, MIDDLE_PAGE_CAP)
+        got = []
+        for page in range(2, pages + 1):
+            try:
+                data = self._request(MIDDLE_SCHEDULE_QUERY, {"id": media["id"], "page": page})
+                edges = (((data or {}).get("data") or {}).get("Media") or {}).get("airingSchedule", {}).get("edges") or []
+                if not edges:
+                    break
+                got.extend(edges)
+            except Exception as e:
+                logger.warning(f"middle schedule page {page} for {media.get('id')} failed: {str(e)[:100]}")
+                break
+        if got:
+            media.setdefault("pastAiring", {}).setdefault("edges", []).extend(got)
+
     def _process_anime(self, conn, media: dict):
         """Full process for brand-new titles only."""
         if media.get("type") and media.get("type") != "ANIME":
@@ -480,26 +529,14 @@ class AniListFetcher:
         except Exception:
             pass
 
-        sched_nodes = []
-        for _key in ("airingSchedule", "upcomingAiring"):
-            _sched = media.get(_key) or {}
-            if isinstance(_sched, dict) and _sched.get("edges"):
-                for _e in _sched.get("edges") or []:
-                    _n = (_e or {}).get("node") if isinstance(_e, dict) and "node" in _e else _e
-                    if isinstance(_n, dict) and _n.get("id"):
-                        sched_nodes.append(_n)
-        if media.get("nextAiringEpisode"):
-            sched_nodes.append(media["nextAiringEpisode"])
-        # Dedupe by schedule id so page-1 history + upcoming + next-ep merge
-        # into one timeline (upsert_airing_schedule replaces per-anime rows).
-        _seen, _merged = set(), []
-        for _n in sched_nodes:
-            if _n.get("id") in _seen:
-                continue
-            _seen.add(_n.get("id"))
-            _merged.append(_n)
-        if _merged:
-            upsert_airing_schedule(conn, media["id"], _merged)
+        # Full schedule timeline: page-1 history + middle-history pages (long
+        # runners only — page 1 + upcoming leave episodes 26..N uncovered) +
+        # upcoming + next episode, merged + deduped into one timeline.
+        if self.fetch_middle_pages:
+            self._backfill_middle_pages(media)
+        merged = collect_schedule_nodes(media)
+        if merged:
+            upsert_airing_schedule(conn, media["id"], merged)
 
         upsert_external_links(conn, media["id"], media.get("externalLinks", []) or [])
         upsert_streaming_episodes(conn, media["id"], media.get("streamingEpisodes", []) or [])
@@ -528,14 +565,7 @@ class AniListFetcher:
             pass
 
         try:
-            _airing_nodes = []
-            _up = (media.get("upcomingAiring") or {}).get("edges") or []
-            for _e in _up:
-                _n = (_e or {}).get("node") if isinstance(_e, dict) and "node" in _e else _e
-                if isinstance(_n, dict) and _n.get("id"):
-                    _airing_nodes.append(_n)
-            if next_ep:
-                _airing_nodes.append(next_ep)
+            _airing_nodes = collect_schedule_nodes(media)
             if _airing_nodes:
                 upsert_airing_schedule(conn, aid, _airing_nodes)
         except Exception:
@@ -920,6 +950,7 @@ class AniListFetcher:
         Idempotent: safe to re-run after a mid-flight failure — already
         upserted pages are simply processed again.
         """
+        self.fetch_middle_pages = True
         conn = init_db(self.db_path)
         set_metadata(conn, "fetch_type", "full")
         set_metadata(conn, "fetch_started_at", datetime.now(timezone.utc).isoformat())

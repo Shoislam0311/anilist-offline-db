@@ -526,6 +526,7 @@ function normMediaAiring(media, raw, args, edgesSub, nodeSub, pageSel, fragments
     byId.set(n.id, liveAiring({ ...n, mediaId: n.mediaId ?? media.id }, now));
   };
   for (const e of (raw?.edges || [])) push(e?.node);
+  for (const e of (media.pastAiring?.edges || [])) push(e?.node);
   for (const e of (media.upcomingAiring?.edges || [])) push(e?.node);
   push(media.nextAiringEpisode);
   let list = [...byId.values()].sort((a, b) => (a.airingAt || 0) - (b.airingAt || 0));
@@ -2182,6 +2183,7 @@ async function resolvePageAiringSchedules(fieldNode, fragments, variables, page,
       });
     };
     for (const e of a.airingSchedule?.edges || []) push(e?.node);
+    for (const e of a.pastAiring?.edges || []) push(e?.node);
     for (const e of a.upcomingAiring?.edges || []) push(e?.node);
     push(a.nextAiringEpisode);
   }

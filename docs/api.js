@@ -814,24 +814,31 @@ async function renderSchedule() {
   scheduleLoaded = true;
   box.innerHTML = '<div class="loading">Loading this week\'s episodes...</div>';
   try {
-    const F = `id title { romaji english } coverImage { large } airingSchedule { edges { node { episode airingAt } } } nextAiringEpisode { episode airingAt }`;
-    const pages = await Promise.all([1, 2, 3, 4].map((p) =>
-      apiQuery(`{ Page(page: ${p}, perPage: 50) { media(type: ANIME, status: RELEASING, sort: POPULARITY_DESC, isAdult: false) { ${F} } } }`)
-        .then((d) => d?.Page?.media || []).catch(() => [])));
-    const now = Date.now() / 1000, week = now + 7 * 86400;
+    // Exact window straight from Page.airingSchedules (yesterday -> +7d),
+    // titles/covers resolved from the local search index — one cheap query
+    // per page instead of hydrating the top-200 popular titles (which missed
+    // everything else, e.g. lower-popularity weeklies).
+    const rawIndex = await loadSearchIndex();
+    const arr = Array.isArray(rawIndex) ? rawIndex : (rawIndex.rows || []);
+    const byId = new Map(arr.map((e) => [e.id, e]));
+    const now = Math.floor(Date.now() / 1000);
+    const start = now - 86400, end = now + 7 * 86400;
+    const rows = [];
+    for (let page = 1; page <= 4; page++) {
+      const d = await apiQuery(`{ Page(page: ${page}, perPage: 50) { airingSchedules(airingAt_greater: ${start}, airingAt_lesser: ${end}, sort: [TIME]) { episode airingAt mediaId } pageInfo { hasNextPage } } }`);
+      rows.push(...(d?.Page?.airingSchedules || []));
+      if (!d?.Page?.pageInfo?.hasNextPage) break;
+    }
+    const seen = new Set();
     const eps = [];
-    for (const a of pages.flat()) {
-      for (const ed of a.airingSchedule?.edges || []) {
-        const n = ed.node;
-        if (n && n.airingAt >= now - 86400 && n.airingAt <= week) {
-          eps.push({ at: n.airingAt, ep: n.episode, id: a.id, title: a.title?.romaji || a.title?.english, cover: a.coverImage?.large });
-        }
-      }
-      const nx = a.nextAiringEpisode;
-      if (nx && nx.airingAt <= week && nx.airingAt >= now - 3600
-          && !eps.some((x) => x.id === a.id && x.ep === nx.episode)) {
-        eps.push({ at: nx.airingAt, ep: nx.episode, id: a.id, title: a.title?.romaji || a.title?.english, cover: a.coverImage?.large });
-      }
+    for (const n of rows) {
+      if (!n || n.airingAt < start || n.airingAt > end) continue;
+      const key = n.mediaId + ':' + n.episode;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const ix = byId.get(n.mediaId) || {};
+      eps.push({ at: n.airingAt, ep: n.episode, id: n.mediaId,
+        title: ix.romaji || ix.english || ('#' + n.mediaId), cover: ix.cover || '' });
     }
     eps.sort((a, b) => a.at - b.at);
   if (!eps.length) { box.innerHTML = '<p style="color:#8ba0b0;">No episodes in the next 7 days.</p>'; return; }

@@ -1015,6 +1015,34 @@ def upsert_recommendations(conn: sqlite3.Connection, anime_id: int, recommendati
                 pass
 
 
+def collect_schedule_nodes(media: dict) -> list:
+    """Merge every schedule source on a media payload into one deduped node list.
+
+    Sources: page-1 history (airingSchedule), middle-history pages
+    (pastAiring, fetched for long-runners), not-yet-aired rows
+    (upcomingAiring), and the single nextAiringEpisode. Deduped by schedule
+    row id so overlapping sources collapse into one timeline.
+    """
+    sched_nodes = []
+    for _key in ("airingSchedule", "pastAiring", "upcomingAiring"):
+        _sched = (media or {}).get(_key) or {}
+        if isinstance(_sched, dict) and _sched.get("edges"):
+            for _e in _sched.get("edges") or []:
+                _n = (_e or {}).get("node") if isinstance(_e, dict) and "node" in _e else _e
+                if isinstance(_n, dict) and _n.get("id"):
+                    sched_nodes.append(_n)
+    _next = (media or {}).get("nextAiringEpisode")
+    if isinstance(_next, dict) and _next.get("id"):
+        sched_nodes.append(_next)
+    _seen, _merged = set(), []
+    for _n in sched_nodes:
+        if _n.get("id") in _seen:
+            continue
+        _seen.add(_n.get("id"))
+        _merged.append(_n)
+    return _merged
+
+
 def upsert_airing_schedule(conn: sqlite3.Connection, anime_id: int, schedule_data: list):
     conn.execute("DELETE FROM airing_schedule WHERE anime_id=?", (anime_id,))
     for ep in schedule_data or []:
