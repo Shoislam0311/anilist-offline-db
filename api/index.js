@@ -405,6 +405,12 @@ function pick(obj, sels, fragments, variables) {
       continue;
     }
     if (!sub || !sub.length) {
+      // StaffLanguageV2 is the display form of StaffLanguage (JAPANESE ->
+      // Japanese); synthesize when the snapshot predates the split field.
+      if (s.name.value === 'languageV2' && obj.languageV2 == null && typeof obj.language === 'string' && obj.language) {
+        out[key] = obj.language.charAt(0) + obj.language.slice(1).toLowerCase();
+        continue;
+      }
       out[key] = obj[s.name.value] ?? null;
       continue;
     }
@@ -458,6 +464,19 @@ function asMedia(node) {
   return node.__typename ? node : { ...node, __typename: 'Media' };
 }
 
+// Project an edge-level field honoring ITS OWN sub-selections (edge-level
+// lists like CharacterEdge.voiceActors bypass the node projection, so raw
+// rows would leak unrequested keys without this).
+function projectEdgeField(val, fieldNode, fragments, vars) {
+  const sub = fieldNode?.selectionSet ? collectSelections(fieldNode, fragments) : null;
+  if (!sub?.length) return val ?? null;
+  if (Array.isArray(val)) {
+    return val.map((item) => (item && typeof item === 'object' ? pick(item, sub, fragments, vars) : item));
+  }
+  if (val && typeof val === 'object') return pick(val, sub, fragments, vars);
+  return val ?? null;
+}
+
 function pickMediaConn(media, fieldNode, sub, fragments, vars) {
   const name = fieldNode.name.value;
   const args = collectArgs(fieldNode, vars);
@@ -498,9 +517,9 @@ function normRelations(raw, relFieldNode, edgesSub, nodeSub, pageSel, fragments,
     const edge = { __typename: 'MediaEdge', id: e?.id ?? null, isMainStudio: false, node };
     for (const { key, version } of verMap) edge[key] = mapRelationType(e || {}, version);
     if (!verMap.length) edge.relationType = mapRelationType(e || {}, undefined);
-    return { edge, node };
+    return { edge, node, raw: e };
   });
-  const projectEdge = (edge) => {
+  const projectEdge = (edge, rawEdge) => {
     if (!edgesSub.length) return edge;
     const out = {};
     for (const s of edgesSub) {
@@ -508,11 +527,14 @@ function normRelations(raw, relFieldNode, edgesSub, nodeSub, pageSel, fragments,
       if (s.name.value === '__typename') { out[k] = 'MediaEdge'; continue; }
       // Versioned/aliased fields are stored under the RESPONSE key (k), not
       // the schema name — e.g. v2: relationType(version: 2) reads edge.v2.
-      out[k] = edge[k] !== undefined ? edge[k] : (edge[s.name.value] ?? null);
+      let v = edge[k] !== undefined ? edge[k] : (edge[s.name.value] ?? null);
+      if (v == null && rawEdge) v = rawEdge[s.name.value] ?? null;
+      if (Array.isArray(v)) v = projectEdgeField(v, s, fragments, vars);
+      out[k] = v;
     }
     return out;
   };
-  const edges = full.map(({ edge }) => projectEdge(edge));
+  const edges = full.map(({ edge, raw }) => projectEdge(edge, raw));
   const nodes = full.map(({ node }) => node);
   return {
     __typename: 'MediaConnection',
@@ -643,7 +665,9 @@ function normCrew(kind, raw, args, edgesSub, nodeSub, pageSel, fragments, vars) 
       const k = s.alias?.value || s.name.value;
       if (s.name.value === '__typename') { out[k] = edgeType; continue; }
       if (s.name.value === 'node') { out[k] = node; continue; }
-      out[k] = edge[s.name.value] !== undefined ? edge[s.name.value] : (e?.[s.name.value] ?? null);
+      let v = edge[s.name.value] !== undefined ? edge[s.name.value] : (e?.[s.name.value] ?? null);
+      if (Array.isArray(v)) v = projectEdgeField(v, s, fragments, vars);
+      out[k] = v;
     }
     return { edge: out, node };
   });

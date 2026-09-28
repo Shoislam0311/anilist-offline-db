@@ -405,12 +405,18 @@ await test('characters honor perPage and derive nodes', async () => {
   eq(ch?.nodes?.length, 2, 'nodes derived');
   eq(ch.pageInfo.perPage, 2, 'pageInfo perPage');
 });
-await test('characters accept array sort (client shape: [ROLE, RELEVANCE, ID])', async () => {
-  const r = await api.post({ query: '{ Page(page:1, perPage:1) { media(id: 101922) { characters(perPage: 50, sort: [ROLE, RELEVANCE, ID]) { edges { role node { id } } } } } }' });
+await test('characters accept array sort (client shape: [ROLE, RELEVANCE, ID])', async () => {  const r = await api.post({ query: '{ Page(page:1, perPage:1) { media(id: 101922) { characters(perPage: 50, sort: [ROLE, RELEVANCE, ID]) { edges { role node { id } } } } } }' });
   ok(!r.json?.errors, 'no errors, got: ' + JSON.stringify(r.json?.errors));
   const edges = r.json?.data?.Page?.media?.[0]?.characters?.edges || [];
   eq(edges.length, 4, 'all stored rows served');
   ok(edges.every((e) => e.node && e.node.id > 0), 'nodes intact');
+});
+await test('edge voiceActors project sub-selections (no key leak) + languageV2 mapping', async () => {
+  const r = await api.post({ query: '{ Page(page:1, perPage:1) { media(id: 101922) { characters(perPage: 1) { edges { role voiceActors { id languageV2 name { full } image { large } } } } } } }' });
+  ok(!r.json?.errors, 'no errors, got: ' + JSON.stringify(r.json?.errors));
+  const vas = r.json?.data?.Page?.media?.[0]?.characters?.edges?.[0]?.voiceActors || [];
+  eq(vas.length, 1, 'one VA');
+  eq(vas[0], { id: 111635, languageV2: 'Japanese', name: { full: 'Natsuki Hanae' }, image: { large: 'L' } }, 'projected + mapped: ' + JSON.stringify(vas[0]));
 });
 await test('studios derive nodes and honor isMain filter', async () => {
   const r = await api.post({ query: '{ Page(page:1, perPage:1) { media(id: 101922) { studios { edges { isMain node { id } } nodes { id } } main: studios(isMain: true) { edges { isMain } } } } }' });
