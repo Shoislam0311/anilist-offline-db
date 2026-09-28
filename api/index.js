@@ -575,7 +575,7 @@ function normMediaAiring(media, raw, args, edgesSub, nodeSub, pageSel, fragments
 
 function normRecs(media, raw, args, edgesSub, nodeSub, pageSel, fragments, vars) {
   let list = [...((raw && raw.edges) || [])];
-  const sort = args.sort || 'RATING_DESC';
+  const sort = Array.isArray(args.sort) ? args.sort[0] : (args.sort || 'RATING_DESC');
   if (sort === 'RATING') list.sort((a, b) => (a?.node?.rating || 0) - (b?.node?.rating || 0));
   else if (sort === 'ID') list.sort((a, b) => (a?.node?.id || 0) - (b?.node?.id || 0));
   else if (sort === 'ID_DESC') list.sort((a, b) => (b?.node?.id || 0) - (a?.node?.id || 0));
@@ -617,7 +617,8 @@ function normRecs(media, raw, args, edgesSub, nodeSub, pageSel, fragments, vars)
 function normCrew(kind, raw, args, edgesSub, nodeSub, pageSel, fragments, vars) {
   let list = [...((raw && raw.edges) || [])];
   if (kind === 'characters' && args.role) list = list.filter((e) => e?.role === args.role);
-  const sort = args.sort || '';
+  // sort can arrive as an array ([ROLE, RELEVANCE, ID]) — honor the primary.
+  const sort = Array.isArray(args.sort) ? args.sort[0] : (args.sort || '');
   if (sort.startsWith('FAVOURITES')) {
     const dir = sort === 'FAVOURITES' ? 1 : -1;
     list.sort((a, b) => dir * ((a?.node?.favourites || 0) - (b?.node?.favourites || 0)));
