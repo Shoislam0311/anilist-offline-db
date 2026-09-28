@@ -27,6 +27,7 @@ from db_utils import (
     upsert_staff, upsert_relations, upsert_recommendations, upsert_airing_schedule,
     upsert_external_links, upsert_streaming_episodes, upsert_statistics,
     upsert_rankings, upsert_trends, upsert_reviews, collect_schedule_nodes,
+    stamp_va_dub_languages, patch_raw_json,
     generate_changelog, export_json, get_database_stats, connect_db
 )
 
@@ -118,6 +119,16 @@ MEDIA_FIELDS = """
             age yearsActive homeTown bloodType
             isFavourite isFavouriteBlocked siteUrl favourites
           }
+          dub_JAPANESE: voiceActors(language: JAPANESE) { id }
+          dub_ENGLISH: voiceActors(language: ENGLISH) { id }
+          dub_KOREAN: voiceActors(language: KOREAN) { id }
+          dub_ITALIAN: voiceActors(language: ITALIAN) { id }
+          dub_SPANISH: voiceActors(language: SPANISH) { id }
+          dub_PORTUGUESE: voiceActors(language: PORTUGUESE) { id }
+          dub_FRENCH: voiceActors(language: FRENCH) { id }
+          dub_GERMAN: voiceActors(language: GERMAN) { id }
+          dub_HEBREW: voiceActors(language: HEBREW) { id }
+          dub_HUNGARIAN: voiceActors(language: HUNGARIAN) { id }
           media { id type }
         }
         pageInfo { total perPage currentPage lastPage hasNextPage }
@@ -502,6 +513,9 @@ class AniListFetcher:
         # pastAiring must already be attached to ship in shards.
         if self.fetch_middle_pages:
             self._backfill_middle_pages(media)
+        # Same ordering for per-role VA dub languages (languageV2 on the VA
+        # objects must predate the snapshot).
+        stamp_va_dub_languages(media)
 
         upsert_anime(conn, media)
         upsert_anime_titles(conn, media["id"], media.get("title", {}) or {})
@@ -571,6 +585,22 @@ class AniListFetcher:
             _airing_nodes = collect_schedule_nodes(media)
             if _airing_nodes:
                 upsert_airing_schedule(conn, aid, _airing_nodes)
+        except Exception:
+            pass
+
+        # Patch the served snapshot too: rails skips the full upsert, so
+        # without this raw_json (what shards + responses read) would keep
+        # yesterday's next episode / updatedAt until a sweep refetch.
+        try:
+            _patch = {}
+            if next_ep:
+                _patch["nextAiringEpisode"] = next_ep
+            if updated_at is not None:
+                _patch["updatedAt"] = updated_at
+            if isinstance(media.get("upcomingAiring"), dict) and media["upcomingAiring"].get("edges"):
+                _patch["upcomingAiring"] = media["upcomingAiring"]
+            patch_raw_json(conn, aid, _patch)
+            conn.commit()
         except Exception:
             pass
 

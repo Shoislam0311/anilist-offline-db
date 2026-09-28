@@ -838,6 +838,7 @@ def upsert_studios(conn: sqlite3.Connection, anime_id: int, studios_data: dict):
 
 def upsert_characters(conn: sqlite3.Connection, anime_id: int, characters_data: dict):
     import json as _json
+    _dub = va_dub_map(characters_data)
     for i, edge in enumerate((characters_data or {}).get("edges", [])):
         node = edge.get("node") or {}
         char_id = node.get("id")
@@ -890,6 +891,7 @@ def upsert_characters(conn: sqlite3.Connection, anime_id: int, characters_data: 
                 continue
             va_name = va.get("name") or {}
             va_img = va.get("image") or {}
+            dub_lang = _dub.get((char_id, va_id))
             conn.execute("""
                 INSERT INTO voice_actors (
                     id, name_first, name_middle, name_last, name_full, name_native,
@@ -916,7 +918,7 @@ def upsert_characters(conn: sqlite3.Connection, anime_id: int, characters_data: 
             conn.execute("""
                 INSERT OR IGNORE INTO character_voice_actors (character_id, voice_actor_id, anime_id, language)
                 VALUES (?, ?, ?, ?)
-            """, (char_id, va_id, anime_id, va.get("language") or "JAPANESE"))
+            """, (char_id, va_id, anime_id, dub_lang or va.get("language") or "JAPANESE"))
 
 
 def upsert_staff(conn: sqlite3.Connection, anime_id: int, staff_data: dict):
@@ -1041,6 +1043,80 @@ def collect_schedule_nodes(media: dict) -> list:
         _seen.add(_n.get("id"))
         _merged.append(_n)
     return _merged
+
+
+# StaffLanguage enum -> display form (StaffLanguageV2). Per-role dub language
+# on a character edge resolves to the display form (even for dubs like
+# Chinese that have no enum member) — captured via dub_* query aliases.
+DUB_LANGS = ("JAPANESE", "ENGLISH", "KOREAN", "ITALIAN", "SPANISH",
+             "PORTUGUESE", "FRENCH", "GERMAN", "HEBREW", "HUNGARIAN")
+
+
+def _dub_display(lang: str) -> Optional[str]:
+    if not lang:
+        return None
+    return lang[:1] + lang[1:].lower()
+
+
+def va_dub_map(characters_data: dict) -> dict:
+    """Map (character_id, va_id) -> dub StaffLanguage enum from dub_* aliases.
+
+    Each VA lands under exactly one language alias (its dub language for that
+    role); VAs under none dubbed in a language outside the enum (e.g. Chinese)
+    and keep the staff-primary fallback downstream.
+    """
+    out = {}
+    for edge in (characters_data or {}).get("edges", []):
+        node = edge.get("node") or {}
+        char_id = node.get("id")
+        if not char_id:
+            continue
+        for lang in DUB_LANGS:
+            for va in edge.get("dub_" + lang) or []:
+                va_id = (va or {}).get("id")
+                if va_id and (char_id, va_id) not in out:
+                    out[(char_id, va_id)] = lang
+    return out
+
+
+def stamp_va_dub_languages(media: dict) -> dict:
+    """Stamp per-role dub language onto VA objects as languageV2 (in place).
+
+    Must run BEFORE upsert_anime snapshots raw_json. Returns the dub map for
+    table upserts. VAs without a determinable dub keep no key and fall back
+    to the staff-primary mapping at serve time.
+    """
+    dub = va_dub_map(media.get("characters") or {})
+    if not dub:
+        return dub
+    for edge in (media.get("characters") or {}).get("edges", []):
+        node = edge.get("node") or {}
+        char_id = node.get("id")
+        for va in edge.get("voiceActors") or []:
+            if not isinstance(va, dict) or not va.get("id"):
+                continue
+            lang = dub.get((char_id, va["id"]))
+            if lang and not va.get("languageV2"):
+                va["languageV2"] = _dub_display(lang)
+    return dub
+
+
+def patch_raw_json(conn: sqlite3.Connection, anime_id: int, fields: dict):
+    """Merge top-level keys into stored raw_json (keeps served snapshot fresh
+    for lightweight updates that skip the full upsert)."""
+    import json as _json
+    if not fields:
+        return
+    try:
+        row = conn.execute("SELECT raw_json FROM anime WHERE id=?", (anime_id,)).fetchone()
+        if not row or not row[0]:
+            return
+        raw = _json.loads(row[0])
+        raw.update({k: v for k, v in fields.items() if v is not None})
+        conn.execute("UPDATE anime SET raw_json=? WHERE id=?",
+                     (_json.dumps(raw, ensure_ascii=False), anime_id))
+    except Exception:
+        pass
 
 
 def upsert_airing_schedule(conn: sqlite3.Connection, anime_id: int, schedule_data: list):

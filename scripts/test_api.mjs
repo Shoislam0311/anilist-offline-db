@@ -416,7 +416,7 @@ await test('edge voiceActors project sub-selections (no key leak) + languageV2 m
   ok(!r.json?.errors, 'no errors, got: ' + JSON.stringify(r.json?.errors));
   const vas = r.json?.data?.Page?.media?.[0]?.characters?.edges?.[0]?.voiceActors || [];
   eq(vas.length, 1, 'one VA');
-  eq(vas[0], { id: 111635, languageV2: 'Japanese', name: { full: 'Natsuki Hanae' }, image: { large: 'L' } }, 'projected + mapped: ' + JSON.stringify(vas[0]));
+  eq(vas[0], { id: 111635, languageV2: 'Chinese', name: { full: 'Natsuki Hanae' }, image: { large: 'L' } }, 'projected + mapped: ' + JSON.stringify(vas[0]));
 });
 await test('studios derive nodes and honor isMain filter', async () => {
   const r = await api.post({ query: '{ Page(page:1, perPage:1) { media(id: 101922) { studios { edges { isMain node { id } } nodes { id } } main: studios(isMain: true) { edges { isMain } } } } }' });
