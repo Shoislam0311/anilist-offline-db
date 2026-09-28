@@ -95,6 +95,39 @@ import tempfile
 fx = fa.AniListFetcher(tempfile.mkdtemp(prefix="sched_test_"))
 check("E flag-default-off", fx.fetch_middle_pages is False, "")
 
+# F: backfill runs BEFORE the raw_json snapshot, so pastAiring ships in
+# shards (regression: calling it after upsert_anime lost the rows)
+import json as _json
+from db_utils import init_db as _init_db
+
+
+class RawFetcher(fa.AniListFetcher):
+    def _request(self, query, variables, retries=0):
+        page = variables.get("page", 2)
+        if page > 3:
+            return {"data": {"Media": {"airingSchedule": {"edges": [], "pageInfo": {}}}}}
+        return {"data": {"Media": {"airingSchedule": {
+            "edges": [edge(node(500 + page * 10 + i, 60 + i)) for i in range(2)],
+            "pageInfo": {"total": 100, "hasNextPage": True}}}}}
+
+
+tmp = tempfile.mkdtemp(prefix="sched_raw_")
+rf = RawFetcher(tmp)
+rf.fetch_middle_pages = True
+conn = _init_db(rf.db_path)
+m = {"id": 777001, "type": "ANIME", "title": {"romaji": "T"},
+     "airingSchedule": {"edges": [edge(node(1, 1))],
+                        "pageInfo": {"total": 100, "hasNextPage": True}},
+     "upcomingAiring": {"edges": []}}
+rf._process_anime(conn, m)
+conn.commit()
+raw = _json.loads(conn.execute("SELECT raw_json FROM anime WHERE id=777001").fetchone()[0])
+past = (raw.get("pastAiring") or {}).get("edges") or []
+n_table = conn.execute("SELECT COUNT(*) FROM airing_schedule WHERE anime_id=777001").fetchone()[0]
+conn.close()
+check("F pastAiring-in-raw", len(past) == 4, "past=%d" % len(past))
+check("F table-merged", n_table == 5, "table_rows=%d" % n_table)
+
 failed = [r for r in results if not r[1]]
 for name, ok, detail in results:
     print(f"{'PASS' if ok else 'FAIL'}  {name}: {detail}")

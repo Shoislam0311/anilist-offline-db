@@ -498,6 +498,11 @@ class AniListFetcher:
 
         self.touched_full.add(aid)
 
+        # Backfill BEFORE upsert_anime: raw_json snapshots this dict, so
+        # pastAiring must already be attached to ship in shards.
+        if self.fetch_middle_pages:
+            self._backfill_middle_pages(media)
+
         upsert_anime(conn, media)
         upsert_anime_titles(conn, media["id"], media.get("title", {}) or {})
         upsert_anime_descriptions(conn, media["id"], media.get("description", ""), media.get("synonyms", []) or [])
@@ -529,11 +534,9 @@ class AniListFetcher:
         except Exception:
             pass
 
-        # Full schedule timeline: page-1 history + middle-history pages (long
-        # runners only — page 1 + upcoming leave episodes 26..N uncovered) +
-        # upcoming + next episode, merged + deduped into one timeline.
-        if self.fetch_middle_pages:
-            self._backfill_middle_pages(media)
+        # Full schedule timeline for the child tables: page-1 history +
+        # middle-history (attached earlier, before the raw_json snapshot) +
+        # upcoming + next episode, merged + deduped.
         merged = collect_schedule_nodes(media)
         if merged:
             upsert_airing_schedule(conn, media["id"], merged)
