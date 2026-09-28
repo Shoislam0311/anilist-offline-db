@@ -41,6 +41,7 @@ const fixtureServer = http.createServer((req, res) => {
   let file = null;
   if (url === '/metadata.json') file = join(FIXTURES, 'metadata.json');
   else if (url === '/search_index.json') file = join(ROOT, 'docs', 'api', 'search_index.json');
+  else if (url === '/schedule_index.json') file = join(FIXTURES, 'schedule_index.json');
   else if (url.startsWith('/shards/')) {
     const candidate = join(FIXTURES, basename(url));
     if (existsSync(candidate)) file = candidate;
@@ -431,8 +432,13 @@ await test('pastAiring middle rows merge into airingSchedule timeline', async ()
   eq(sch.edges[0].node, { id: 991, episode: 26 }, 'row content');
   eq(sch?.nodes?.length, 1, 'nodes derived');
 });
-await test('Page.pageInfo follows airingSchedules when media is absent', async () => {
-  const r = await api.post({ query: '{ Page(page:1, perPage:5) { airingSchedules { id } pageInfo { total perPage currentPage lastPage hasNextPage } } }' });
+await test('Page.airingSchedules serves window from schedule_index (no shard needed)', async () => {
+  const r = await api.post({ query: '{ Page(page:1, perPage:50) { airingSchedules(airingAt_greater: 1499999999, airingAt_lesser: 1500000001, sort: [TIME]) { id episode airingAt mediaId } } }' });
+  const rows = r.json?.data?.Page?.airingSchedules || [];
+  const ids = rows.map((x) => x.id).sort((a, b) => a - b);
+  eq(ids, [991, 555001], 'index rows served, incl. media absent from shards: ' + JSON.stringify(ids));
+});
+await test('Page.pageInfo follows airingSchedules when media is absent', async () => {  const r = await api.post({ query: '{ Page(page:1, perPage:5) { airingSchedules { id } pageInfo { total perPage currentPage lastPage hasNextPage } } }' });
   const pi = r.json?.data?.Page?.pageInfo;
   eq(pi.total, 5000, 'estimate total');
   eq(pi.perPage, 5, 'perPage');

@@ -312,7 +312,7 @@ jobs:
         # files for hours after a push. Purge so the new releaseTag/index
         # go live immediately (release shards are immutable per tag).
         run: |
-          for f in metadata.json search_index.json search_index.json.gz shard_manifest.json sample.json; do
+          for f in metadata.json search_index.json search_index.json.gz shard_manifest.json sample.json schedule_index.json; do
             code=$(curl -s -o /dev/null -w "%{http_code}" "https://purge.jsdelivr.net/gh/${{ github.repository }}@main/docs/api/$f")
             echo "purge $f -> $code"
           done

@@ -154,6 +154,28 @@ def generate_search_index(conn, output_dir: str):
     return len(index)
 
 
+def generate_schedule_index(conn, output_dir: str, recent_days: int = 45):
+    """Precomputed schedule rows for fast Page.airingSchedules (no shard scan).
+
+    Covers recent-past + all future rows (older windows fall back to the shard
+    scan). Compact array rows [id, episode, airingAt, mediaId], TIME-sorted.
+    Regenerated every run, so the serving cache stays day-fresh.
+    """
+    import time as _time
+    print("Generating schedule index...")
+    cutoff = int(_time.time()) - recent_days * 86400
+    cur = conn.execute(
+        """SELECT id, episode, airing_at, anime_id FROM airing_schedule
+           WHERE airing_at IS NOT NULL AND airing_at >= ?
+           ORDER BY airing_at, id""", (cutoff,))
+    rows = [[r[0], r[1], r[2], r[3]] for r in cur.fetchall()]
+    payload = {"generatedAt": _time.strftime("%Y-%m-%dT%H:%M:%S+00:00", _time.gmtime()),
+               "cutoff": cutoff, "rows": rows}
+    with open(os.path.join(output_dir, "schedule_index.json"), "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    print(f"Schedule index: {len(rows)} rows (cutoff {recent_days}d)")
+
+
 def generate_metadata(conn, output_dir: str):
     print("Generating metadata...")
     stats = {}
@@ -290,6 +312,7 @@ def main():
             pass
         generate_anime_shards(conn, api_dir)
         generate_search_index(conn, api_dir)
+        generate_schedule_index(conn, api_dir)
         generate_metadata(conn, api_dir)
         generate_sample_data(conn, api_dir)
         generate_shard_manifest(api_dir)

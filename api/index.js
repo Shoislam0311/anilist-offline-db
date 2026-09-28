@@ -177,6 +177,20 @@ async function getSearchIndex() {
     throw e;
   }
 }
+let schedEntry = null, schedFailAt = 0;
+async function getScheduleIndex() {
+  if (fresh(schedEntry)) return schedEntry.data;
+  if (Date.now() - schedFailAt < FAIL_BACKOFF_MS && schedEntry) return schedEntry.data;
+  try {
+    const data = await fetchJSON(`${DATA_BASE}/schedule_index.json`);
+    schedEntry = { data, time: Date.now() };
+    return data;
+  } catch (e) {
+    schedFailAt = Date.now();
+    if (schedEntry) return schedEntry.data;
+    throw e;
+  }
+}
 async function getShardStartIds() {
   const meta = await getMetadata().catch(() => null);
   if (meta?.shardStartIds?.length) return meta.shardStartIds;
@@ -2142,6 +2156,34 @@ async function resolvePageAiringSchedules(fieldNode, fragments, variables, page,
   const args = collectArgs(fieldNode, variables || {});
   const sels = collectSelections(fieldNode, fragments);
   const now = Math.floor(Date.now() / 1000);
+  const inList = (v, arr) => Array.isArray(arr) && arr.includes(v);
+  const all = new Map();
+  const push = (n, mediaId) => {
+    if (!n || n.id == null || all.has(n.id)) return;
+    all.set(n.id, {
+      __typename: 'AiringSchedule', id: n.id, episode: n.episode ?? null,
+      airingAt: n.airingAt ?? null,
+      timeUntilAiring: n.airingAt != null ? Math.max(0, n.airingAt - now) : 0,
+      mediaId: n.mediaId ?? mediaId,
+    });
+  };
+  // Fast path: precomputed schedule_index.json covers [cutoff, +inf) with
+  // zero shard I/O (cold window queries went 15s+ scanning shards).
+  const schedIdx = await getScheduleIndex().catch(() => null);
+  const rows = schedIdx?.rows;
+  const cutoff = schedIdx?.cutoff;
+  const g = args.airingAt_greater, eq = args.airingAt, arr = args.airingAt_in;
+  const indexCovers = Array.isArray(rows) && cutoff != null
+    && args.airingAt_not == null && !args.airingAt_not_in
+    && (eq == null || eq >= cutoff) && (g == null || g >= cutoff)
+    && (!arr || !arr.some((v) => v < cutoff))
+    && (g != null || eq != null || arr || args.notYetAired);
+  if (indexCovers) {
+    for (const r of rows) {
+      if (all.has(r[0])) continue;
+      push({ id: r[0], episode: r[1], airingAt: r[2], mediaId: r[3] });
+    }
+  } else {
   const index = await getSearchIndex();
   // Premieres drift: a title airing this week is often still
   // NOT_YET_RELEASED in the snapshot (status lags by hours/days), so the
@@ -2153,7 +2195,6 @@ async function resolvePageAiringSchedules(fieldNode, fragments, variables, page,
     if (e.status === 'NOT_YET_RELEASED' && (lesser == null || (e.startDate || 99999999) <= lesser)) return true;
     return false;
   }).map((e) => e.id);
-  const inList = (v, arr) => Array.isArray(arr) && arr.includes(v);
   if (args.mediaId != null) ids = ids.filter((id) => id === args.mediaId);
   if (args.mediaId_in) ids = ids.filter((id) => inList(id, args.mediaId_in));
   if (args.mediaId_not != null) ids = ids.filter((id) => id !== args.mediaId_not);
@@ -2171,21 +2212,12 @@ async function resolvePageAiringSchedules(fieldNode, fragments, variables, page,
     const shard = await getShard(si).catch(() => []);
     for (const a of shard) if (arr.includes(a.id)) found.set(a.id, a);
   }));
-  const all = new Map();
   for (const a of found.values()) {
-    const push = (n) => {
-      if (!n || n.id == null || all.has(n.id)) return;
-      all.set(n.id, {
-        __typename: 'AiringSchedule', id: n.id, episode: n.episode ?? null,
-        airingAt: n.airingAt ?? null,
-        timeUntilAiring: n.airingAt != null ? Math.max(0, n.airingAt - now) : 0,
-        mediaId: a.id,
-      });
-    };
-    for (const e of a.airingSchedule?.edges || []) push(e?.node);
-    for (const e of a.pastAiring?.edges || []) push(e?.node);
-    for (const e of a.upcomingAiring?.edges || []) push(e?.node);
-    push(a.nextAiringEpisode);
+    for (const e of a.airingSchedule?.edges || []) push(e?.node, a.id);
+    for (const e of a.pastAiring?.edges || []) push(e?.node, a.id);
+    for (const e of a.upcomingAiring?.edges || []) push(e?.node, a.id);
+    push(a.nextAiringEpisode, a.id);
+  }
   }
   let list = [...all.values()];
   const numFilter = (get, base, not, arrIn, arrNot, greater, lesser) => {
