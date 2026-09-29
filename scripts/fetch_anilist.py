@@ -119,16 +119,6 @@ MEDIA_FIELDS = """
             age yearsActive homeTown bloodType
             isFavourite isFavouriteBlocked siteUrl favourites
           }
-          dub_JAPANESE: voiceActors(language: JAPANESE) { id }
-          dub_ENGLISH: voiceActors(language: ENGLISH) { id }
-          dub_KOREAN: voiceActors(language: KOREAN) { id }
-          dub_ITALIAN: voiceActors(language: ITALIAN) { id }
-          dub_SPANISH: voiceActors(language: SPANISH) { id }
-          dub_PORTUGUESE: voiceActors(language: PORTUGUESE) { id }
-          dub_FRENCH: voiceActors(language: FRENCH) { id }
-          dub_GERMAN: voiceActors(language: GERMAN) { id }
-          dub_HEBREW: voiceActors(language: HEBREW) { id }
-          dub_HUNGARIAN: voiceActors(language: HUNGARIAN) { id }
           media { id type }
         }
         pageInfo { total perPage currentPage lastPage hasNextPage }
@@ -278,6 +268,32 @@ query ($ids: [Int]) {
   }
 }
 """ % MEDIA_FIELDS
+
+# Per-role VA dub languages MUST live in a separate query: combining filtered
+# voiceActors(language:) aliases with the unfiltered list on one edge makes
+# AniList truncate/empty the results (verified live). Aliases alone work.
+DUB_QUERY = """
+query ($id: Int) {
+  Media(id: $id, type: ANIME) {
+    id
+    characters(sort: [ROLE], page: 1, perPage: 25) {
+      edges {
+        node { id }
+        dub_JAPANESE: voiceActors(language: JAPANESE) { id }
+        dub_ENGLISH: voiceActors(language: ENGLISH) { id }
+        dub_KOREAN: voiceActors(language: KOREAN) { id }
+        dub_ITALIAN: voiceActors(language: ITALIAN) { id }
+        dub_SPANISH: voiceActors(language: SPANISH) { id }
+        dub_PORTUGUESE: voiceActors(language: PORTUGUESE) { id }
+        dub_FRENCH: voiceActors(language: FRENCH) { id }
+        dub_GERMAN: voiceActors(language: GERMAN) { id }
+        dub_HEBREW: voiceActors(language: HEBREW) { id }
+        dub_HUNGARIAN: voiceActors(language: HUNGARIAN) { id }
+      }
+    }
+  }
+}
+"""
 
 # Middle-history schedule pages for long-runners: Media.airingSchedule has
 # no sort/filter args, so pages 2..N are the only way to reach episodes
@@ -498,6 +514,40 @@ class AniListFetcher:
         if got:
             media.setdefault("pastAiring", {}).setdefault("edges", []).extend(got)
 
+    def _fetch_va_dubs(self, media: dict):
+        """Attach per-role dub alias lists onto character edges (full runs only).
+
+        Skips titles without voice actors (nothing to map). Failures are
+        non-blocking: those VAs keep the staff-primary fallback.
+        """
+        aid = media.get("id")
+        edges = ((media.get("characters") or {}).get("edges")) or []
+        if not aid or not edges:
+            return
+        if not any(e.get("voiceActors") for e in edges):
+            return
+        try:
+            data = self._request(DUB_QUERY, {"id": aid})
+            dub_edges = (((data or {}).get("data") or {}).get("Media") or {}).get("characters", {}).get("edges") or []
+        except Exception as e:
+            logger.warning(f"VA dub map for {aid} failed: {str(e)[:100]}")
+            return
+        by_char = {}
+        for e in edges:
+            cid = (e.get("node") or {}).get("id")
+            if cid:
+                by_char[cid] = e
+        for de in dub_edges:
+            cid = (de.get("node") or {}).get("id")
+            target = by_char.get(cid)
+            if not target:
+                continue
+            for lang in ("JAPANESE", "ENGLISH", "KOREAN", "ITALIAN", "SPANISH",
+                         "PORTUGUESE", "FRENCH", "GERMAN", "HEBREW", "HUNGARIAN"):
+                vals = de.get("dub_" + lang)
+                if vals:
+                    target["dub_" + lang] = vals
+
     def _process_anime(self, conn, media: dict):
         """Full process for brand-new titles only."""
         if media.get("type") and media.get("type") != "ANIME":
@@ -514,7 +564,10 @@ class AniListFetcher:
         if self.fetch_middle_pages:
             self._backfill_middle_pages(media)
         # Same ordering for per-role VA dub languages (languageV2 on the VA
-        # objects must predate the snapshot).
+        # objects must predate the snapshot). Dub map comes from a separate
+        # query (aliases corrupt the main fetch — see DUB_QUERY).
+        if self.fetch_middle_pages:
+            self._fetch_va_dubs(media)
         stamp_va_dub_languages(media)
 
         upsert_anime(conn, media)
