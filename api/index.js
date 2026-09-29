@@ -556,10 +556,15 @@ function liveAiring(n, now) {
 
 function normMediaAiring(media, raw, args, edgesSub, nodeSub, pageSel, fragments, vars) {
   const now = Math.floor(Date.now() / 1000);
+  // Official AiringSchedule.media: attach the parent when selected.
+  const wantNodeMedia = nodeSub.some((s) => s.kind === Kind.FIELD && s.name.value === 'media');
+  const mediaRef = wantNodeMedia ? (media.__typename ? media : { ...media, __typename: 'Media' }) : null;
   const byId = new Map();
   const push = (n) => {
     if (!n || n.id == null || byId.has(n.id)) return;
-    byId.set(n.id, liveAiring({ ...n, mediaId: n.mediaId ?? media.id }, now));
+    const obj = liveAiring({ ...n, mediaId: n.mediaId ?? media.id }, now);
+    if (mediaRef) obj.media = mediaRef;
+    byId.set(n.id, obj);
   };
   for (const e of (raw?.edges || [])) push(e?.node);
   for (const e of (media.pastAiring?.edges || [])) push(e?.node);
@@ -2182,7 +2187,11 @@ async function resolvePageAiringSchedules(fieldNode, fragments, variables, page,
   const sels = collectSelections(fieldNode, fragments);
   const now = Math.floor(Date.now() / 1000);
   const inList = (v, arr) => Array.isArray(arr) && arr.includes(v);
+  // Official AiringSchedule.media: attach the parent Media object when the
+  // client selects it (Miruro schedule rows render title/cover from it).
+  const wantMedia = sels.some((s) => s.kind === Kind.FIELD && s.name.value === 'media');
   const all = new Map();
+  let foundMedia = null;
   const push = (n, mediaId) => {
     if (!n || n.id == null || all.has(n.id)) return;
     all.set(n.id, {
@@ -2209,8 +2218,7 @@ async function resolvePageAiringSchedules(fieldNode, fragments, variables, page,
       push({ id: r[0], episode: r[1], airingAt: r[2], mediaId: r[3] });
     }
   } else {
-  const index = await getSearchIndex();
-  // Premieres drift: a title airing this week is often still
+  const index = await getSearchIndex();  // Premieres drift: a title airing this week is often still
   // NOT_YET_RELEASED in the snapshot (status lags by hours/days), so the
   // scan covers those too — pruned by startDate against the window end so
   // far-future announcements never cost shard loads.
@@ -2243,6 +2251,7 @@ async function resolvePageAiringSchedules(fieldNode, fragments, variables, page,
     for (const e of a.upcomingAiring?.edges || []) push(e?.node, a.id);
     push(a.nextAiringEpisode, a.id);
   }
+  foundMedia = found;
   }
   let list = [...all.values()];
   const numFilter = (get, base, not, arrIn, arrNot, greater, lesser) => {
@@ -2276,7 +2285,22 @@ async function resolvePageAiringSchedules(fieldNode, fragments, variables, page,
   list.sort(cmp);
   const total = all.size ? 5000 : 0;
   const sliced = list.slice((page - 1) * perPage, page * perPage);
-  return sliced.map((n) => pick(n, sels, fragments, variables || {}));
+  // Attach parent media only when selected (extra shard loads otherwise).
+  let mediaById = null;
+  if (wantMedia) {
+    const needIds = [...new Set(sliced.map((n) => n.mediaId).filter((id) => id != null))];
+    if (indexCovers) {
+      const got = await getAnimeBatch(needIds).catch(() => []);
+      mediaById = new Map(got.map((a) => [a.id, a.__typename ? a : { ...a, __typename: 'Media' }]));
+    } else {
+      mediaById = new Map();
+      for (const a of (foundMedia || new Map()).values()) mediaById.set(a.id, a.__typename ? a : { ...a, __typename: 'Media' });
+    }
+  }
+  return sliced.map((n) => {
+    if (wantMedia && mediaById?.has(n.mediaId)) n.media = mediaById.get(n.mediaId);
+    return pick(n, sels, fragments, variables || {});
+  });
 }
 
 async function pageOut(fieldNode, fragments, paged, total, page, perPage, variables) {
@@ -2596,18 +2620,24 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
           throw tursoUnavailable('Turso not ready (bootstrap flag missing) and TURSO_REQUIRED=1');
         }
         if (args.id || args.mediaId) {
+          const wantMedia = sels.some((s) => s.kind === Kind.FIELD && s.name.value === 'media');
           const shardStartIds = await getShardStartIds();
           for (let i = 0; i < Math.min(shardStartIds.length, 8); i++) {
             const shard = await getShard(i).catch(() => []);
             for (const a of shard) {
               if (args.mediaId && a.id !== args.mediaId) continue;
-              const edges = a.airingSchedule?.edges || [];
+              const edges = [...(a.airingSchedule?.edges || []), ...(a.pastAiring?.edges || []), ...(a.upcomingAiring?.edges || [])];
               const hit = args.id
                 ? edges.find((e) => e.node?.id === args.id)?.node
                 : edges[0]?.node;
-              if (hit) { const o = { __typename: 'AiringSchedule', ...hit }; entitySet('airing', args, o); return pick(o, sels, fragments, variables); }
+              if (hit) {
+                const o = { __typename: 'AiringSchedule', ...hit };
+                if (wantMedia) o.media = a.__typename ? a : { ...a, __typename: 'Media' };
+                entitySet('airing', args, o); return pick(o, sels, fragments, variables);
+              }
               if (args.mediaId && a.nextAiringEpisode) {
                 const o = { __typename: 'AiringSchedule', ...a.nextAiringEpisode };
+                if (wantMedia) o.media = a.__typename ? a : { ...a, __typename: 'Media' };
                 entitySet('airing', args, o);
                 return pick(o, sels, fragments, variables);
               }

@@ -445,6 +445,23 @@ await test('pastAiring middle rows merge into airingSchedule timeline', async ()
   eq(sch.edges[0].node, { id: 991, episode: 26 }, 'row content');
   eq(sch?.nodes?.length, 1, 'nodes derived');
 });
+await test('Page.airingSchedules resolves media sub-selection', async () => {
+  const r = await api.post({ query: '{ Page(page:1, perPage:50) { airingSchedules(airingAt_greater: 1499999999, airingAt_lesser: 1500000001, sort: [TIME]) { id mediaId media { id title { romaji } } } } }' });
+  ok(!r.json?.errors, 'no errors, got: ' + JSON.stringify(r.json?.errors));
+  const rows = r.json?.data?.Page?.airingSchedules || [];
+  const known = rows.find((x) => x.mediaId === 1);
+  eq(known?.media?.id, 1, 'parent media attached');
+  ok(known?.media?.title?.romaji, 'title hydrated: ' + JSON.stringify(known?.media?.title));
+  const ghost = rows.find((x) => x.mediaId === 999999);
+  eq(ghost?.media, null, 'missing media stays null, not crash');
+});
+await test('Media.airingSchedule nodes carry parent media', async () => {
+  const r = await api.post({ query: '{ Page(page:1, perPage:1) { media(id: 101922) { id airingSchedule { nodes { id media { id title { romaji } } } } } } }' });
+  ok(!r.json?.errors, 'no errors');
+  const nodes = r.json?.data?.Page?.media?.[0]?.airingSchedule?.nodes || [];
+  ok(nodes.length > 0, 'nodes present');
+  ok(nodes.every((n) => n.media && n.media.id === 101922 && n.media.title?.romaji), 'parent attached on all nodes');
+});
 await test('Page.airingSchedules serves window from schedule_index (no shard needed)', async () => {
   const r = await api.post({ query: '{ Page(page:1, perPage:50) { airingSchedules(airingAt_greater: 1499999999, airingAt_lesser: 1500000001, sort: [TIME]) { id episode airingAt mediaId } } }' });
   const rows = r.json?.data?.Page?.airingSchedules || [];
