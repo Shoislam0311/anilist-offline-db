@@ -378,6 +378,51 @@ function collectSelections(node, fragments, seen = null) {
   }
   return out;
 }
+/* Effective status: fix premiere-flip lag between daily fetches.
+ * A title premiering after the morning fetch sits NOT_YET_RELEASED all day
+ * on the snapshot while episodes air. Derive from snapshot signals:
+ *   - certain: next episode > 1 (ep1 aired), or any schedule row aired
+ *   - heuristic: full-precision startDate passed (delays are rare and heal
+ *     on next fetch; year/month-only dates never trigger this leg)
+ * Premiered single-episode titles resolve FINISHED (official agrees).
+ * Everything else passes through untouched. */
+function fuzzyToday() {
+  const d = new Date();
+  return d.getUTCFullYear() * 10000 + (d.getUTCMonth() + 1) * 100 + d.getUTCDate();
+}
+function startDatePassed(sd) {
+  if (sd == null) return false;
+  let y, m, day;
+  if (typeof sd === 'object') { y = sd.year; m = sd.month; day = sd.day; }
+  else if (typeof sd === 'number') { y = Math.floor(sd / 10000); m = Math.floor(sd / 100) % 100; day = sd % 100; }
+  else return false;
+  if (!y || !m || !day) return false; // full precision only
+  return y * 10000 + m * 100 + day <= fuzzyToday();
+}
+function effectiveStatus(media, nowSec = Math.floor(Date.now() / 1000)) {
+  const st = media?.status;
+  if (st !== 'NOT_YET_RELEASED') return st ?? null;
+  const nextEp = media?.nextAiringEpisode?.episode;
+  if (typeof nextEp === 'number' && nextEp > 1) {
+    return media?.episodes === 1 ? 'FINISHED' : 'RELEASING';
+  }
+  const rows = [
+    ...((media?.airingSchedule?.edges) || []),
+    ...((media?.pastAiring?.edges) || []),
+    ...((media?.upcomingAiring?.edges) || []),
+  ];
+  for (const e of rows) {
+    const at = e?.node?.airingAt;
+    if (at != null && at <= nowSec) {
+      return media?.episodes === 1 ? 'FINISHED' : 'RELEASING';
+    }
+  }
+  if (startDatePassed(media?.startDate)) {
+    return media?.episodes === 1 ? 'FINISHED' : 'RELEASING';
+  }
+  return st;
+}
+
 function pick(obj, sels, fragments, variables) {
   if (obj == null) return obj;
   if (!sels || !sels.length) return obj;
@@ -394,17 +439,24 @@ function pick(obj, sels, fragments, variables) {
       out[key] = pickMediaConn(obj, s, sub, fragments, vars);
       continue;
     }
-    // nextAiringEpisode.timeUntilAiring is live (airingAt - now), never stale.
+    // nextAiringEpisode is live: stale snapshot rows advance past aired
+    // episodes (or null when nothing future is known) — never a past ep.
     if (obj.__typename === 'Media' && s.name.value === 'nextAiringEpisode'
         && obj.nextAiringEpisode && typeof obj.nextAiringEpisode === 'object') {
-      const na = obj.nextAiringEpisode;
-      const live = { ...na, __typename: na.__typename || 'AiringSchedule' };
-      if (live.airingAt != null) live.timeUntilAiring = Math.max(0, live.airingAt - Math.floor(Date.now() / 1000));
+      const nowSec = Math.floor(Date.now() / 1000);
+      const live = nextAiringLive(obj, nowSec);
+      if (!live) { out[key] = null; continue; }
       if (!sub?.length) { out[key] = live; continue; }
       out[key] = pick(live, sub, fragments, vars);
       continue;
     }
     if (!sub || !sub.length) {
+      // Premiere-flip lag fix (see effectiveStatus): snapshot status goes
+      // stale intraday; derive from airing signals when present.
+      if (obj.__typename === 'Media' && s.name.value === 'status') {
+        out[key] = effectiveStatus(obj, Math.floor(Date.now() / 1000));
+        continue;
+      }
       // StaffLanguageV2 is the display form of StaffLanguage (JAPANESE ->
       // Japanese); synthesize when the snapshot predates the split field.
       if (s.name.value === 'languageV2' && obj.languageV2 == null && typeof obj.language === 'string' && obj.language) {
@@ -552,6 +604,26 @@ function liveAiring(n, now) {
   const o = { __typename: 'AiringSchedule', ...n };
   if (o.airingAt != null) o.timeUntilAiring = Math.max(0, o.airingAt - now);
   return o;
+}
+
+// Advance a stale nextAiringEpisode past aired rows (same premiere-lag
+// family as effectiveStatus): the next not-yet-aired row in the merged
+// timeline, or null when nothing future is known (official agrees).
+function nextAiringLive(media, nowSec) {
+  const na = media?.nextAiringEpisode;
+  if (!na || typeof na !== 'object') return null;
+  if (na.airingAt != null && na.airingAt > nowSec) return liveAiring(na, nowSec);
+  const rows = [];
+  for (const key of ['airingSchedule', 'pastAiring', 'upcomingAiring']) {
+    for (const e of ((media?.[key]?.edges) || [])) {
+      const n = e?.node;
+      if (n && n.id != null && n.airingAt != null) rows.push(n);
+    }
+  }
+  rows.sort((a, b) => a.airingAt - b.airingAt);
+  const nxt = rows.find((n) => n.airingAt > nowSec);
+  if (!nxt) return null;
+  return liveAiring({ ...nxt, mediaId: nxt.mediaId ?? media.id }, nowSec);
 }
 
 function normMediaAiring(media, raw, args, edgesSub, nodeSub, pageSel, fragments, vars) {
@@ -2636,7 +2708,8 @@ async function resolveNode(typeName, fieldNode, fragments, variables) {
                 entitySet('airing', args, o); return pick(o, sels, fragments, variables);
               }
               if (args.mediaId && a.nextAiringEpisode) {
-                const o = { __typename: 'AiringSchedule', ...a.nextAiringEpisode };
+                const live = nextAiringLive(a, Math.floor(Date.now() / 1000)) || { __typename: 'AiringSchedule', ...a.nextAiringEpisode };
+                const o = { __typename: 'AiringSchedule', ...live };
                 if (wantMedia) o.media = a.__typename ? a : { ...a, __typename: 'Media' };
                 entitySet('airing', args, o);
                 return pick(o, sels, fragments, variables);
@@ -2947,4 +3020,4 @@ export default async function handler(req, res) {
 }
 
 /* Test-only surface (scripts/test_api.mjs) — not part of the public API. */
-export const __test = { tursoWhere, matchMedia, indexToMedia, canServeFromIndex, sortIndexRows, searchScore };
+export const __test = { tursoWhere, matchMedia, indexToMedia, canServeFromIndex, sortIndexRows, searchScore, effectiveStatus, nextAiringLive };

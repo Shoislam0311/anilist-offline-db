@@ -350,8 +350,7 @@ await test('cards still served when DATA_BASE_URL is dead (bundled snapshot fall
     ok(!r.json.errors, 'no errors');
   } finally { await dead.close(); }
 });
-await test('tursoWhere(tag_not_in) builds a valid, count-matched statement', async () => {
-  const mod = await import('../api/index.js?where=1');
+await test('tursoWhere(tag_not_in) builds a valid, count-matched statement', async () => {  const mod = await import('../api/index.js?where=1');
   ok(typeof mod.__test?.tursoWhere === 'function', 'handler must export __test.tursoWhere for testing');
   const { where, args } = mod.__test.tursoWhere({ tag_not_in: ['Action', 'Hentai'] });
   const clause = where.join(' ');
@@ -474,6 +473,55 @@ await test('Page.pageInfo follows airingSchedules when media is absent', async (
   eq(pi.perPage, 5, 'perPage');
   eq(pi.lastPage, 1000, 'lastPage');
   eq(pi.hasNextPage, true, 'hasNextPage');
+});
+
+await test('effectiveStatus fixes premiere-flip lag (NYR -> RELEASING/FINISHED)', async () => {
+  const mod = await import('../api/index.js?status=1');
+  const es = mod.__test?.effectiveStatus;
+  ok(typeof es === 'function', 'handler must export __test.effectiveStatus');
+  const now = Math.floor(Date.now() / 1000);
+  const past = { year: 2020, month: 1, day: 1 };
+  const today = new Date();
+  const todayObj = { year: today.getUTCFullYear(), month: today.getUTCMonth() + 1, day: today.getUTCDate() };
+  // Certain: next episode > 1 means ep1 aired.
+  eq(es({ status: 'NOT_YET_RELEASED', nextAiringEpisode: { episode: 5 } }), 'RELEASING', 'nextEp>1');
+  // Certain: any aired schedule row.
+  eq(es({ status: 'NOT_YET_RELEASED', airingSchedule: { edges: [{ node: { airingAt: now - 3600 } }] } }), 'RELEASING', 'aired row');
+  // User case: premiere today, snapshot still holds next=ep1 future row.
+  eq(es({ status: 'NOT_YET_RELEASED', startDate: todayObj, nextAiringEpisode: { episode: 1, airingAt: now + 3600 } }), 'RELEASING', 'premiere-day startDate');
+  // Single-episode movie that aired resolves FINISHED (official agrees).
+  eq(es({ status: 'NOT_YET_RELEASED', episodes: 1, airingSchedule: { edges: [{ node: { airingAt: now - 3600 } }] } }), 'FINISHED', 'aired movie');
+  eq(es({ status: 'NOT_YET_RELEASED', episodes: 1, startDate: todayObj }), 'FINISHED', 'movie premiere day');
+  // Guards: year-only dates never flip; future premieres stay; others pass through.
+  eq(es({ status: 'NOT_YET_RELEASED', startDate: { year: 2026, month: null, day: null } }), 'NOT_YET_RELEASED', 'year-only stays');
+  eq(es({ status: 'NOT_YET_RELEASED', startDate: 99991231 }), 'NOT_YET_RELEASED', 'future stays');
+  eq(es({ status: 'NOT_YET_RELEASED', startDate: past, nextAiringEpisode: { episode: 1, airingAt: now + 86400 } }), 'RELEASING', 'past startDate flips');
+  eq(es({ status: 'FINISHED' }), 'FINISHED', 'passthrough');
+  eq(es({ status: 'RELEASING' }), 'RELEASING', 'passthrough');
+  eq(es({}), null, 'missing status -> null');
+});
+await test('nextAiringLive advances past aired rows (195516 case)', async () => {
+  const mod = await import('../api/index.js?nextair=1');
+  const nal = mod.__test?.nextAiringLive;
+  ok(typeof nal === 'function', 'handler must export __test.nextAiringLive');
+  const now = Math.floor(Date.now() / 1000);
+  const media = {
+    id: 195516,
+    nextAiringEpisode: { id: 1, episode: 1, airingAt: now - 7200, mediaId: 195516 },
+    airingSchedule: { edges: [
+      { node: { id: 1, episode: 1, airingAt: now - 7200, mediaId: 195516 } },
+      { node: { id: 2, episode: 2, airingAt: now + 86400, mediaId: 195516 } },
+    ] },
+  };
+  const live = nal(media, now);
+  eq(live && { episode: live.episode, airingAt: live.airingAt }, { episode: 2, airingAt: now + 86400 }, 'advanced to ep2');
+  // Fresh (unaired) next passes through with live countdown.
+  const fresh = nal({ nextAiringEpisode: { id: 9, episode: 3, airingAt: now + 100 } }, now);
+  eq(fresh && fresh.episode, 3, 'fresh passthrough');
+  ok(fresh.timeUntilAiring >= 0 && fresh.timeUntilAiring <= 100, 'live countdown');
+  // Nothing future known -> null, never a past episode.
+  eq(nal({ nextAiringEpisode: { id: 1, episode: 1, airingAt: now - 7200 } }, now), null, 'no-future -> null');
+  eq(nal({}, now), null, 'missing -> null');
 });
 
 /* ================================ summary ================================= */
