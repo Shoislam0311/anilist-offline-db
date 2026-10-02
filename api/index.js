@@ -401,26 +401,34 @@ function startDatePassed(sd) {
 }
 function effectiveStatus(media, nowSec = Math.floor(Date.now() / 1000)) {
   const st = media?.status;
-  if (st !== 'NOT_YET_RELEASED') return st ?? null;
-  const nextEp = media?.nextAiringEpisode?.episode;
-  if (typeof nextEp === 'number' && nextEp > 1) {
-    return media?.episodes === 1 ? 'FINISHED' : 'RELEASING';
-  }
-  const rows = [
-    ...((media?.airingSchedule?.edges) || []),
-    ...((media?.pastAiring?.edges) || []),
-    ...((media?.upcomingAiring?.edges) || []),
-  ];
-  for (const e of rows) {
-    const at = e?.node?.airingAt;
-    if (at != null && at <= nowSec) {
+  if (st === 'NOT_YET_RELEASED') {
+    const nextEp = media?.nextAiringEpisode?.episode;
+    if (typeof nextEp === 'number' && nextEp > 1) {
       return media?.episodes === 1 ? 'FINISHED' : 'RELEASING';
     }
+    const rows = [
+      ...((media?.airingSchedule?.edges) || []),
+      ...((media?.pastAiring?.edges) || []),
+      ...((media?.upcomingAiring?.edges) || []),
+    ];
+    for (const e of rows) {
+      const at = e?.node?.airingAt;
+      if (at != null && at <= nowSec) {
+        return media?.episodes === 1 ? 'FINISHED' : 'RELEASING';
+      }
+    }
+    if (startDatePassed(media?.startDate)) {
+      return media?.episodes === 1 ? 'FINISHED' : 'RELEASING';
+    }
+    return st;
   }
-  if (startDatePassed(media?.startDate)) {
-    return media?.episodes === 1 ? 'FINISHED' : 'RELEASING';
-  }
-  return st;
+  // NOTE: no RELEASING -> FINISHED derivation on purpose. Official itself
+  // leaves ended titles RELEASING for months/years (verified live: 168947
+  // ended 2024-06, 168177 ended 2026-06, both still RELEASING) — deriving
+  // FINISHED would trade a rare lag for permanent mismatch. The premiere
+  // direction is safe instead: official flips those within hours (zero
+  // snapshot-NYR titles sit >30d past their full-precision startDate).
+  return st ?? null;
 }
 
 function pick(obj, sels, fragments, variables) {
