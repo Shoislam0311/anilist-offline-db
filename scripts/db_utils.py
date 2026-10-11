@@ -1017,6 +1017,31 @@ def upsert_recommendations(conn: sqlite3.Connection, anime_id: int, recommendati
                 pass
 
 
+def carry_forward_pastAiring(conn: sqlite3.Connection, anime_id: int, media: dict):
+    """Preserve stored middle-history rows across reprocesses.
+
+    pastAiring is attached programmatically (full runs only); daily payloads
+    lack the key, so snapshotting them would erase the middle timeline.
+    Merges stored edges in (deduped by row id, fresh wins) when the payload
+    carries none. No-op for brand-new titles.
+    """
+    try:
+        fresh = ((media or {}).get("pastAiring") or {}).get("edges") or []
+        if fresh:
+            return
+        row = conn.execute("SELECT raw_json FROM anime WHERE id=?", (anime_id,)).fetchone()
+        if not row or not row[0]:
+            return
+        import json as _json
+        stored = (_json.loads(row[0]).get("pastAiring") or {}).get("edges") or []
+        stored = [e for e in stored if isinstance(e, dict) and (e.get("node") or {}).get("id")]
+        if not stored:
+            return
+        media.setdefault("pastAiring", {})["edges"] = stored
+    except Exception:
+        pass
+
+
 def collect_schedule_nodes(media: dict) -> list:
     """Merge every schedule source on a media payload into one deduped node list.
 

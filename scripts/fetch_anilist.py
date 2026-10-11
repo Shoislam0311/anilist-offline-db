@@ -27,7 +27,7 @@ from db_utils import (
     upsert_staff, upsert_relations, upsert_recommendations, upsert_airing_schedule,
     upsert_external_links, upsert_streaming_episodes, upsert_statistics,
     upsert_rankings, upsert_trends, upsert_reviews, collect_schedule_nodes,
-    stamp_va_dub_languages, patch_raw_json,
+    stamp_va_dub_languages, patch_raw_json, carry_forward_pastAiring,
     generate_changelog, export_json, get_database_stats, connect_db
 )
 
@@ -508,6 +508,10 @@ class AniListFetcher:
         # pastAiring must already be attached to ship in shards.
         if self.fetch_middle_pages:
             self._backfill_middle_pages(media)
+        # Carry forward stored pastAiring when this payload has none: daily
+        # reprocesses refetch MEDIA_FIELDS (no pastAiring key) and would
+        # otherwise wipe the middle timeline from raw_json AND the table.
+        carry_forward_pastAiring(conn, aid, media)
         # Same ordering for per-role VA dub languages (languageV2 on the VA
         # objects must predate the snapshot; alias-sourced when present).
         stamp_va_dub_languages(media)

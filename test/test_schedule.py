@@ -128,6 +128,23 @@ conn.close()
 check("F pastAiring-in-raw", len(past) == 4, "past=%d" % len(past))
 check("F table-merged", n_table == 5, "table_rows=%d" % n_table)
 
+# G: daily reprocess without pastAiring preserves stored middle timeline
+# (regression: sweep overwrote raw_json and wiped it — OP pages 2+ emptied)
+m2 = {"id": 777001, "type": "ANIME", "title": {"romaji": "T"},
+      "airingSchedule": {"edges": [edge(node(1, 1))],
+                         "pageInfo": {"total": 100, "hasNextPage": True}},
+      "upcomingAiring": {"edges": []}}
+rf.fetch_middle_pages = False  # daily mode: no backfill
+conn = _init_db(rf.db_path)
+rf._process_anime(conn, m2)
+conn.commit()
+raw2 = _json.loads(conn.execute("SELECT raw_json FROM anime WHERE id=777001").fetchone()[0])
+past2 = (raw2.get("pastAiring") or {}).get("edges") or []
+n_table2 = conn.execute("SELECT COUNT(*) FROM airing_schedule WHERE anime_id=777001").fetchone()[0]
+conn.close()
+check("G carry-forward-raw", len(past2) == 4, "past=%d" % len(past2))
+check("G carry-forward-table", n_table2 == 5, "table_rows=%d" % n_table2)
+
 failed = [r for r in results if not r[1]]
 for name, ok, detail in results:
     print(f"{'PASS' if ok else 'FAIL'}  {name}: {detail}")
