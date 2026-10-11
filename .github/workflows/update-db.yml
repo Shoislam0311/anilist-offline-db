@@ -251,7 +251,7 @@ jobs:
         run: |
           git rm --cached -r --ignore-unmatch docs/api/shards data/anilist.db data/anilist.json data/anilist.db.gz data/anilist.json.gz || true
           git add docs/api/metadata.json docs/api/search_index.json docs/api/search_index.json.gz \
-            docs/api/sample.json docs/api/shard_manifest.json docs/index.html docs/api.js \
+            docs/api/sample.json docs/api/shard_manifest.json docs/api/schedule_index.json docs/index.html docs/api.js \
             .github/workflows/update-db.yml
           # rail manifest exists after rails runs — never fail the add on it
           test -f docs/api/rail_manifest.json && git add docs/api/rail_manifest.json || true

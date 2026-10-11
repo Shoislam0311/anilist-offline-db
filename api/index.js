@@ -178,16 +178,29 @@ async function getSearchIndex() {
   }
 }
 let schedEntry = null, schedFailAt = 0;
+// A stale precomputed index is worse than a slow shard scan (it silently
+// drops rescheduled rows), so entries older than this are ignored.
+const SCHED_MAX_AGE_MS = 48 * 3600 * 1000;
+function schedUsable(data) {
+  if (!data || !Array.isArray(data?.rows)) return false;
+  const gen = Date.parse(data.generatedAt || '');
+  if (Number.isNaN(gen)) return true; // undated files (tests) stay usable
+  return Date.now() - gen < SCHED_MAX_AGE_MS;
+}
 async function getScheduleIndex() {
-  if (fresh(schedEntry)) return schedEntry.data;
-  if (Date.now() - schedFailAt < FAIL_BACKOFF_MS && schedEntry) return schedEntry.data;
+  if (schedEntry && fresh(schedEntry) && schedUsable(schedEntry.data)) return schedEntry.data;
+  if (Date.now() - schedFailAt < FAIL_BACKOFF_MS) {
+    if (schedEntry && schedUsable(schedEntry.data)) return schedEntry.data;
+    throw new Error('schedule index unavailable');
+  }
   try {
     const data = await fetchJSON(`${DATA_BASE}/schedule_index.json`);
     schedEntry = { data, time: Date.now() };
+    if (!schedUsable(data)) throw new Error('schedule index stale');
     return data;
   } catch (e) {
     schedFailAt = Date.now();
-    if (schedEntry) return schedEntry.data;
+    if (schedEntry && schedUsable(schedEntry.data)) return schedEntry.data;
     throw e;
   }
 }
