@@ -148,4 +148,71 @@ check("G carry-forward-table", n_table2 == 5, "table_rows=%d" % n_table2)
 failed = [r for r in results if not r[1]]
 for name, ok, detail in results:
     print(f"{'PASS' if ok else 'FAIL'}  {name}: {detail}")
+
+
+# H: window_sync walks window pages, batches id_in, re-processes union
+class SyncFetcher(fa.AniListFetcher):
+    def __init__(self, tmp):
+        self.data_dir = tmp
+        self.db_path = os.path.join(tmp, "anilist.db")
+        self.calls = []
+        self.processed = []
+        self.fetch_middle_pages = False
+        self.touched_full = set()
+
+    def _request(self, query, variables, retries=0):
+        self.calls.append(query)
+        if "airingSchedules" in query:
+            p = variables["page"]
+            if p == 1:
+                return {"data": {"Page": {
+                    "airingSchedules": [{"id": 1, "episode": 1, "airingAt": 100, "mediaId": 11},
+                                        {"id": 2, "episode": 1, "airingAt": 200, "mediaId": 22}],
+                    "pageInfo": {"hasNextPage": True}}}}
+            if p == 2:
+                return {"data": {"Page": {
+                    "airingSchedules": [{"id": 3, "episode": 2, "airingAt": 300, "mediaId": 11}],
+                    "pageInfo": {"hasNextPage": False}}}}
+            return {"data": {"Page": {"airingSchedules": [], "pageInfo": {"hasNextPage": False}}}}
+        ids = variables["ids"]
+        return {"data": {"Page": {"media": [
+            {"id": i, "type": "ANIME", "title": {"romaji": "T%d" % i},
+             "airingSchedule": {"edges": []}, "upcomingAiring": {"edges": []}}
+            for i in ids], "pageInfo": {}}}}
+
+    def _process_anime(self, conn, media):
+        self.processed.append(media["id"])
+
+
+import tempfile as _tf
+_tmp = _tf.mkdtemp(prefix="sched_sync_")
+_fx = SyncFetcher(_tmp)
+from db_utils import init_db as _init_db2
+_conn = _init_db2(_fx.db_path)
+import fetch_anilist as _fa
+_fa.AniListFetcher.window_sync(_fx, past_hours=48, future_hours=168)
+_conn.close()
+h_results = []
+h_results.append(("H union-reprocessed", sorted(_fx.processed) == [11, 22], str(sorted(_fx.processed))))
+h_results.append(("H window-paged", sum(1 for c in _fx.calls if "airingSchedules" in c) == 2, str(len(_fx.calls))))
+h_results.append(("H id-batched", sum(1 for c in _fx.calls if "id_in" in c) == 1, ""))
+
+# I: window failure raises (workflow-visible)
+class FailSyncFetcher(SyncFetcher):
+    def _request(self, query, variables, retries=0):
+        return None
+_fyf = FailSyncFetcher(_tf.mkdtemp(prefix="sched_sync_fail_"))
+_fyf.calls = []
+_fyf.processed = []
+try:
+    _fa.AniListFetcher.window_sync(_fyf, past_hours=1, future_hours=1)
+    h_results.append(("I failure-raises", False, "no raise"))
+except RuntimeError:
+    h_results.append(("I failure-raises", True, ""))
+
+for name, ok, detail in h_results:
+    print(f"{'PASS' if ok else 'FAIL'}  {name}: {detail}")
+    results.append((name, ok, detail))
+
+failed = [r for r in results if not r[1]]
 sys.exit(1 if failed else 0)

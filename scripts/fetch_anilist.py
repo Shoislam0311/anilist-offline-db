@@ -274,7 +274,35 @@ query ($ids: [Int]) {
 # with the unfiltered list they truncate it. Chinese (the main observed gap)
 # has no StaffLanguage member at all, so aliases could never capture it.
 # Kept out of all queries; dub language falls back to staff primary.
-MIDDLE_PAGE_CAP = 50
+# Intraday schedule sync (FETCH_MODE=schedule): reconcile exactly the rows
+# the serving windows read. Upstream replaces/corrects schedule rows
+# intraday (new row ids, shifted times); the daily snapshot would otherwise
+# serve dead rows for up to 24h. Walks one airingAt window, then fully
+# re-processes every touched title (dead rows drop via DELETE+insert and
+# raw_json replacement; pastAiring carries forward).
+WINDOW_SYNC_QUERY = """
+query ($page: Int, $perPage: Int, $g: Int, $l: Int) {
+  Page(page: $page, perPage: $perPage) {
+    airingSchedules(airingAt_greater: $g, airingAt_lesser: $l, sort: [TIME]) {
+      id episode airingAt mediaId
+    }
+    pageInfo { hasNextPage }
+  }
+}
+"""
+
+MEDIA_BY_IDS_QUERY = """
+query ($ids: [Int]) {
+  Page(page: 1, perPage: 50) {
+    media(type: ANIME, id_in: $ids) {
+      %s
+    }
+    pageInfo { hasNextPage }
+  }
+}
+""" % MEDIA_FIELDS
+
+# Middle-history schedule pages for long-runners: Media.airingSchedule has
 # no sort/filter args, so pages 2..N are the only way to reach episodes
 # between page-1 history and upcoming rows. Capped: 50 pages x 25 rows.
 MIDDLE_PAGE_CAP = 50
@@ -604,6 +632,47 @@ class AniListFetcher:
             pass
 
         self.touched_airing.add(aid)
+
+    def window_sync(self, past_hours: int = 48, future_hours: int = 168):
+        """Intraday airing-timeline reconciliation (FETCH_MODE=schedule).
+
+        Fetches every schedule row upstream in [now-past, now+future] (paged),
+        then fully re-processes each touched title: corrected times and
+        replacement row ids land in the tables AND raw_json, while rows
+        upstream deleted vanish via DELETE+insert. Cheap: ~1 request per 50
+        titles + the touched reprocesses (a few hundred titles).
+        """
+        conn = init_db(self.db_path)
+        set_metadata(conn, "fetch_type", "schedule")
+        set_metadata(conn, "fetch_started_at", datetime.now(timezone.utc).isoformat())
+        now = int(time.time())
+        g, l = now - past_hours * 3600, now + future_hours * 3600
+        logger.info(f"SCHEDULE sync: airing window {g}..{l} (±{past_hours}h/{future_hours}h)")
+        rows = []
+        for page in range(1, 12):
+            data = self._request(WINDOW_SYNC_QUERY, {"page": page, "perPage": 50, "g": g, "l": l})
+            if not data or "data" not in data:
+                raise RuntimeError(f"schedule sync window page {page} failed")
+            paged = data["data"]["Page"]
+            rows.extend(paged.get("airingSchedules", []) or [])
+            if not paged.get("pageInfo", {}).get("hasNextPage"):
+                break
+        ids = sorted({r.get("mediaId") for r in rows if r.get("mediaId")})
+        logger.info(f"SCHEDULE sync: {len(rows)} rows across {len(ids)} titles")
+        done = 0
+        for i in range(0, len(ids), 50):
+            chunk = ids[i:i + 50]
+            data = self._request(MEDIA_BY_IDS_QUERY, {"ids": chunk})
+            if not data or "data" not in data:
+                raise RuntimeError(f"schedule sync media batch {i // 50 + 1} failed")
+            for media in data["data"]["Page"].get("media", []) or []:
+                self._process_anime(conn, media)
+                self.touched_full.add(media.get("id"))
+                done += 1
+            conn.commit()
+        conn.close()
+        logger.info(f"SCHEDULE SYNC COMPLETE: {done} titles re-processed")
+        return done
 
     def rails_fetch(self):
         """
@@ -1041,6 +1110,9 @@ def main():
     if mode == "full":
         # full-catalog parity backfill: every anime AniList knows
         fetcher.full_fetch()
+    elif mode == "schedule":
+        # intraday airing-timeline reconciliation (row replacements/corrections)
+        fetcher.window_sync()
     elif mode in ("daily", "rails"):
         fetcher.rails_fetch()
         # catalog-wide change sweep: catches edits to ANY title (old or new),

@@ -18,16 +18,18 @@ name: Update AniList Database
 on:
   schedule:
     - cron: '0 4 * * *'    # Daily 04:00 UTC -> rails + catalog-wide updatedAt sweep
+    - cron: '0 16 * * *'   # Intraday 16:00 UTC -> schedule-window reconciliation only
   workflow_dispatch:
     inputs:
       fetch_mode:
-        description: 'daily = rails + updatedAt sweep; full = complete catalog backfill'
+        description: 'daily = rails + updatedAt sweep; full = complete catalog backfill; schedule = airing-window reconciliation'
         required: false
         default: 'daily'
         type: choice
         options:
           - daily
           - full
+          - schedule
 
 permissions:
   contents: write
@@ -67,7 +69,9 @@ jobs:
       - name: Determine fetch mode (scheduled runs default to daily)
         id: mode
         run: |
-          echo "mode=${{ inputs.fetch_mode || 'daily' }}" >> $GITHUB_OUTPUT
+          MODE="${{ inputs.fetch_mode || 'daily' }}"
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.schedule }}" = "0 16 * * *" ]; then MODE="schedule"; fi
+          echo "mode=$MODE" >> $GITHUB_OUTPUT
 
       - name: Restore database cache (runners are ephemeral)
         uses: actions/cache/restore@v4
