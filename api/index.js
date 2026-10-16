@@ -55,7 +55,7 @@ const CUSTOM_BASE = !!String((typeof process !== 'undefined' && process.env?.DAT
 const NET_TIMEOUT_MS = Number((typeof process !== 'undefined' && process.env?.FETCH_TIMEOUT_MS) || 15000);
 const FAIL_BACKOFF_MS = 20000;  // negative-cache window after a failed fetch
 const CACHE_TTL_MS = 10 * 60 * 1000;
-const MAX_SHARD_CACHE = 12; // decompressed shards are ~15MB each; cap RAM (~180MB)
+const MAX_SHARD_CACHE = Number((typeof process !== 'undefined' && process.env?.SHARD_CACHE_SIZE) || 12); // decompressed shards are ~15MB each; cap RAM (~180MB at 12; set 5-6 for 512MB hosts like Render free)
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',

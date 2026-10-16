@@ -1,0 +1,18 @@
+# Render free web service for the AniList mirror API.
+# Dashboard: New -> Web Service -> select this repo. Render reads this file:
+# build needs nothing beyond npm install; start serves server.js on $PORT.
+services:
+  - type: web
+    name: anilist-mirror
+    runtime: node
+    plan: free
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      # 512MB host: keep decompressed-shard cache small (~6 x 15MB).
+      - key: SHARD_CACHE_SIZE
+        value: 6
+      # Optional: pin a custom data source instead of the default CDNs.
+      # - key: DATA_BASE_URL
+      #   value: https://shoislam0311.github.io/anilist-offline-db/api

@@ -6,7 +6,11 @@
   "scripts": {
     "test": "node scripts/test_api.mjs",
     "dev": "node scripts/dev_server.mjs",
-    "probe": "node scripts/probe.mjs"
+    "probe": "node scripts/probe.mjs",
+    "start": "node --max-old-space-size=460 server.js"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "@libsql/client": "^0.18.0",
