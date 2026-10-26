@@ -499,6 +499,11 @@ await test('effectiveStatus fixes premiere-flip lag (NYR -> RELEASING/FINISHED)'
   eq(es({ status: 'FINISHED' }), 'FINISHED', 'passthrough');
   eq(es({ status: 'RELEASING' }), 'RELEASING', 'passthrough');
   eq(es({}), null, 'missing status -> null');
+  // Symmetric: RELEASING -> FINISHED when all episodes aired
+  eq(es({ status: 'RELEASING', episodes: 10, airingSchedule: { edges: [{ node: { airingAt: now - 3600, episode: 10 } }] } }), 'FINISHED', 'ended + all aired');
+  eq(es({ status: 'RELEASING', episodes: 10, airingSchedule: { edges: [{ node: { airingAt: now - 3600, episode: 5 } }] } }), 'RELEASING', 'partial airing');
+  eq(es({ status: 'RELEASING', episodes: 10, nextAiringEpisode: { episode: 6, airingAt: now + 86400 } }), 'RELEASING', 'future next ep');
+  eq(es({ status: 'RELEASING', episodes: 1, airingSchedule: { edges: [{ node: { airingAt: now - 3600, episode: 1 } }] } }), 'FINISHED', 'single ep aired');
 });
 await test('nextAiringLive advances past aired rows (195516 case)', async () => {
   const mod = await import('../api/index.js?nextair=1');

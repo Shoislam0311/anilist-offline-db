@@ -435,12 +435,31 @@ function effectiveStatus(media, nowSec = Math.floor(Date.now() / 1000)) {
     }
     return st;
   }
-  // NOTE: no RELEASING -> FINISHED derivation on purpose. Official itself
-  // leaves ended titles RELEASING for months/years (verified live: 168947
-  // ended 2024-06, 168177 ended 2026-06, both still RELEASING) — deriving
-  // FINISHED would trade a rare lag for permanent mismatch. The premiere
-  // direction is safe instead: official flips those within hours (zero
-  // snapshot-NYR titles sit >30d past their full-precision startDate).
+  if (st === 'RELEASING') {
+    const eps = media?.episodes ?? 0;
+    const nextEp = media?.nextAiringEpisode?.episode;
+    // If there's a future next episode scheduled, still releasing
+    if (typeof nextEp === 'number' && nextEp > 1) {
+      return 'RELEASING';
+    }
+    // All episodes aired → finished
+    const rows = [
+      ...((media?.airingSchedule?.edges) || []),
+      ...((media?.pastAiring?.edges) || []),
+      ...((media?.upcomingAiring?.edges) || []),
+    ];
+    let maxAiredEp = 0;
+    for (const e of rows) {
+      const at = e?.node?.airingAt;
+      const ep = e?.node?.episode ?? 0;
+      if (at != null && at <= nowSec && ep > maxAiredEp) {
+        maxAiredEp = ep;
+      }
+    }
+    if (eps > 0 && maxAiredEp >= eps) {
+      return 'FINISHED';
+    }
+  }
   return st ?? null;
 }
 
