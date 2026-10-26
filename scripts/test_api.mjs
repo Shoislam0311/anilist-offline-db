@@ -503,6 +503,8 @@ await test('effectiveStatus fixes premiere-flip lag (NYR -> RELEASING/FINISHED)'
   eq(es({ status: 'RELEASING', episodes: 10, airingSchedule: { edges: [{ node: { airingAt: now - 3600, episode: 10 } }] } }), 'FINISHED', 'ended + all aired');
   eq(es({ status: 'RELEASING', episodes: 10, airingSchedule: { edges: [{ node: { airingAt: now - 3600, episode: 5 } }] } }), 'RELEASING', 'partial airing');
   eq(es({ status: 'RELEASING', episodes: 10, nextAiringEpisode: { episode: 6, airingAt: now + 86400 } }), 'RELEASING', 'future next ep');
+  eq(es({ status: 'RELEASING', episodes: 10, nextAiringEpisode: { episode: 10, airingAt: now - 3600 } }), 'FINISHED', 'next ep in past, all aired');
+  eq(es({ status: 'RELEASING', episodes: 10, nextAiringEpisode: { episode: 10, airingAt: now + 86400 } }), 'RELEASING', 'next ep in future');
   eq(es({ status: 'RELEASING', episodes: 1, airingSchedule: { edges: [{ node: { airingAt: now - 3600, episode: 1 } }] } }), 'FINISHED', 'single ep aired');
 });
 await test('nextAiringLive advances past aired rows (195516 case)', async () => {

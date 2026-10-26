@@ -437,17 +437,21 @@ function effectiveStatus(media, nowSec = Math.floor(Date.now() / 1000)) {
   }
   if (st === 'RELEASING') {
     const eps = media?.episodes ?? 0;
-    const nextEp = media?.nextAiringEpisode?.episode;
-    // If there's a future next episode scheduled, still releasing
-    if (typeof nextEp === 'number' && nextEp > 1) {
-      return 'RELEASING';
-    }
+    const nextEp = media?.nextAiringEpisode;
     // All episodes aired → finished
     const rows = [
       ...((media?.airingSchedule?.edges) || []),
       ...((media?.pastAiring?.edges) || []),
       ...((media?.upcomingAiring?.edges) || []),
     ];
+    // If nextAiringEpisode exists and already aired, count it as an aired row
+    if (nextEp && typeof nextEp.episode === 'number' && nextEp.airingAt != null && nextEp.airingAt <= nowSec) {
+      rows.push({ node: { episode: nextEp.episode, airingAt: nextEp.airingAt } });
+    }
+    // If there's a future next episode scheduled, still releasing
+    if (nextEp && typeof nextEp.episode === 'number' && nextEp.episode > 1 && nextEp.airingAt != null && nextEp.airingAt > nowSec) {
+      return 'RELEASING';
+    }
     let maxAiredEp = 0;
     for (const e of rows) {
       const at = e?.node?.airingAt;
