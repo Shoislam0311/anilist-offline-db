@@ -278,14 +278,49 @@ jobs:
         # A concurrent push (code fix landing mid-run) must not nuke 30
         # minutes of fetching. Generated data files conflict on every
         # rebase (both sides rewrite them fully), so resolve by taking
-        # THIS run's output — it is the newest complete dataset.
+        # THIS run's output — it is the newest complete dataset. Resolve
+        # every conflicting path, not just the known data files: a code fix
+        # can also touch the workflow, site or changelog mid-run.
         run: |
-          git pull --rebase --autostash origin "${{ github.ref_name }}" || {
-            git checkout --theirs -- docs/api/metadata.json docs/api/rail_manifest.json docs/api/sample.json docs/api/schedule_index.json docs/api/search_index.json docs/api/search_index.json.gz docs/api/shard_manifest.json 2>/dev/null || true
-            git add -A
-            git rebase --continue
+          rebase_on_head() {
+            git pull --rebase --autostash origin "${{ github.ref_name }}" && return 0
+
+            if [ ! -d "$(git rev-parse --git-path rebase-merge)" ] && [ ! -d "$(git rev-parse --git-path rebase-apply)" ]; then
+              echo "::error::git pull --rebase failed with no rebase in progress"
+              return 1
+            fi
+
+            # In a rebase, "theirs" is the commit being replayed: this run.
+            git -c core.quotepath=false diff --name-only --diff-filter=U | while IFS= read -r f; do
+              echo "resolving conflict in $f (taking this run's output)"
+              git checkout --theirs -- "$f" && git add -- "$f"
+            done
+
+            if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+              echo "::error::unresolved conflicts after resolution"
+              git rebase --abort
+              return 1
+            fi
+
+            if ! GIT_EDITOR=true git rebase --continue; then
+              if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+                echo "::error::unresolved conflicts after rebase --continue"
+                git rebase --abort
+                return 1
+              fi
+              if ! git diff --cached --quiet HEAD; then
+                # Real staged changes were lost — never silently skip them.
+                echo "::error::rebase --continue failed with staged changes"
+                git rebase --abort
+                return 1
+              fi
+              # Taking our side can make the replayed commit empty.
+              git rebase --skip || { git rebase --abort; return 1; }
+            fi
           }
-          git push || (git pull --rebase --autostash origin "${{ github.ref_name }}" && git push)
+
+          rebase_on_head || exit 1
+          git push || { rebase_on_head && git push; }
 
       - name: Save database cache
         uses: actions/cache/save@v4
@@ -302,6 +337,7 @@ jobs:
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
 
     permissions:
+      actions: read   # poll the artifact list in "Wait for artifact propagation"
       pages: write
       id-token: write
 
@@ -335,10 +371,31 @@ jobs:
         with:
           path: docs
 
+      - name: Wait for artifact propagation
+        # deploy-pages@v4 looks up the artifact exactly once, immediately
+        # after upload. GitHub's artifact API is eventually consistent and
+        # sometimes reports 0 artifacts for a few seconds ("No artifacts
+        # named github-pages"), which kills an otherwise healthy run.
+        run: |
+          for attempt in $(seq 1 12); do
+            count=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?name=github-pages" \
+              --jq '.total_count' 2>/dev/null || echo 0)
+            if [ "${count:-0}" -ge 1 ]; then
+              echo "github-pages artifact visible (attempt $attempt)"
+              exit 0
+            fi
+            echo "artifact not visible yet (attempt $attempt/12); retrying in 5s"
+            sleep 5
+          done
+          echo "::error::github-pages artifact never became visible after upload"
+          exit 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Deploy to GitHub Pages
         id: deployment
-        # Transient API hiccups ("No artifacts named github-pages") are
-        # common; retry the deployment a few times before failing the run.
+        # timeout/error_count only cover deployment-status polling in
+        # deploy-pages@v4, not the one-shot artifact lookup above.
         uses: actions/deploy-pages@v4
         with:
           timeout: 600000
